@@ -1,48 +1,80 @@
 import { Scope } from '@nestjs/common';
 import { ApplicationConfig } from '@nestjs/core';
-import { ExecutionContextHost } from '@nestjs/core/helpers/execution-context-host';
-import { NestContainer } from '@nestjs/core/injector/container';
-import { Injector } from '@nestjs/core/injector/injector';
-import { InstanceWrapper } from '@nestjs/core/injector/instance-wrapper';
-import { expect } from 'chai';
-import * as sinon from 'sinon';
-import { MetadataScanner } from '../../core/metadata-scanner';
-import { ClientProxyFactory } from '../client';
-import { ClientsContainer } from '../container';
-import { ExceptionFiltersContext } from '../context/exception-filters-context';
-import { RpcContextCreator } from '../context/rpc-context-creator';
-import { Transport } from '../enums/transport.enum';
-import { ListenerMetadataExplorer } from '../listener-metadata-explorer';
-import { ListenersController } from '../listeners-controller';
+import { ExecutionContextHost } from '@nestjs/core/helpers/execution-context-host.js';
+import { STATIC_CONTEXT } from '@nestjs/core/injector/constants.js';
+import { NestContainer } from '@nestjs/core/injector/container.js';
+import { Injector } from '@nestjs/core/injector/injector.js';
+import { InstanceWrapper } from '@nestjs/core/injector/instance-wrapper.js';
+import {
+  EMPTY,
+  lastValueFrom,
+  map,
+  Observable,
+  tap,
+  throwError,
+  timer,
+  toArray,
+} from 'rxjs';
+import { GraphInspector } from '../../core/inspector/graph-inspector.js';
+import { MetadataScanner } from '../../core/metadata-scanner.js';
+import { ClientProxyFactory } from '../client/index.js';
+import { ClientsContainer } from '../container.js';
+import { ExceptionFiltersContext } from '../context/exception-filters-context.js';
+import { RequestContextHost } from '../context/request-context-host.js';
+import { RpcContextCreator } from '../context/rpc-context-creator.js';
+import { RpcProxy } from '../context/rpc-proxy.js';
+import { BaseRpcExceptionFilter } from '../exceptions/base-rpc-exception-filter.js';
+import { KafkaRetriableException } from '../exceptions/kafka-retriable-exception.js';
+import { RpcExceptionsHandler } from '../exceptions/rpc-exceptions-handler.js';
+import { Transport } from '../enums/transport.enum.js';
+import {
+  EventOrMessageListenerDefinition,
+  ListenerMetadataExplorer,
+} from '../listener-metadata-explorer.js';
+import { MessageHandler } from '../interfaces/message-handler.interface.js';
+import { ListenersController } from '../listeners-controller.js';
 
 describe('ListenersController', () => {
   let instance: ListenersController,
-    explorer: sinon.SinonMock,
+    explorer: any,
     metadataExplorer: ListenerMetadataExplorer,
     server: any,
     serverTCP: any,
-    addSpy: sinon.SinonSpy,
-    addSpyTCP: sinon.SinonSpy,
-    proxySpy: sinon.SinonSpy,
+    serverCustom: any,
+    customTransport: symbol,
+    addSpy: ReturnType<typeof vi.fn>,
+    addSpyTCP: ReturnType<typeof vi.fn>,
+    addSpyCustom: ReturnType<typeof vi.fn>,
+    proxySpy: ReturnType<typeof vi.fn>,
     container: NestContainer,
+    graphInspector: GraphInspector,
     injector: Injector,
     rpcContextCreator: RpcContextCreator,
     exceptionFiltersContext: ExceptionFiltersContext;
 
-  before(() => {
+  beforeAll(() => {
     metadataExplorer = new ListenerMetadataExplorer(new MetadataScanner());
-    explorer = sinon.mock(metadataExplorer);
+    explorer = metadataExplorer;
   });
   beforeEach(() => {
     container = new NestContainer();
+    graphInspector = new GraphInspector(container);
     injector = new Injector();
     exceptionFiltersContext = new ExceptionFiltersContext(
       container,
       new ApplicationConfig(),
     );
-    rpcContextCreator = sinon.createStubInstance(RpcContextCreator) as any;
-    proxySpy = sinon.spy();
-    (rpcContextCreator as any).create.callsFake(() => proxySpy);
+    rpcContextCreator = {
+      ...Object.fromEntries(
+        Object.getOwnPropertyNames(RpcContextCreator.prototype).map(m => [
+          m,
+          vi.fn(),
+        ]),
+      ),
+    } as any;
+    proxySpy = vi.fn();
+    (rpcContextCreator as any).create.mockImplementation(() => proxySpy);
+
     instance = new ListenersController(
       new ClientsContainer(),
       rpcContextCreator,
@@ -50,102 +82,204 @@ describe('ListenersController', () => {
       injector,
       ClientProxyFactory,
       exceptionFiltersContext,
+      graphInspector,
     );
     (instance as any).metadataExplorer = metadataExplorer;
-    addSpy = sinon.spy();
+    addSpy = vi.fn();
     server = {
       addHandler: addSpy,
     };
-    addSpyTCP = sinon.spy();
+    addSpyTCP = vi.fn();
     serverTCP = {
       addHandler: addSpyTCP,
       transportId: Transport.TCP,
+    };
+    addSpyCustom = vi.fn();
+    customTransport = Symbol();
+    serverCustom = {
+      addHandler: addSpyCustom,
+      transportId: customTransport,
     };
   });
 
   describe('registerPatternHandlers', () => {
     const handlers = [
-      { pattern: 'test', targetCallback: 'tt' },
-      { pattern: 'test2', targetCallback: '2' },
+      { patterns: ['test'], targetCallback: 'tt' },
+      { patterns: ['test2'], targetCallback: '2', isEventHandler: true },
     ];
 
     beforeEach(() => {
-      sinon.stub(container, 'getModuleByKey').callsFake(() => ({} as any));
+      vi.spyOn(container, 'getModuleByKey').mockImplementation(
+        () => ({}) as any,
+      );
     });
     it(`should call "addHandler" method of server for each pattern handler`, () => {
-      explorer.expects('explore').returns(handlers);
+      vi.spyOn(metadataExplorer, 'explore').mockReturnValue(handlers as any);
       instance.registerPatternHandlers(new InstanceWrapper(), server, '');
-      expect(addSpy.calledTwice).to.be.true;
+      expect(addSpy).toHaveBeenCalledTimes(2);
     });
     it(`should call "addHandler" method of server for each pattern handler with same transport`, () => {
       const serverHandlers = [
         {
-          pattern: { cmd: 'test' },
+          patterns: [{ cmd: 'test' }],
           targetCallback: 'tt',
           transport: Transport.TCP,
         },
         { pattern: 'test2', targetCallback: '2', transport: Transport.KAFKA },
       ];
-      explorer.expects('explore').returns(serverHandlers);
+      vi.spyOn(metadataExplorer, 'explore').mockReturnValue(
+        serverHandlers as any,
+      );
       instance.registerPatternHandlers(new InstanceWrapper(), serverTCP, '');
-      expect(addSpyTCP.calledOnce).to.be.true;
+      expect(addSpyTCP).toHaveBeenCalledOnce();
     });
     it(`should call "addHandler" method of server without transportID for each pattern handler with any transport value`, () => {
       const serverHandlers = [
-        { pattern: { cmd: 'test' }, targetCallback: 'tt' },
-        { pattern: 'test2', targetCallback: '2', transport: Transport.KAFKA },
+        { patterns: [{ cmd: 'test' }], targetCallback: 'tt' },
+        {
+          patterns: ['test2'],
+          targetCallback: '2',
+          transport: Transport.KAFKA,
+        },
       ];
-      explorer.expects('explore').returns(serverHandlers);
+      vi.spyOn(metadataExplorer, 'explore').mockReturnValue(
+        serverHandlers as any,
+      );
       instance.registerPatternHandlers(new InstanceWrapper(), server, '');
-      expect(addSpy.calledTwice).to.be.true;
+      expect(addSpy).toHaveBeenCalledTimes(2);
     });
     it(`should call "addHandler" method of server with transportID for each pattern handler with self transport and without transport`, () => {
       const serverHandlers = [
-        { pattern: 'test', targetCallback: 'tt' },
-        { pattern: 'test2', targetCallback: '2', transport: Transport.KAFKA },
+        { patterns: ['test'], targetCallback: 'tt' },
         {
-          pattern: { cmd: 'test3' },
+          patterns: ['test2'],
+          targetCallback: '2',
+          transport: Transport.KAFKA,
+        },
+        {
+          patterns: [{ cmd: 'test3' }],
           targetCallback: '3',
           transport: Transport.TCP,
         },
       ];
-      explorer.expects('explore').returns(serverHandlers);
+      vi.spyOn(metadataExplorer, 'explore').mockReturnValue(
+        serverHandlers as any,
+      );
       instance.registerPatternHandlers(new InstanceWrapper(), serverTCP, '');
-      expect(addSpyTCP.calledTwice).to.be.true;
+      expect(addSpyTCP).toHaveBeenCalledTimes(2);
     });
     it(`should call "addHandler" method of server with transportID for each pattern handler without transport`, () => {
-      explorer.expects('explore').returns(handlers);
+      vi.spyOn(metadataExplorer, 'explore').mockReturnValue(handlers as any);
       instance.registerPatternHandlers(new InstanceWrapper(), serverTCP, '');
-      expect(addSpyTCP.calledTwice).to.be.true;
+      expect(addSpyTCP).toHaveBeenCalledTimes(2);
+    });
+    it(`should call "addHandler" method of server with custom transportID for pattern handler with the same custom token`, () => {
+      const serverHandlers = [
+        {
+          patterns: [{ cmd: 'test' }],
+          targetCallback: 'tt',
+          transport: customTransport,
+        },
+        {
+          patterns: ['test2'],
+          targetCallback: '2',
+          transport: Transport.KAFKA,
+        },
+      ];
+
+      vi.spyOn(metadataExplorer, 'explore').mockReturnValue(
+        serverHandlers as any,
+      );
+      instance.registerPatternHandlers(new InstanceWrapper(), serverCustom, '');
+      expect(addSpyCustom).toHaveBeenCalledOnce();
+    });
+    describe('reporting unhandled errors', () => {
+      const createSpy = () => vi.spyOn(rpcContextCreator, 'create');
+      const reportFlagOf = (spy: any) => spy.mock.calls.map((c: any[]) => c[7]);
+
+      beforeEach(() => {
+        vi.spyOn(metadataExplorer, 'explore').mockReturnValue(handlers as any);
+      });
+
+      it('should ask for a report only for event handlers', () => {
+        const spy = createSpy();
+
+        instance.registerPatternHandlers(new InstanceWrapper(), server, '');
+
+        // handlers[1] is the event handler; handlers[0] is a message one
+        expect(reportFlagOf(spy)[1]).toBe(true);
+      });
+
+      it('should not ask for a report when the transport propagates the error', () => {
+        const spy = createSpy();
+        const kafkaLike = { ...server, propagatesEventHandlerErrors: true };
+
+        instance.registerPatternHandlers(new InstanceWrapper(), kafkaLike, '');
+
+        expect(reportFlagOf(spy)[1]).toBe(false);
+      });
+    });
+
+    it(`should call "addHandler" method of server with extras data`, () => {
+      const serverHandlers = [
+        {
+          patterns: ['test'],
+          targetCallback: 'tt',
+          extras: { param: 'value' },
+        },
+      ];
+      vi.spyOn(metadataExplorer, 'explore').mockReturnValue(
+        serverHandlers as any,
+      );
+      instance.registerPatternHandlers(new InstanceWrapper(), serverTCP, '');
+      expect(addSpyTCP).toHaveBeenCalledOnce();
+      expect(addSpyTCP.mock.calls[0][3]).toEqual(
+        expect.objectContaining({ param: 'value' }),
+      );
+    });
+    describe('when static', () => {
+      it('should create the proxy with the controller id as inquirer id', () => {
+        vi.spyOn(metadataExplorer, 'explore').mockReturnValue(handlers as any);
+        const controller = new InstanceWrapper();
+
+        instance.registerPatternHandlers(controller, server, '');
+
+        const [, , , , contextId, inquirerId] = (
+          rpcContextCreator.create as any
+        ).mock.calls[0];
+        expect(contextId).toBe(STATIC_CONTEXT);
+        expect(inquirerId).toBe(controller.id);
+      });
     });
     describe('when request scoped', () => {
-      it(`should call "addHandler" with deffered proxy`, () => {
-        explorer.expects('explore').returns(handlers);
+      it(`should call "addHandler" with deferred proxy`, () => {
+        vi.spyOn(metadataExplorer, 'explore').mockReturnValue(handlers as any);
         instance.registerPatternHandlers(
           new InstanceWrapper({ scope: Scope.REQUEST }),
           server,
           '',
         );
-        expect(addSpy.calledTwice).to.be.true;
+        expect(addSpy).toHaveBeenCalledTimes(2);
       });
     });
   });
 
   describe('createRequestScopedHandler', () => {
-    let handleSpy: sinon.SinonSpy;
+    let handleSpy: ReturnType<typeof vi.fn>;
 
     beforeEach(() => {
-      handleSpy = sinon.spy();
-      sinon.stub(exceptionFiltersContext, 'create').callsFake(
+      handleSpy = vi.fn();
+      vi.spyOn(exceptionFiltersContext, 'create').mockImplementation(
         () =>
           ({
             handle: handleSpy,
-          } as any),
+          }) as any,
       );
 
-      sinon
-        .stub((instance as any).container, 'registerRequestProvider')
-        .callsFake(() => ({} as any));
+      vi.spyOn(
+        (instance as any).container,
+        'registerRequestProvider',
+      ).mockImplementation(() => ({}) as any);
     });
 
     describe('when "loadPerContext" resolves', () => {
@@ -154,25 +288,25 @@ describe('ListenersController', () => {
       const module = {
         controllers: new Map(),
       } as any;
-      const pattern = {};
+      const patterns = [{}];
       const wrapper = new InstanceWrapper({ instance: { [methodKey]: {} } });
 
       it('should pass all arguments to the proxy chain', async () => {
-        sinon
-          .stub(injector, 'loadPerContext')
-          .callsFake(() => Promise.resolve({}));
+        vi.spyOn(injector, 'loadPerContext').mockImplementation(() =>
+          Promise.resolve({}),
+        );
         const handler = instance.createRequestScopedHandler(
           wrapper,
-          pattern,
+          patterns,
           module,
           moduleKey,
           methodKey,
         );
         await handler('data', 'metadata');
 
-        expect(proxySpy.called).to.be.true;
-        expect(proxySpy.getCall(0).args[0]).to.be.eql('data');
-        expect(proxySpy.getCall(0).args[1]).to.be.eql('metadata');
+        expect(proxySpy).toHaveBeenCalled();
+        expect(proxySpy.mock.calls[0][0]).toEqual('data');
+        expect(proxySpy.mock.calls[0][1]).toEqual('metadata');
       });
     });
 
@@ -182,39 +316,535 @@ describe('ListenersController', () => {
       const module = {
         controllers: new Map(),
       } as any;
-      const pattern = {};
+      const patterns = [{}];
       const wrapper = new InstanceWrapper({ instance: { [methodKey]: {} } });
 
-      it('should delegete error to exception filters', async () => {
-        sinon.stub(injector, 'loadPerContext').callsFake(() => {
+      it('should create the filters for the context of the message', async () => {
+        const error = new Error('provider failed');
+        vi.spyOn(injector, 'loadPerContext').mockRejectedValue(error);
+        const loadEnhancersPerContext = vi
+          .spyOn(injector, 'loadEnhancersPerContext')
+          .mockResolvedValue(undefined);
+        const filter = new InstanceWrapper({ subtype: 'filter' } as any);
+        const guard = new InstanceWrapper({ subtype: 'guard' } as any);
+        const scopedWrapper = new InstanceWrapper({
+          instance: { [methodKey]: {} },
+        });
+        vi.spyOn(scopedWrapper, 'getEnhancersMetadata').mockReturnValue([
+          filter,
+          guard,
+        ]);
+        const handler = instance.createRequestScopedHandler(
+          scopedWrapper,
+          patterns,
+          module,
+          moduleKey,
+          methodKey,
+        );
+
+        await handler('data');
+
+        // Only the filters: a guard may need what failed to resolve
+        const [, contextId, inquirer, enhancers] =
+          loadEnhancersPerContext.mock.calls[0];
+        expect(inquirer).toBe(scopedWrapper);
+        expect(enhancers).toEqual([filter]);
+        expect(exceptionFiltersContext.create).toHaveBeenCalledWith(
+          scopedWrapper.instance,
+          scopedWrapper.instance[methodKey],
+          moduleKey,
+          contextId,
+          scopedWrapper.id,
+        );
+        expect(handleSpy).toHaveBeenCalledWith(error, expect.anything(), false);
+      });
+
+      it('should fall back to the static filters when the filters fail to resolve', async () => {
+        const error = new Error('provider failed');
+        vi.spyOn(injector, 'loadPerContext').mockRejectedValue(error);
+        vi.spyOn(injector, 'loadEnhancersPerContext').mockRejectedValue(
+          new Error('filter failed'),
+        );
+        const handler = instance.createRequestScopedHandler(
+          wrapper,
+          patterns,
+          module,
+          moduleKey,
+          methodKey,
+        );
+
+        await handler('data');
+
+        expect(exceptionFiltersContext.create).toHaveBeenCalledOnce();
+        expect(exceptionFiltersContext.create).toHaveBeenCalledWith(
+          wrapper.instance,
+          wrapper.instance[methodKey],
+          moduleKey,
+        );
+        expect(handleSpy).toHaveBeenCalledWith(error, expect.anything(), false);
+      });
+
+      it('should delegate error to exception filters', async () => {
+        vi.spyOn(injector, 'loadPerContext').mockImplementation(() => {
           throw new Error();
         });
         const handler = instance.createRequestScopedHandler(
           wrapper,
-          pattern,
+          patterns,
           module,
           moduleKey,
           methodKey,
         );
         await handler([]);
 
-        expect(handleSpy.called).to.be.true;
-        expect(handleSpy.getCall(0).args[0]).to.be.instanceOf(Error);
-        expect(handleSpy.getCall(0).args[1]).to.be.instanceOf(
-          ExecutionContextHost,
+        expect(handleSpy).toHaveBeenCalled();
+        expect(handleSpy.mock.calls[0][0]).toBeInstanceOf(Error);
+        expect(handleSpy.mock.calls[0][1]).toBeInstanceOf(ExecutionContextHost);
+      });
+
+      it('should run the next event handler', async () => {
+        vi.spyOn(injector, 'loadPerContext').mockRejectedValue(new Error());
+        const handler = instance.createRequestScopedHandler(
+          wrapper,
+          patterns,
+          module,
+          moduleKey,
+          methodKey,
+          undefined,
+          true,
         );
+        handler.next = vi.fn();
+        await handler('data', 'context');
+
+        expect(handler.next).toHaveBeenCalledExactlyOnceWith('data', 'context');
+      });
+
+      it('should pass the request context host on to the next event handler', async () => {
+        vi.spyOn(injector, 'loadPerContext').mockRejectedValue(new Error());
+        const handler = instance.createRequestScopedHandler(
+          wrapper,
+          patterns,
+          module,
+          moduleKey,
+          methodKey,
+          undefined,
+          true,
+        );
+        handler.next = vi.fn();
+        const contextHost = RequestContextHost.create(
+          {} as any,
+          'data',
+          'context' as any,
+        );
+        await handler(contextHost, 'data', 'context');
+
+        expect(handler.next).toHaveBeenCalledExactlyOnceWith(
+          contextHost,
+          'data',
+          'context',
+        );
+      });
+
+      it('should ask the exception filters to report an unhandled error', async () => {
+        vi.spyOn(injector, 'loadPerContext').mockRejectedValue(new Error());
+        const handler = instance.createRequestScopedHandler(
+          wrapper,
+          patterns,
+          module,
+          moduleKey,
+          methodKey,
+          undefined,
+          true,
+          true,
+        );
+        await handler('data', 'context');
+
+        expect(handleSpy.mock.calls[0][2]).toBe(true);
+      });
+
+      it('should delegate errors to the filters of the controller that inherits the handler', async () => {
+        class BaseController {
+          handle() {}
+        }
+        class FirstController extends BaseController {}
+        class SecondController extends BaseController {}
+
+        const firstWrapper = new InstanceWrapper({
+          instance: new FirstController(),
+        });
+        const secondWrapper = new InstanceWrapper({
+          instance: new SecondController(),
+        });
+        const firstExceptionsHandler = { handle: vi.fn() };
+        const secondExceptionsHandler = { handle: vi.fn() };
+        vi.spyOn(exceptionFiltersContext, 'create').mockImplementation(
+          instance =>
+            (instance === firstWrapper.instance
+              ? firstExceptionsHandler
+              : secondExceptionsHandler) as any,
+        );
+        vi.spyOn(injector, 'loadPerContext').mockImplementation(() => {
+          throw new Error();
+        });
+
+        // Event handlers, as only those of both controllers stay registered
+        const firstHandler = instance.createRequestScopedHandler(
+          firstWrapper,
+          patterns,
+          module,
+          moduleKey,
+          'handle',
+          undefined,
+          true,
+        );
+        const secondHandler = instance.createRequestScopedHandler(
+          secondWrapper,
+          patterns,
+          module,
+          moduleKey,
+          'handle',
+          undefined,
+          true,
+        );
+        await firstHandler('data');
+        await secondHandler('data');
+
+        expect(firstExceptionsHandler.handle).toHaveBeenCalledOnce();
+        expect(secondExceptionsHandler.handle).toHaveBeenCalledOnce();
       });
     });
   });
 
+  describe('forkJoinHandlersIfAttached', () => {
+    let sideEffects: string[];
+
+    beforeEach(() => {
+      sideEffects = [];
+    });
+
+    // Resolves after a tick, like a handler that awaits I/O, and records a
+    // side effect that only happens if nobody cancels the subscription.
+    const slowHandlerResult = (name: string) =>
+      timer(10).pipe(
+        tap(() => sideEffects.push(name)),
+        map(() => name),
+      );
+
+    const createHandlerChain = ([
+      returnValue,
+      ...rest
+    ]: Observable<unknown>[]): MessageHandler => {
+      const handler: MessageHandler = async (...args: unknown[]) =>
+        instance.forkJoinHandlersIfAttached(returnValue, args, handler);
+      if (rest.length > 0) {
+        handler.next = createHandlerChain(rest);
+      }
+      return handler;
+    };
+
+    const emissionsOf = async (handler: MessageHandler) =>
+      lastValueFrom(
+        instance.transformToObservable(await handler('data')).pipe(toArray()),
+      );
+
+    it('should return the value untouched when there is no next handler', () => {
+      const returnValue = slowHandlerResult('a');
+      const lastHandler = createHandlerChain([returnValue]);
+
+      expect(
+        instance.forkJoinHandlersIfAttached(returnValue, [], lastHandler),
+      ).toBe(returnValue);
+    });
+
+    it('should run the next handler when the current one completes empty', async () => {
+      const emissions = await emissionsOf(
+        createHandlerChain([EMPTY, slowHandlerResult('next')]),
+      );
+
+      expect(sideEffects).toEqual(['next']);
+      expect(emissions).toHaveLength(1);
+    });
+
+    it('should run the current handler when the next one completes empty', async () => {
+      const emissions = await emissionsOf(
+        createHandlerChain([slowHandlerResult('current'), EMPTY]),
+      );
+
+      expect(sideEffects).toEqual(['current']);
+      expect(emissions).toHaveLength(1);
+    });
+
+    it('should run every handler when the middle one of three completes empty', async () => {
+      const emissions = await emissionsOf(
+        createHandlerChain([
+          slowHandlerResult('first'),
+          EMPTY,
+          slowHandlerResult('last'),
+        ]),
+      );
+
+      expect([...sideEffects].sort()).toEqual(['first', 'last']);
+      expect(emissions).toHaveLength(1);
+    });
+
+    it('should run every handler when the last one of three completes empty', async () => {
+      const emissions = await emissionsOf(
+        createHandlerChain([
+          slowHandlerResult('first'),
+          slowHandlerResult('second'),
+          EMPTY,
+        ]),
+      );
+
+      expect([...sideEffects].sort()).toEqual(['first', 'second']);
+      expect(emissions).toHaveLength(1);
+    });
+
+    it('should still fail the join when one handler errors', async () => {
+      const failure = new Error('handler failed');
+
+      await expect(
+        emissionsOf(
+          createHandlerChain([
+            slowHandlerResult('current'),
+            throwError(() => failure),
+          ]),
+        ),
+      ).rejects.toBe(failure);
+      expect(sideEffects).toEqual(['current']);
+    });
+
+    it('should run the next handlers when the current one errors', async () => {
+      const failure = new Error('handler failed');
+
+      await expect(
+        emissionsOf(
+          createHandlerChain([
+            throwError(() => failure),
+            slowHandlerResult('second'),
+            slowHandlerResult('third'),
+          ]),
+        ),
+      ).rejects.toBe(failure);
+      expect([...sideEffects].sort()).toEqual(['second', 'third']);
+    });
+
+    it('should run the next static handler when the current one completes empty', async () => {
+      vi.spyOn(container, 'getModuleByKey').mockReturnValue({} as any);
+      vi.spyOn(metadataExplorer, 'explore').mockReturnValue([
+        { patterns: ['event'], targetCallback: 'a', isEventHandler: true },
+        { patterns: ['event'], targetCallback: 'b', isEventHandler: true },
+      ] as any);
+      proxySpy
+        .mockReturnValueOnce(EMPTY)
+        .mockReturnValueOnce(slowHandlerResult('next'));
+
+      instance.registerPatternHandlers(
+        new InstanceWrapper({ instance: {} }),
+        server,
+        '',
+      );
+      const [[, head], [, tail]] = addSpy.mock.calls;
+      head.next = tail;
+      const emissions = await emissionsOf(head);
+
+      expect(sideEffects).toEqual(['next']);
+      expect(emissions).toHaveLength(1);
+    });
+
+    it('should run the next request-scoped handler when the current one completes empty', async () => {
+      vi.spyOn(container, 'registerRequestProvider').mockImplementation(
+        () => ({}) as any,
+      );
+      vi.spyOn(injector, 'loadPerContext').mockResolvedValue({
+        handle: () => undefined,
+      });
+      proxySpy
+        .mockReturnValueOnce(EMPTY)
+        .mockReturnValueOnce(slowHandlerResult('next'));
+      const createHandler = () =>
+        instance.createRequestScopedHandler(
+          new InstanceWrapper({ instance: {} }),
+          {},
+          { controllers: new Map() } as any,
+          'moduleKey',
+          'handle',
+          undefined,
+          true,
+        );
+      const head = createHandler();
+      head.next = createHandler();
+
+      const emissions = await emissionsOf(head);
+
+      expect(sideEffects).toEqual(['next']);
+      expect(emissions).toHaveLength(1);
+    });
+
+    describe('when the exception filter of a handler fails', () => {
+      const filterError = new Error('filter failed');
+      let unhandledRejection: ReturnType<typeof vi.fn>;
+      let loggerErrorSpy: ReturnType<typeof vi.spyOn>;
+
+      beforeEach(() => {
+        unhandledRejection = vi.fn();
+        process.on('unhandledRejection', unhandledRejection);
+        loggerErrorSpy = vi
+          .spyOn((BaseRpcExceptionFilter as any).logger, 'error')
+          .mockImplementation(() => {});
+      });
+      afterEach(() => {
+        process.off('unhandledRejection', unhandledRejection);
+        loggerErrorSpy.mockRestore();
+      });
+
+      const flush = () => new Promise(resolve => setImmediate(resolve));
+      // Proxies as the context creator builds them, whose handler fails and
+      // whose filter fails in turn
+      const createFailingProxy = (filter: () => unknown) => {
+        const exceptionsHandler = new RpcExceptionsHandler();
+        exceptionsHandler.setCustomFilters([
+          { exceptionMetatypes: [], func: filter as any },
+        ]);
+        return new RpcProxy().create(async () => {
+          throw new Error('handler failed');
+        }, exceptionsHandler);
+      };
+      const createProxyChain = (
+        proxies: Array<(...args: unknown[]) => Promise<unknown>>,
+      ): MessageHandler => {
+        const [proxy, ...rest] = proxies;
+        const handler: MessageHandler = async (...args: unknown[]) =>
+          instance.forkJoinHandlersIfAttached(
+            proxy(...args) as Promise<unknown>,
+            args,
+            handler,
+          );
+        if (rest.length > 0) {
+          handler.next = createProxyChain(rest);
+        }
+        return handler;
+      };
+      const succeeding = () =>
+        new RpcProxy().create(async () => 'done', new RpcExceptionsHandler());
+
+      it.each([
+        [
+          'throws',
+          () => {
+            throw filterError;
+          },
+        ],
+        [
+          'rejects',
+          async () => {
+            throw filterError;
+          },
+        ],
+      ])(
+        'should not leave the rejection unhandled when the filter %s and the join is never subscribed',
+        async (_, filter) => {
+          // ServerTCP does not subscribe to it for a peer that is gone
+          await createProxyChain([createFailingProxy(filter), succeeding()])(
+            'data',
+          );
+          await flush();
+          await createProxyChain([succeeding(), createFailingProxy(filter)])(
+            'data',
+          );
+          await flush();
+
+          expect(unhandledRejection).not.toHaveBeenCalled();
+          expect(loggerErrorSpy).toHaveBeenCalledTimes(2);
+          expect(loggerErrorSpy).toHaveBeenCalledWith(filterError);
+        },
+      );
+
+      it('should answer the join as an unknown error', async () => {
+        const join = await createProxyChain([
+          createFailingProxy(() => {
+            throw filterError;
+          }),
+          succeeding(),
+        ])('data');
+
+        await expect(
+          lastValueFrom(instance.transformToObservable(join)),
+        ).rejects.toEqual({
+          status: 'error',
+          message: 'Internal server error',
+        });
+      });
+
+      it('should pass on an exception that returns itself from "getError"', async () => {
+        const retriable = new KafkaRetriableException('retry me');
+        const join = await createProxyChain([
+          succeeding(),
+          createFailingProxy(() => {
+            throw retriable;
+          }),
+        ])('data');
+
+        await expect(
+          lastValueFrom(instance.transformToObservable(join)),
+        ).rejects.toBe(retriable);
+        expect(loggerErrorSpy).not.toHaveBeenCalled();
+      });
+    });
+  });
+
+  describe('insertEntrypointDefinition', () => {
+    it('should inspect & insert corresponding entrypoint definitions', () => {
+      class TestCtrl {}
+      const instanceWrapper = new InstanceWrapper({
+        metatype: TestCtrl,
+        name: TestCtrl.name,
+      });
+      const definition: EventOrMessageListenerDefinition = {
+        patterns: ['findOne'],
+        methodKey: 'find',
+        isEventHandler: false,
+        targetCallback: null!,
+        extras: { qos: 2 },
+      };
+      const transportId = Transport.MQTT;
+
+      const insertEntrypointDefinitionSpy = vi.spyOn(
+        graphInspector,
+        'insertEntrypointDefinition',
+      );
+      instance.insertEntrypointDefinition(
+        instanceWrapper,
+        definition,
+        transportId,
+      );
+      expect(insertEntrypointDefinitionSpy).toHaveBeenCalledWith(
+        {
+          type: 'microservice',
+          methodName: definition.methodKey,
+          className: 'TestCtrl',
+          classNodeId: instanceWrapper.id,
+          metadata: {
+            key: definition.patterns.toString(),
+            transportId: 'MQTT',
+            patterns: definition.patterns,
+            isEventHandler: definition.isEventHandler,
+            extras: definition.extras,
+          } as any,
+        },
+        expect.any(String),
+      );
+    });
+  });
+
   describe('assignClientToInstance', () => {
-    it('should assing client to instance', () => {
+    it('should assign client to instance', () => {
       const propertyKey = 'key';
       const object = {};
       const client = { test: true };
       instance.assignClientToInstance(object, propertyKey, client);
 
-      expect(object[propertyKey]).to.be.eql(client);
+      expect(object[propertyKey]).toEqual(client);
     });
   });
 
@@ -229,17 +859,18 @@ describe('ListenersController', () => {
           metadata: {},
         },
       ];
-      sinon
-        .stub((instance as any).metadataExplorer, 'scanForClientHooks')
-        .callsFake(() => metadata);
+      vi.spyOn(
+        (instance as any).metadataExplorer,
+        'scanForClientHooks',
+      ).mockImplementation(() => metadata);
 
-      const assignClientToInstanceSpy = sinon.spy(
+      const assignClientToInstanceSpy = vi.spyOn(
         instance,
         'assignClientToInstance',
       );
       instance.assignClientsToProperties(controller);
 
-      expect(assignClientToInstanceSpy.calledOnce).to.be.true;
+      expect(assignClientToInstanceSpy).toHaveBeenCalledOnce();
     });
   });
 });

@@ -1,42 +1,88 @@
-import { ForbiddenException } from '@nestjs/common/exceptions/forbidden.exception';
-import { expect } from 'chai';
-import { of } from 'rxjs';
-import * as sinon from 'sinon';
-import { PassThrough } from 'stream';
-import { HttpException, HttpStatus, RouteParamMetadata } from '../../../common';
-import { CUSTOM_ROUTE_AGRS_METADATA } from '../../../common/constants';
-import { RouteParamtypes } from '../../../common/enums/route-paramtypes.enum';
-import { AbstractHttpAdapter } from '../../adapters';
-import { ApplicationConfig } from '../../application-config';
-import { FORBIDDEN_MESSAGE } from '../../guards/constants';
-import { GuardsConsumer } from '../../guards/guards-consumer';
-import { GuardsContextCreator } from '../../guards/guards-context-creator';
-import { HandlerResponseBasicFn } from '../../helpers/handler-metadata-storage';
-import { NestContainer } from '../../injector/container';
-import { InterceptorsConsumer } from '../../interceptors/interceptors-consumer';
-import { InterceptorsContextCreator } from '../../interceptors/interceptors-context-creator';
-import { PipesConsumer } from '../../pipes/pipes-consumer';
-import { PipesContextCreator } from '../../pipes/pipes-context-creator';
-import { RouteParamsFactory } from '../../router/route-params-factory';
-import { RouterExecutionContext } from '../../router/router-execution-context';
-import { NoopHttpAdapter } from '../utils/noop-adapter.spec';
+import { ForbiddenException } from '@nestjs/common/exceptions/forbidden.exception.js';
+import { EventEmitter } from 'events';
+import {
+  concatMap,
+  EMPTY,
+  EmptyError,
+  lastValueFrom,
+  map,
+  Observable,
+  of,
+  ReplaySubject,
+  retry,
+  Subject,
+  throwError,
+} from 'rxjs';
+import { PassThrough, Readable, Writable } from 'stream';
+import {
+  CUSTOM_ROUTE_ARGS_METADATA,
+  PARAMTYPES_METADATA,
+} from '../../../common/constants.js';
+import {
+  Body,
+  Req,
+} from '../../../common/decorators/http/route-params.decorator.js';
+import { Sse } from '../../../common/decorators/http/sse.decorator.js';
+import { RouteParamtypes } from '../../../common/enums/route-paramtypes.enum.js';
+import {
+  HttpException,
+  HttpStatus,
+  Logger,
+  type NestInterceptor,
+  RequestMethod,
+  RouteParamMetadata,
+  StreamableFile,
+  UseInterceptors,
+  ValidationPipe,
+} from '../../../common/index.js';
+import { AbstractHttpAdapter } from '../../adapters/index.js';
+import { ApplicationConfig } from '../../application-config.js';
+import { FORBIDDEN_MESSAGE } from '../../guards/constants.js';
+import { GuardsConsumer } from '../../guards/guards-consumer.js';
+import { GuardsContextCreator } from '../../guards/guards-context-creator.js';
+import { HandlerResponseBasicFn } from '../../helpers/handler-metadata-storage.js';
+import { NestContainer } from '../../injector/container.js';
+import { InterceptorsConsumer } from '../../interceptors/interceptors-consumer.js';
+import { InterceptorsContextCreator } from '../../interceptors/interceptors-context-creator.js';
+import { PipesConsumer } from '../../pipes/pipes-consumer.js';
+import { PipesContextCreator } from '../../pipes/pipes-context-creator.js';
+import { isRejectedByPipes } from '../../router/rejected-by-pipes.js';
+import { RouteParamsFactory } from '../../router/route-params-factory.js';
+import { RouterExecutionContext } from '../../router/router-execution-context.js';
+import { HeaderStream } from '../../router/sse-stream.js';
+import { NoopHttpAdapter } from '../utils/noop-adapter.js';
 
 describe('RouterExecutionContext', () => {
   let contextCreator: RouterExecutionContext;
   let callback: any;
-  let applySpy: sinon.SinonSpy;
+  let applySpy: ReturnType<typeof vi.fn>;
   let factory: RouteParamsFactory;
   let consumer: PipesConsumer;
   let guardsConsumer: GuardsConsumer;
   let interceptorsConsumer: InterceptorsConsumer;
   let adapter: AbstractHttpAdapter;
 
+  const attachSocket = <T extends PassThrough>(request: T) =>
+    Object.assign(request, {
+      socket: Object.assign(new EventEmitter(), {
+        setKeepAlive() {},
+        setNoDelay() {},
+        setTimeout() {},
+      }),
+    }) as T & {
+      socket: EventEmitter & {
+        setKeepAlive(): void;
+        setNoDelay(): void;
+        setTimeout(): void;
+      };
+    };
+
   beforeEach(() => {
     callback = {
       bind: () => ({}),
       apply: () => ({}),
     };
-    applySpy = sinon.spy(callback, 'apply');
+    applySpy = vi.spyOn(callback, 'apply');
 
     factory = new RouteParamsFactory();
     consumer = new PipesConsumer();
@@ -55,9 +101,316 @@ describe('RouterExecutionContext', () => {
     );
   });
   describe('create', () => {
+    describe('when the handler has no parameter types', () => {
+      it('should warn once that a ValidationPipe cannot validate its parameters', () => {
+        class TypelessController {
+          public create(@Body() body: object, @Req() req: object) {}
+        }
+        // What a compiler that emits no decorator metadata leaves
+        Reflect.deleteMetadata(
+          PARAMTYPES_METADATA,
+          TypelessController.prototype,
+          'create',
+        );
+        const applicationConfig = new ApplicationConfig();
+        applicationConfig.addGlobalPipe(new ValidationPipe());
+        contextCreator = new RouterExecutionContext(
+          factory,
+          new PipesContextCreator(new NestContainer(), applicationConfig),
+          consumer,
+          new GuardsContextCreator(new NestContainer()),
+          guardsConsumer,
+          new InterceptorsContextCreator(new NestContainer()),
+          interceptorsConsumer,
+          adapter,
+        );
+        const warn = vi
+          .spyOn(Logger.prototype, 'warn')
+          .mockImplementation(() => {});
+
+        const instance = new TypelessController();
+        for (let i = 0; i < 2; i++) {
+          contextCreator.create(
+            instance,
+            instance.create,
+            'create',
+            '',
+            RequestMethod.POST,
+          );
+        }
+        expect(warn).toHaveBeenCalledOnce();
+        expect(warn.mock.calls[0][0]).toContain('TypelessController.create()');
+        warn.mockRestore();
+      });
+    });
+
+    it('should pass an unresolved Promise<Observable> to the SSE response handler', async () => {
+      const result = Promise.resolve(of('test'));
+      const fnHandleResponse = vi.fn().mockResolvedValue(undefined);
+
+      vi.spyOn(contextCreator, 'getMetadata').mockReturnValue({
+        argsLength: 0,
+        fnHandleResponse,
+        isSseHandler: true,
+        paramtypes: [],
+        getParamsMetadata: vi.fn().mockReturnValue([]),
+        httpStatusCode: 200,
+        hasCustomHeaders: false,
+        responseHeaders: [],
+      } as any);
+      vi.spyOn(contextCreator, 'createGuardsFn').mockReturnValue(null as any);
+      vi.spyOn(contextCreator, 'createPipesFn').mockReturnValue(null as any);
+      vi.spyOn(interceptorsConsumer, 'intercept').mockReturnValue(
+        result as any,
+      );
+
+      const proxy = contextCreator.create({} as any, callback, '', '', 0);
+      await proxy({}, {}, vi.fn());
+
+      expect(fnHandleResponse).toHaveBeenCalledOnce();
+      expect(fnHandleResponse.mock.calls[0][0]).toBe(result);
+    });
+
+    describe('when the route has interceptors', () => {
+      const createProxy = (
+        handlerResult: unknown,
+        onHandlerObservable: () => void,
+      ) => {
+        const fnHandleResponse = vi.fn(
+          async (result, _res, _req, handlerObservable$) => {
+            handlerObservable$.subscribe(onHandlerObservable);
+            await lastValueFrom(result);
+          },
+        );
+        vi.spyOn(contextCreator, 'getMetadata').mockReturnValue({
+          argsLength: 0,
+          fnHandleResponse,
+          isSseHandler: false,
+          paramtypes: [],
+          getParamsMetadata: vi.fn().mockReturnValue([]),
+          httpStatusCode: 200,
+          hasCustomHeaders: false,
+          responseHeaders: [],
+        } as any);
+        vi.spyOn(contextCreator, 'createGuardsFn').mockReturnValue(null as any);
+        vi.spyOn(contextCreator, 'createPipesFn').mockReturnValue(null as any);
+        vi.spyOn(
+          (contextCreator as any).interceptorsContextCreator,
+          'create',
+        ).mockReturnValue([{ intercept: (_, next) => next.handle() }]);
+
+        return contextCreator.create(
+          {} as any,
+          { apply: () => handlerResult } as any,
+          '',
+          '',
+          0,
+        );
+      };
+
+      it('should report an Observable returned by the handler', async () => {
+        const onHandlerObservable = vi.fn();
+        const proxy = createProxy(of('test'), onHandlerObservable);
+
+        await proxy({}, {}, vi.fn());
+
+        expect(onHandlerObservable).toHaveBeenCalledOnce();
+      });
+
+      it('should report an Observable the handler resolves to', async () => {
+        const onHandlerObservable = vi.fn();
+        const proxy = createProxy(
+          Promise.resolve(of('test')),
+          onHandlerObservable,
+        );
+
+        await proxy({}, {}, vi.fn());
+
+        expect(onHandlerObservable).toHaveBeenCalledOnce();
+      });
+
+      it('should not report a non-Observable handler result', async () => {
+        const onHandlerObservable = vi.fn();
+        const proxy = createProxy(Promise.resolve('test'), onHandlerObservable);
+
+        await proxy({}, {}, vi.fn());
+
+        expect(onHandlerObservable).not.toHaveBeenCalled();
+      });
+
+      it('should not call "then()" on a returned thenable more than once', async () => {
+        const thenable = { then: vi.fn(resolve => resolve('test')) };
+        const proxy = createProxy(thenable, vi.fn());
+
+        await proxy({}, {}, vi.fn());
+
+        expect(thenable.then).toHaveBeenCalledOnce();
+      });
+
+      describe('disconnect handling', () => {
+        const createRoute = (
+          routeHandler: () => unknown,
+          interceptor: NestInterceptor,
+        ) => {
+          @UseInterceptors(interceptor)
+          class TestController {
+            handle() {
+              return routeHandler();
+            }
+          }
+
+          const controller = new TestController();
+          return contextCreator.create(
+            controller,
+            controller.handle,
+            'handle',
+            '',
+            RequestMethod.GET,
+          );
+        };
+
+        it('should not subscribe a retried Observable when the socket is already destroyed', async () => {
+          const socket = new PassThrough();
+          const subscribe = vi.fn();
+          const retried = new Observable(() => {
+            subscribe();
+          });
+          const routeHandler = vi
+            .fn(() => retried)
+            .mockReturnValueOnce(throwError(() => new Error('first attempt')));
+          const reply = vi.spyOn(adapter, 'reply');
+          const proxy = createRoute(routeHandler, {
+            intercept: (_, next) =>
+              next.handle().pipe(
+                retry({
+                  count: 1,
+                  delay: () => {
+                    // The socket is destroyed before emitting 'close'.
+                    socket.destroy();
+                    return of(undefined);
+                  },
+                }),
+              ),
+          });
+
+          await proxy({ socket }, {}, vi.fn());
+
+          expect(routeHandler).toHaveBeenCalledTimes(2);
+          expect(subscribe).not.toHaveBeenCalled();
+          expect(reply).not.toHaveBeenCalled();
+        });
+
+        it('should tear down the Observable of a retried handler when the client disconnects', async () => {
+          const socket = new EventEmitter();
+          let tornDown = false;
+          const routeHandler = vi
+            .fn(
+              () =>
+                new Observable(() => () => {
+                  tornDown = true;
+                }),
+            )
+            .mockReturnValueOnce(throwError(() => new Error('first attempt')));
+          const reply = vi.spyOn(adapter, 'reply');
+          const proxy = createRoute(routeHandler, {
+            intercept: (_, next) => next.handle().pipe(retry(1)),
+          });
+
+          const pending = proxy({ socket }, {}, vi.fn());
+          await vi.waitFor(() => expect(routeHandler).toHaveBeenCalledTimes(2));
+          expect(socket.listenerCount('close')).toBe(1);
+
+          socket.emit('close');
+          await pending;
+
+          expect(tornDown).toBe(true);
+          expect(reply).not.toHaveBeenCalled();
+          expect(socket.listenerCount('close')).toBe(0);
+        });
+
+        it('should not inspect the socket for a handler returning a Promise of a plain value', async () => {
+          const getSocket = vi.fn(() => new EventEmitter());
+          const request = Object.defineProperty({}, 'socket', {
+            get: getSocket,
+          });
+          const response = {};
+          const reply = vi.spyOn(adapter, 'reply');
+          const proxy = createRoute(() => Promise.resolve('value'), {
+            intercept: (_, next) => next.handle(),
+          });
+
+          await proxy(request, response, vi.fn());
+
+          expect(getSocket).not.toHaveBeenCalled();
+          expect(reply).toHaveBeenCalledWith(response, 'value', undefined);
+        });
+      });
+    });
+
+    describe('when the pipes reject the request', () => {
+      const createProxy = (pipesFn: Function, apply: () => unknown) => {
+        vi.spyOn(contextCreator, 'getMetadata').mockReturnValue({
+          argsLength: 1,
+          fnHandleResponse: vi.fn(),
+          isSseHandler: false,
+          paramtypes: [],
+          getParamsMetadata: vi.fn().mockReturnValue([]),
+          httpStatusCode: 200,
+          hasCustomHeaders: false,
+          responseHeaders: [],
+        } as any);
+        vi.spyOn(contextCreator, 'createGuardsFn').mockReturnValue(null as any);
+        vi.spyOn(contextCreator, 'createPipesFn').mockReturnValue(
+          pipesFn as any,
+        );
+        return contextCreator.create({} as any, { apply } as any, '', '', 0);
+      };
+
+      it('should record that the route handler did not run', async () => {
+        const error = new HttpException('Validation failed', 400);
+        const apply = vi.fn();
+        const req = {};
+        const proxy = createProxy(() => Promise.reject(error), apply);
+
+        await expect(proxy(req, {}, vi.fn())).rejects.toBe(error);
+
+        expect(apply).not.toHaveBeenCalled();
+        expect(isRejectedByPipes(req)).toBe(true);
+      });
+
+      it('should record it under the registered symbol the platform packages read', async () => {
+        const error = new HttpException('Validation failed', 400);
+        const req = {};
+        const proxy = createProxy(() => Promise.reject(error), vi.fn());
+
+        await expect(proxy(req, {}, vi.fn())).rejects.toBe(error);
+
+        expect(
+          (req as Record<symbol, unknown>)[
+            Symbol.for('nestjs:rejected-by-pipes')
+          ],
+        ).toBe(true);
+      });
+
+      it('should not record a request whose route handler fails', async () => {
+        const error = new Error('handler failed');
+        const req = {};
+        const proxy = createProxy(
+          () => Promise.resolve(),
+          () => {
+            throw error;
+          },
+        );
+
+        await expect(proxy(req, {}, vi.fn())).rejects.toBe(error);
+
+        expect(isRejectedByPipes(req)).toBe(false);
+      });
+    });
+
     describe('when callback metadata is not undefined', () => {
       let metadata: Record<number, RouteParamMetadata>;
-      let exchangeKeysForValuesSpy: sinon.SinonSpy;
+      let exchangeKeysForValuesSpy: ReturnType<typeof vi.fn>;
       beforeEach(() => {
         metadata = {
           [RouteParamtypes.NEXT]: { index: 0 },
@@ -66,28 +419,35 @@ describe('RouterExecutionContext', () => {
             data: 'test',
           },
         };
-        sinon
-          .stub((contextCreator as any).contextUtils, 'reflectCallbackMetadata')
-          .returns(metadata);
-        sinon
-          .stub(
-            (contextCreator as any).contextUtils,
-            'reflectCallbackParamtypes',
-          )
-          .returns([]);
-        exchangeKeysForValuesSpy = sinon.spy(
+        vi.spyOn(
+          (contextCreator as any).contextUtils,
+          'reflectCallbackMetadata',
+        ).mockReturnValue(metadata);
+        vi.spyOn(
+          (contextCreator as any).contextUtils,
+          'reflectCallbackParamtypes',
+        ).mockReturnValue([]);
+        exchangeKeysForValuesSpy = vi.spyOn(
           contextCreator,
           'exchangeKeysForValues',
         );
       });
-      it('should call "exchangeKeysForValues" with expected arguments', done => {
-        const keys = Object.keys(metadata);
+      it('should call "exchangeKeysForValues" with expected arguments', () =>
+        new Promise<void>(done => {
+          const keys = Object.keys(metadata);
 
-        contextCreator.create({ foo: 'bar' }, callback as any, '', '', 0);
-        expect(exchangeKeysForValuesSpy.called).to.be.true;
-        expect(exchangeKeysForValuesSpy.calledWith(keys, metadata)).to.be.true;
-        done();
-      });
+          contextCreator.create({ foo: 'bar' }, callback, '', '', 0);
+          expect(exchangeKeysForValuesSpy).toHaveBeenCalled();
+          expect(exchangeKeysForValuesSpy).toHaveBeenCalledWith(
+            keys,
+            metadata,
+            '',
+            expect.anything(),
+            undefined,
+            expect.any(Function),
+          );
+          done();
+        }));
       describe('returns proxy function', () => {
         let proxyContext;
         let instance;
@@ -97,23 +457,19 @@ describe('RouterExecutionContext', () => {
 
           const canActivateFn = contextCreator.createGuardsFn(
             [1] as any,
-            null,
-            null,
+            null!,
+            null!,
           );
-          sinon.stub(contextCreator, 'createGuardsFn').returns(canActivateFn);
-          tryActivateStub = sinon
-            .stub(guardsConsumer, 'tryActivate')
-            .callsFake(async () => true);
-          proxyContext = contextCreator.create(
-            instance,
-            callback as any,
-            '',
-            '',
-            0,
+          vi.spyOn(contextCreator, 'createGuardsFn').mockReturnValue(
+            canActivateFn,
           );
+          tryActivateStub = vi
+            .spyOn(guardsConsumer, 'tryActivate')
+            .mockImplementation(async () => true);
+          proxyContext = contextCreator.create(instance, callback, '', '', 0);
         });
         it('should be a function', () => {
-          expect(proxyContext).to.be.a('function');
+          expect(proxyContext).toBeTypeOf('function');
         });
         describe('when proxy function called', () => {
           let request;
@@ -131,17 +487,31 @@ describe('RouterExecutionContext', () => {
               },
             };
           });
-          it('should apply expected context and arguments to callback', done => {
-            tryActivateStub.callsFake(async () => true);
-            proxyContext(request, response, next).then(() => {
-              const args = [next, undefined, request.body.test];
-              expect(applySpy.called).to.be.true;
-              expect(applySpy.calledWith(instance, args)).to.be.true;
-              done();
+          it('should apply expected context and arguments to callback', () =>
+            new Promise<void>(done => {
+              tryActivateStub.mockImplementation(async () => true);
+              proxyContext(request, response, next).then(() => {
+                const args = [next, undefined, request.body.test];
+                expect(applySpy).toHaveBeenCalled();
+                expect(applySpy).toHaveBeenCalledWith(instance, args);
+                done();
+              });
+            }));
+          it('should reject without calling the handler when a param cannot be extracted', async () => {
+            const error = new Error('unreadable body');
+            const unreadable = Object.defineProperty({}, 'body', {
+              get() {
+                throw error;
+              },
             });
+
+            await expect(proxyContext(unreadable, response, next)).rejects.toBe(
+              error,
+            );
+            expect(applySpy).not.toHaveBeenCalled();
           });
           it('should throw exception when "tryActivate" returns false', async () => {
-            tryActivateStub.callsFake(async () => false);
+            tryActivateStub.mockImplementation(async () => false);
 
             let error: HttpException;
             try {
@@ -149,9 +519,9 @@ describe('RouterExecutionContext', () => {
             } catch (e) {
               error = e;
             }
-            expect(error).to.be.instanceOf(ForbiddenException);
-            expect(error.message).to.be.eql('Forbidden resource');
-            expect(error.getResponse()).to.be.eql({
+            expect(error!).toBeInstanceOf(ForbiddenException);
+            expect(error!.message).toEqual('Forbidden resource');
+            expect(error!.getResponse()).toEqual({
               statusCode: HttpStatus.FORBIDDEN,
               error: 'Forbidden',
               message: FORBIDDEN_MESSAGE,
@@ -159,17 +529,19 @@ describe('RouterExecutionContext', () => {
           });
           it('should apply expected context when "canActivateFn" apply', () => {
             proxyContext(request, response, next).then(() => {
-              expect(tryActivateStub.args[0][1][0]).to.equals(request);
-              expect(tryActivateStub.args[0][1][1]).to.equals(response);
-              expect(tryActivateStub.args[0][1][2]).to.equals(next);
+              expect(tryActivateStub.mock.calls[0][1][0]).toBe(request);
+              expect(tryActivateStub.mock.calls[0][1][1]).toBe(response);
+              expect(tryActivateStub.mock.calls[0][1][2]).toBe(next);
             });
           });
           it('should apply expected context when "intercept" apply', () => {
-            const interceptStub = sinon.stub(interceptorsConsumer, 'intercept');
+            const interceptStub = vi
+              .spyOn(interceptorsConsumer, 'intercept')
+              .mockImplementation(() => ({}) as any);
             proxyContext(request, response, next).then(() => {
-              expect(interceptStub.args[0][1][0]).to.equals(request);
-              expect(interceptStub.args[0][1][1]).to.equals(response);
-              expect(interceptStub.args[0][1][2]).to.equals(next);
+              expect(interceptStub.mock.calls[0][1][0]).toBe(request);
+              expect(interceptStub.mock.calls[0][1][1]).toBe(response);
+              expect(interceptStub.mock.calls[0][1][2]).toBe(next);
             });
           });
         });
@@ -182,7 +554,7 @@ describe('RouterExecutionContext', () => {
       const metadata = {
         [RouteParamtypes.REQUEST]: { index: 0, data: 'test', pipes: [] },
         [RouteParamtypes.BODY]: { index: 2, data: 'test', pipes: [] },
-        [`key${CUSTOM_ROUTE_AGRS_METADATA}`]: {
+        [`key${CUSTOM_ROUTE_ARGS_METADATA}`]: {
           index: 3,
           data: 'custom',
           pipes: [],
@@ -193,62 +565,67 @@ describe('RouterExecutionContext', () => {
       const expectedValues = [
         { index: 0, type: RouteParamtypes.REQUEST, data: 'test' },
         { index: 2, type: RouteParamtypes.BODY, data: 'test' },
-        { index: 3, type: `key${CUSTOM_ROUTE_AGRS_METADATA}`, data: 'custom' },
+        { index: 3, type: `key${CUSTOM_ROUTE_ARGS_METADATA}`, data: 'custom' },
       ];
-      expect(values[0]).to.deep.include(expectedValues[0]);
-      expect(values[1]).to.deep.include(expectedValues[1]);
+      expect(values[0]).toMatchObject(expectedValues[0]);
+      expect(values[1]).toMatchObject(expectedValues[1]);
     });
   });
 
   describe('getParamValue', () => {
-    let consumerApplySpy: sinon.SinonSpy;
+    let consumerApplySpy: ReturnType<typeof vi.fn>;
     const value = 3,
       metatype = null,
-      transforms = [{ transform: sinon.spy() }];
+      transforms = [{ transform: vi.fn() }];
 
     beforeEach(() => {
-      consumerApplySpy = sinon.spy(consumer, 'apply');
+      consumerApplySpy = vi.spyOn(consumer, 'apply');
     });
-    describe('when paramtype is query, body or param', () => {
-      it('should call "consumer.apply" with expected arguments', () => {
-        contextCreator.getParamValue(
+    describe('when paramtype is query, body, rawBody or param', () => {
+      it('should call "consumer.apply" with expected arguments', async () => {
+        await contextCreator.getParamValue(
           value,
           { metatype, type: RouteParamtypes.QUERY, data: null },
           transforms,
         );
-        expect(
-          consumerApplySpy.calledWith(
-            value,
-            { metatype, type: RouteParamtypes.QUERY, data: null },
-            transforms,
-          ),
-        ).to.be.true;
+        expect(consumerApplySpy).toHaveBeenCalledWith(
+          value,
+          { metatype, type: RouteParamtypes.QUERY, data: null },
+          transforms,
+        );
 
-        contextCreator.getParamValue(
+        await contextCreator.getParamValue(
           value,
           { metatype, type: RouteParamtypes.BODY, data: null },
           transforms,
         );
-        expect(
-          consumerApplySpy.calledWith(
-            value,
-            { metatype, type: RouteParamtypes.BODY, data: null },
-            transforms,
-          ),
-        ).to.be.true;
+        expect(consumerApplySpy).toHaveBeenCalledWith(
+          value,
+          { metatype, type: RouteParamtypes.BODY, data: null },
+          transforms,
+        );
 
-        contextCreator.getParamValue(
+        await contextCreator.getParamValue(
+          value,
+          { metatype, type: RouteParamtypes.RAW_BODY, data: null },
+          transforms,
+        );
+        expect(consumerApplySpy).toHaveBeenCalledWith(
+          value,
+          { metatype, type: RouteParamtypes.RAW_BODY, data: null },
+          transforms,
+        );
+
+        await contextCreator.getParamValue(
           value,
           { metatype, type: RouteParamtypes.PARAM, data: null },
           transforms,
         );
-        expect(
-          consumerApplySpy.calledWith(
-            value,
-            { metatype, type: RouteParamtypes.PARAM, data: null },
-            transforms,
-          ),
-        ).to.be.true;
+        expect(consumerApplySpy).toHaveBeenCalledWith(
+          value,
+          { metatype, type: RouteParamtypes.PARAM, data: null },
+          transforms,
+        );
       });
     });
   });
@@ -256,13 +633,20 @@ describe('RouterExecutionContext', () => {
     describe('when paramtype is not query, body, param and custom', () => {
       it('should return false', () => {
         const result = contextCreator.isPipeable(RouteParamtypes.NEXT);
-        expect(result).to.be.false;
+        expect(result).toBe(false);
       });
       it('otherwise', () => {
-        expect(contextCreator.isPipeable(RouteParamtypes.BODY)).to.be.true;
-        expect(contextCreator.isPipeable(RouteParamtypes.QUERY)).to.be.true;
-        expect(contextCreator.isPipeable(RouteParamtypes.PARAM)).to.be.true;
-        expect(contextCreator.isPipeable('custom')).to.be.true;
+        expect(contextCreator.isPipeable(RouteParamtypes.BODY)).toBe(true);
+        expect(contextCreator.isPipeable(RouteParamtypes.RAW_BODY)).toBe(true);
+        expect(contextCreator.isPipeable(RouteParamtypes.QUERY)).toBe(true);
+        expect(contextCreator.isPipeable(RouteParamtypes.PARAM)).toBe(true);
+        expect(contextCreator.isPipeable(RouteParamtypes.FILE)).toBe(true);
+        expect(contextCreator.isPipeable(RouteParamtypes.FILES)).toBe(true);
+        expect(contextCreator.isPipeable(RouteParamtypes.COOKIES)).toBe(true);
+        expect(contextCreator.isPipeable(RouteParamtypes.SIGNED_COOKIES)).toBe(
+          true,
+        );
+        expect(contextCreator.isPipeable('custom')).toBe(true);
       });
     });
   });
@@ -270,14 +654,245 @@ describe('RouterExecutionContext', () => {
     describe('when "paramsOptions" is empty', () => {
       it('returns null', async () => {
         const pipesFn = contextCreator.createPipesFn([], []);
-        expect(pipesFn).to.be.null;
+        expect(pipesFn).toBeNull();
+      });
+    });
+    describe('when no pipe runs on a param', () => {
+      const param = (
+        index: number,
+        type: RouteParamtypes | string,
+        extractValue: (...args: any[]) => unknown,
+      ) => ({ index, type, data: undefined, pipes: [], extractValue });
+      const nextParam = param(
+        0,
+        RouteParamtypes.NEXT,
+        (_req, _res, next) => next,
+      );
+
+      it('fills the args without returning a promise', () => {
+        const next = () => {};
+        const pipesFn = contextCreator.createPipesFn(
+          [],
+          [
+            param(1, RouteParamtypes.PARAM, (req: any) => req.params),
+            nextParam,
+          ],
+        )!;
+        const args = [undefined, undefined];
+        const params = { id: '42' };
+
+        expect(pipesFn(args, { params }, {}, next)).toBeUndefined();
+        expect(args).toEqual([next, params]);
+      });
+      it('ignores global pipes when no param is pipeable', () => {
+        const next = () => {};
+        const globalPipe = { transform: vi.fn() };
+        const pipesFn = contextCreator.createPipesFn(
+          [globalPipe],
+          [nextParam],
+        )!;
+        const args = [undefined];
+
+        expect(pipesFn(args, {}, {}, next)).toBeUndefined();
+        expect(args).toEqual([next]);
+        expect(globalPipe.transform).not.toHaveBeenCalled();
+      });
+      it('settles a thenable a pipeable param resolves to, calling "then()" once', async () => {
+        const thenable = { then: vi.fn(resolve => resolve('user')) };
+        const pipesFn = contextCreator.createPipesFn(
+          [],
+          [param(0, 'custom', () => thenable)],
+        )!;
+        const args = [undefined];
+
+        await pipesFn(args, {}, {}, () => {});
+
+        expect(args).toEqual(['user']);
+        expect(thenable.then).toHaveBeenCalledOnce();
+      });
+      it('passes a thenable a non-pipeable param resolves to as it is', () => {
+        // e.g. a Fastify reply injected with @Res()
+        const reply = { then: vi.fn() };
+        const pipesFn = contextCreator.createPipesFn(
+          [],
+          [param(0, RouteParamtypes.RESPONSE, () => reply)],
+        )!;
+        const args = [undefined];
+
+        expect(pipesFn(args, {}, {}, () => {})).toBeUndefined();
+        expect(args).toEqual([reply]);
+        expect(reply.then).not.toHaveBeenCalled();
+      });
+      it('runs every extractor and rejects with the first error', async () => {
+        const first = new Error('first');
+        const last = vi.fn(() => 'last');
+        const pipesFn = contextCreator.createPipesFn(
+          [],
+          [
+            param(0, RouteParamtypes.REQUEST, () => {
+              throw first;
+            }),
+            param(1, RouteParamtypes.REQUEST, () => {
+              throw new Error('second');
+            }),
+            param(2, RouteParamtypes.REQUEST, last),
+          ],
+        )!;
+
+        await expect(pipesFn([], {}, {}, () => {})).rejects.toBe(first);
+        expect(last).toHaveBeenCalledOnce();
+      });
+      it('rejects with an extractor error before an earlier thenable rejects', async () => {
+        const error = new Error('extractor');
+        const thenable = {
+          then: vi.fn((_resolve, reject) => reject(new Error('thenable'))),
+        };
+        const pipesFn = contextCreator.createPipesFn(
+          [],
+          [
+            param(0, 'custom', () => thenable),
+            param(1, 'custom', () => {
+              throw error;
+            }),
+          ],
+        )!;
+
+        await expect(pipesFn([], {}, {}, () => {})).rejects.toBe(error);
+        expect(thenable.then).toHaveBeenCalledOnce();
+      });
+    });
+    describe('when a pipe applies', () => {
+      it('runs the global pipes, then the param pipes, on pipeable params only', async () => {
+        const next = () => {};
+        const globalPipe = { transform: vi.fn(async value => `${value}-g`) };
+        const paramPipe = { transform: vi.fn(value => `${value}-p`) };
+        const pipesFn = contextCreator.createPipesFn(
+          [globalPipe],
+          [
+            {
+              index: 0,
+              type: RouteParamtypes.PARAM,
+              data: 'id',
+              pipes: [paramPipe],
+              extractValue: () => '42',
+            },
+            {
+              index: 1,
+              type: RouteParamtypes.NEXT,
+              data: undefined,
+              pipes: [],
+              extractValue: (_req, _res, next) => next,
+            },
+          ],
+        )!;
+        const args = [undefined, undefined];
+
+        await pipesFn(args, {}, {}, next);
+        await pipesFn(args, {}, {}, next);
+
+        expect(args).toEqual(['42-g-p', next]);
+        expect(globalPipe.transform).toHaveBeenCalledTimes(2);
+        expect(globalPipe.transform).toHaveBeenCalledWith('42', {
+          metatype: undefined,
+          type: 'param',
+          data: 'id',
+          schema: undefined,
+        });
+      });
+      it("starts each param's pipes right after extracting it", async () => {
+        const order: string[] = [];
+        const pipe = {
+          transform: (value: string) => {
+            order.push(`transform ${value}`);
+            return value;
+          },
+        };
+        const query = (index: number) => ({
+          index,
+          type: RouteParamtypes.QUERY,
+          data: undefined,
+          pipes: [],
+          extractValue: () => {
+            order.push(`extract ${index}`);
+            return `${index}`;
+          },
+        });
+        const pipesFn = contextCreator.createPipesFn(
+          [pipe],
+          [query(0), query(1)],
+        )!;
+
+        await pipesFn([], {}, {}, () => {});
+
+        expect(order).toEqual([
+          'extract 0',
+          'transform 0',
+          'extract 1',
+          'transform 1',
+        ]);
+      });
+    });
+    describe('when a custom param gives the response', () => {
+      const custom = (
+        extractValue: (...args: any[]) => unknown,
+        pipes: any[] = [],
+      ) => ({ index: 0, type: 'custom', data: undefined, pipes, extractValue });
+      const toResponse = (_req: unknown, res: unknown) => res;
+
+      it('passes a thenable response as it is, running no pipe on it', () => {
+        // e.g. a Fastify reply, whose then() waits for it to be sent
+        const reply = { then: vi.fn() };
+        const globalPipe = { transform: vi.fn(async value => value) };
+        const paramPipe = { transform: vi.fn(value => value) };
+        const pipesFn = contextCreator.createPipesFn(
+          [globalPipe],
+          [custom(toResponse, [paramPipe])],
+        )!;
+        const args = [undefined];
+
+        expect(pipesFn(args, {}, reply, () => {})).toBeUndefined();
+        expect(args[0]).toBe(reply);
+        expect(reply.then).not.toHaveBeenCalled();
+        expect(globalPipe.transform).not.toHaveBeenCalled();
+        expect(paramPipe.transform).not.toHaveBeenCalled();
+      });
+      it('passes a response that is not a thenable as it is too', () => {
+        const res = {};
+        const globalPipe = { transform: vi.fn(value => value) };
+        const pipesFn = contextCreator.createPipesFn(
+          [globalPipe],
+          [custom(toResponse)],
+        )!;
+        const args = [undefined];
+
+        expect(pipesFn(args, {}, res, () => {})).toBeUndefined();
+        expect(args[0]).toBe(res);
+        expect(globalPipe.transform).not.toHaveBeenCalled();
+      });
+      it('still settles any other thenable and runs the pipes on its value, calling "then()" once', async () => {
+        const reply = { then: vi.fn() };
+        const thenable = { then: vi.fn(resolve => resolve('user')) };
+        const globalPipe = { transform: vi.fn(async value => `${value}-g`) };
+        const pipesFn = contextCreator.createPipesFn(
+          [globalPipe],
+          [custom(() => thenable)],
+        )!;
+        const args = [undefined];
+
+        await pipesFn(args, {}, reply, () => {});
+
+        expect(args).toEqual(['user-g']);
+        expect(thenable.then).toHaveBeenCalledOnce();
+        expect(reply.then).not.toHaveBeenCalled();
       });
     });
   });
   describe('createGuardsFn', () => {
     it('should throw ForbiddenException when "tryActivate" returns false', async () => {
-      const guardsFn = contextCreator.createGuardsFn([null], null, null);
-      sinon.stub(guardsConsumer, 'tryActivate').callsFake(async () => false);
+      const guardsFn = contextCreator.createGuardsFn([null!], null!, null!)!;
+      vi.spyOn(guardsConsumer, 'tryActivate').mockImplementation(
+        async () => false,
+      );
 
       let error: ForbiddenException;
       try {
@@ -286,9 +901,9 @@ describe('RouterExecutionContext', () => {
         error = e;
       }
 
-      expect(error).to.be.instanceOf(ForbiddenException);
-      expect(error.message).to.be.eql('Forbidden resource');
-      expect(error.getResponse()).to.be.eql({
+      expect(error!).toBeInstanceOf(ForbiddenException);
+      expect(error!.message).toEqual('Forbidden resource');
+      expect(error!.getResponse()).toEqual({
         statusCode: HttpStatus.FORBIDDEN,
         message: FORBIDDEN_MESSAGE,
         error: 'Forbidden',
@@ -296,66 +911,218 @@ describe('RouterExecutionContext', () => {
     });
   });
   describe('createHandleResponseFn', () => {
+    describe('when a route handler produced a stream', () => {
+      const response = {};
+      const request = { method: 'GET', socket: new PassThrough() };
+      const stream = async () => {
+        const reply = vi.spyOn(adapter, 'reply').mockReturnValue(undefined);
+        const handler = contextCreator.createHandleResponseFn(
+          (() => undefined) as any,
+          false,
+        ) as HandlerResponseBasicFn;
+        return { reply, handler };
+      };
+      async function* generator() {
+        yield 'chunk';
+      }
+
+      afterEach(async () => {
+        const [, body] =
+          (adapter.reply as unknown as ReturnType<typeof vi.fn>).mock
+            .calls[0] ?? [];
+        if (body instanceof StreamableFile) {
+          body.getStream().destroy();
+        }
+      });
+
+      it('should stream what the interceptors hand back', async () => {
+        const { reply, handler } = await stream();
+        const apply = vi.spyOn(contextCreator['responseController'], 'apply');
+
+        await handler(generator(), response, request);
+
+        expect(reply.mock.calls[0][1]).toBeInstanceOf(StreamableFile);
+        expect(apply).not.toHaveBeenCalled();
+      });
+
+      it('should stream the stream an interceptor wrapped', async () => {
+        const { reply, handler } = await stream();
+        const body = generator();
+        const send = vi.spyOn(contextCreator['responseController'], 'stream');
+
+        await handler({ data: body }, response, request, undefined, [body]);
+
+        expect(send.mock.calls[0][0]).toBe(body);
+        expect(reply.mock.calls[0][1]).toBeInstanceOf(StreamableFile);
+      });
+
+      it('should stream the one an interceptor replaced it with, not its own, if another wrapped that', async () => {
+        const { handler } = await stream();
+        const replaced = generator();
+        const send = vi.spyOn(contextCreator['responseController'], 'stream');
+
+        await handler({ data: replaced }, response, request, undefined, [
+          generator(),
+        ]);
+
+        expect(send.mock.calls[0][0]).toBe(replaced);
+      });
+
+      it.each([
+        ['an object', { message: 'Paid plans only' }],
+        ['an empty object', {}],
+        ['an array', []],
+        ['a string', 'Paid plans only'],
+        ['null', null],
+        ['nothing', undefined],
+        ['a class instance that wraps it', new (class Page {})()],
+        ['an object that wraps it deeper', { result: { data: {} } }],
+      ])(
+        'should send %s an interceptor replaced it with',
+        async (_, notice) => {
+          const { reply, handler } = await stream();
+          const send = vi.spyOn(contextCreator['responseController'], 'stream');
+
+          await handler(notice, response, request, undefined, [generator()]);
+
+          expect(send).not.toHaveBeenCalled();
+          expect(reply.mock.calls[0][1]).toBe(notice);
+        },
+      );
+
+      it('should send what an interceptor made of a stream it read', async () => {
+        const { reply, handler } = await stream();
+        const body = new Response('body');
+        await body.text();
+
+        await handler({ read: true }, response, request, undefined, [body]);
+
+        expect(reply.mock.calls[0][1]).toEqual({ read: true });
+      });
+
+      it('should not look for a stream in what a handler that does not stream returned', async () => {
+        const { reply, handler } = await stream();
+        const wrapped = { data: generator() };
+
+        await handler(wrapped, response, request);
+
+        expect(reply.mock.calls[0][1]).toBe(wrapped);
+      });
+
+      it('should send a file an interceptor replaced it with', async () => {
+        const { reply, handler } = await stream();
+        const file = new StreamableFile(Buffer.from('file'));
+
+        await handler(file, response, request, undefined, [generator()]);
+
+        expect(reply.mock.calls[0][1]).toBe(file);
+      });
+
+      it('should not look at it when the handler sends the response', async () => {
+        const reply = vi.spyOn(adapter, 'reply').mockReturnValue(undefined);
+        const handler = contextCreator.createHandleResponseFn(
+          (() => undefined) as any,
+          true,
+        ) as HandlerResponseBasicFn;
+        const onStart = vi.fn();
+
+        await handler(
+          (async function* () {
+            onStart();
+            yield 'chunk';
+          })(),
+          response,
+          request,
+        );
+
+        expect(reply).not.toHaveBeenCalled();
+        expect(onStart).not.toHaveBeenCalled();
+      });
+
+      it('should cancel the stream when an interceptor fails', async () => {
+        const { handler } = await stream();
+        const onCancel = vi.fn();
+        const body = new ReadableStream({ cancel: onCancel });
+        const failure = new Error('rejected');
+
+        await expect(
+          handler(
+            throwError(() => failure),
+            response,
+            request,
+            undefined,
+            [body],
+          ),
+        ).rejects.toBe(failure);
+
+        await vi.waitFor(() => expect(onCancel).toHaveBeenCalledTimes(1));
+      });
+    });
+
     describe('when "renderTemplate" is defined', () => {
       beforeEach(() => {
-        sinon
-          .stub(adapter, 'render')
-          .callsFake((response, view: string, options: any) => {
+        vi.spyOn(adapter, 'render').mockImplementation(
+          (response, view: string, options: any) => {
             return response.render(view, options);
-          });
+          },
+        );
       });
       it('should call "res.render()" with expected args', async () => {
         const template = 'template';
         const value = 'test';
-        const response = { render: sinon.spy() };
+        const response = { render: vi.fn() };
 
-        sinon.stub(contextCreator, 'reflectRenderTemplate').returns(template);
+        vi.spyOn(contextCreator, 'reflectRenderTemplate').mockReturnValue(
+          template,
+        );
 
         const handler = contextCreator.createHandleResponseFn(
-          null,
+          null!,
           true,
           undefined,
           200,
         ) as HandlerResponseBasicFn;
         await handler(value, response);
 
-        expect(response.render.calledWith(template, value)).to.be.true;
+        expect(response.render).toHaveBeenCalledWith(template, value);
       });
     });
     describe('when "renderTemplate" is undefined', () => {
       it('should not call "res.render()"', async () => {
         const result = Promise.resolve('test');
-        const response = { render: sinon.spy() };
+        const response = { render: vi.fn() };
 
-        sinon.stub(contextCreator, 'reflectResponseHeaders').returns([]);
-        sinon.stub(contextCreator, 'reflectRenderTemplate').returns(undefined);
-        sinon.stub(contextCreator, 'reflectSse').returns(undefined);
+        vi.spyOn(contextCreator, 'reflectResponseHeaders').mockReturnValue([]);
+        vi.spyOn(contextCreator, 'reflectRenderTemplate').mockReturnValue(
+          undefined!,
+        );
+        vi.spyOn(contextCreator, 'reflectSse').mockReturnValue(undefined!);
 
         const handler = contextCreator.createHandleResponseFn(
-          null,
+          null!,
           true,
           undefined,
           200,
         ) as HandlerResponseBasicFn;
         await handler(result, response);
 
-        expect(response.render.called).to.be.false;
+        expect(response.render).not.toHaveBeenCalled();
       });
     });
     describe('when "redirectResponse" is present', () => {
       beforeEach(() => {
-        sinon
-          .stub(adapter, 'redirect')
-          .callsFake((response, statusCode: number, url: string) => {
+        vi.spyOn(adapter, 'redirect').mockImplementation(
+          (response, statusCode: number, url: string) => {
             return response.redirect(statusCode, url);
-          });
+          },
+        );
       });
       it('should call "res.redirect()" with expected args', async () => {
         const redirectResponse = {
           url: 'http://test.com',
           statusCode: 302,
         };
-        const response = { redirect: sinon.spy() };
+        const response = { redirect: vi.fn() };
 
         const handler = contextCreator.createHandleResponseFn(
           () => {},
@@ -365,33 +1132,33 @@ describe('RouterExecutionContext', () => {
         ) as HandlerResponseBasicFn;
         await handler(redirectResponse, response);
 
-        expect(
-          response.redirect.calledWith(
-            redirectResponse.statusCode,
-            redirectResponse.url,
-          ),
-        ).to.be.true;
+        expect(response.redirect).toHaveBeenCalledWith(
+          redirectResponse.statusCode,
+          redirectResponse.url,
+        );
       });
     });
 
     describe('when "redirectResponse" is undefined', () => {
       it('should not call "res.redirect()"', async () => {
         const result = Promise.resolve('test');
-        const response = { redirect: sinon.spy() };
+        const response = { redirect: vi.fn() };
 
-        sinon.stub(contextCreator, 'reflectResponseHeaders').returns([]);
-        sinon.stub(contextCreator, 'reflectRenderTemplate').returns(undefined);
-        sinon.stub(contextCreator, 'reflectSse').returns(undefined);
+        vi.spyOn(contextCreator, 'reflectResponseHeaders').mockReturnValue([]);
+        vi.spyOn(contextCreator, 'reflectRenderTemplate').mockReturnValue(
+          undefined!,
+        );
+        vi.spyOn(contextCreator, 'reflectSse').mockReturnValue(undefined!);
 
         const handler = contextCreator.createHandleResponseFn(
-          null,
+          null!,
           true,
           undefined,
           200,
         ) as HandlerResponseBasicFn;
         await handler(result, response);
 
-        expect(response.redirect.called).to.be.false;
+        expect(response.redirect).not.toHaveBeenCalled();
       });
     });
 
@@ -400,24 +1167,611 @@ describe('RouterExecutionContext', () => {
         const result = Promise.resolve('test');
         const response = {};
 
-        sinon.stub(contextCreator, 'reflectRenderTemplate').returns(undefined);
-        sinon.stub(contextCreator, 'reflectSse').returns(undefined);
+        vi.spyOn(contextCreator, 'reflectRenderTemplate').mockReturnValue(
+          undefined!,
+        );
+        vi.spyOn(contextCreator, 'reflectSse').mockReturnValue(undefined!);
 
         const handler = contextCreator.createHandleResponseFn(
-          null,
+          null!,
           false,
           undefined,
           1234,
         ) as HandlerResponseBasicFn;
-        const adapterReplySpy = sinon.spy(adapter, 'reply');
+        const adapterReplySpy = vi.spyOn(adapter, 'reply');
         await handler(result, response);
-        expect(
-          adapterReplySpy.calledOnceWithExactly(
-            sinon.match.same(response),
-            'test',
-            1234,
+        expect(adapterReplySpy).toHaveBeenCalledWith(response, 'test', 1234);
+      });
+
+      it('should reject with EmptyError when an Observable completes without emitting', async () => {
+        vi.spyOn(contextCreator, 'reflectRenderTemplate').mockReturnValue(
+          undefined!,
+        );
+        vi.spyOn(contextCreator, 'reflectSse').mockReturnValue(undefined!);
+
+        const handler = contextCreator.createHandleResponseFn(
+          null!,
+          false,
+          undefined,
+          200,
+        ) as HandlerResponseBasicFn;
+
+        await expect(handler(EMPTY, {})).rejects.toBeInstanceOf(EmptyError);
+      });
+    });
+
+    describe('when the client disconnects', () => {
+      let handler: HandlerResponseBasicFn;
+      let adapterReplySpy: ReturnType<typeof vi.spyOn>;
+      let request: { socket: EventEmitter & { destroyed?: boolean } };
+      const response = {};
+
+      const createProducer = () => {
+        const producer = { subscribed: false, tornDown: false };
+        const source = new Subject<string>();
+        const observable = new Observable<string>(subscriber => {
+          producer.subscribed = true;
+          const subscription = source.subscribe(subscriber);
+          return () => {
+            producer.tornDown = true;
+            subscription.unsubscribe();
+          };
+        });
+        return { producer, source, observable };
+      };
+
+      beforeEach(() => {
+        vi.spyOn(contextCreator, 'reflectRenderTemplate').mockReturnValue(
+          undefined!,
+        );
+        vi.spyOn(contextCreator, 'reflectSse').mockReturnValue(undefined!);
+        handler = contextCreator.createHandleResponseFn(
+          null!,
+          false,
+          undefined,
+          200,
+        ) as HandlerResponseBasicFn;
+        adapterReplySpy = vi.spyOn(adapter, 'reply');
+        request = { socket: new EventEmitter() };
+      });
+
+      it('should still reply to a non-Observable result', async () => {
+        request.socket.destroyed = true;
+        const expressResponse = { socket: request.socket };
+
+        await handler(Promise.resolve('test'), expressResponse, request);
+
+        expect(adapterReplySpy).toHaveBeenCalledWith(
+          expressResponse,
+          'test',
+          200,
+        );
+      });
+
+      it('should tear down an Observable returned by the handler and not reply', async () => {
+        const { producer, source, observable } = createProducer();
+
+        const pending = handler(observable, response, request);
+        source.next('partial');
+        request.socket.emit('close');
+        await pending;
+
+        expect(producer.tornDown).toBe(true);
+        expect(adapterReplySpy).not.toHaveBeenCalled();
+        expect(request.socket.listenerCount('close')).toBe(0);
+      });
+
+      it('should close the producer during a synchronous disconnect in subscribe', async () => {
+        const afterDisconnect = vi.fn();
+        const observable = new Observable(subscriber => {
+          subscriber.next('partial');
+          request.socket.emit('close');
+          if (!subscriber.closed) {
+            afterDisconnect();
+          }
+          subscriber.complete();
+        });
+
+        await handler(observable, response, request);
+
+        expect(afterDisconnect).not.toHaveBeenCalled();
+        expect(adapterReplySpy).not.toHaveBeenCalled();
+      });
+
+      it('should share one "close" listener among the pipelined requests of a connection', async () => {
+        const producers = [
+          createProducer(),
+          createProducer(),
+          createProducer(),
+        ];
+
+        const pending = producers.map(({ observable }) =>
+          handler(observable, response, request),
+        );
+        expect(request.socket.listenerCount('close')).toBe(1);
+
+        // A request that is answered leaves the others waiting
+        producers[0].source.next('done');
+        producers[0].source.complete();
+        await pending[0];
+        expect(adapterReplySpy).toHaveBeenCalledTimes(1);
+        expect(request.socket.listenerCount('close')).toBe(1);
+
+        request.socket.emit('close');
+        await Promise.all(pending);
+
+        expect(producers[1].producer.tornDown).toBe(true);
+        expect(producers[2].producer.tornDown).toBe(true);
+        expect(adapterReplySpy).toHaveBeenCalledTimes(1);
+        expect(request.socket.listenerCount('close')).toBe(0);
+      });
+
+      it('should finish disconnecting pipelined requests if one teardown throws', async () => {
+        const error = new Error('teardown failed');
+        const failing = new Observable(() => () => {
+          throw error;
+        });
+        const { producer, observable } = createProducer();
+        const pending = [
+          handler(failing, response, request),
+          handler(observable, response, request),
+        ];
+
+        expect(() => request.socket.emit('close')).not.toThrow();
+        expect(producer.tornDown).toBe(true);
+        await Promise.all(pending);
+        expect(adapterReplySpy).not.toHaveBeenCalled();
+      });
+
+      it('should not subscribe an Observable returned by the handler once the client is gone', async () => {
+        const { producer, observable } = createProducer();
+        request.socket.destroyed = true;
+
+        await handler(observable, response, request);
+
+        expect(producer.subscribed).toBe(false);
+        expect(adapterReplySpy).not.toHaveBeenCalled();
+      });
+
+      it('should watch the response when the request socket cannot report the close', async () => {
+        const { producer, source, observable } = createProducer();
+        // Runtimes that emulate "node:http" without a real "net.Socket" (e.g.
+        // Cloudflare Workers) expose a socket-like object that only carries
+        // address information, so it cannot report a "close" event.
+        const socketlessRequest = { socket: { remoteAddress: '127.0.0.1' } };
+        const streamedResponse = new PassThrough();
+
+        const pending = handler(
+          observable,
+          streamedResponse,
+          socketlessRequest,
+        );
+        source.next('partial');
+        await new Promise(resolve => setImmediate(resolve));
+        streamedResponse.emit('close');
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(producer.tornDown).toBe(true);
+        expect(streamedResponse.listenerCount('close')).toBe(0);
+
+        source.complete();
+        await pending;
+        expect(adapterReplySpy).not.toHaveBeenCalled();
+      });
+
+      it('should watch the raw response when the request socket cannot report the close', async () => {
+        const { producer, observable } = createProducer();
+        const socketlessRequest = { socket: { remoteAddress: '127.0.0.1' } };
+        const rawResponse = new PassThrough();
+
+        const pending = handler(
+          observable,
+          { raw: rawResponse },
+          socketlessRequest,
+        );
+        await new Promise(resolve => setImmediate(resolve));
+        rawResponse.emit('close');
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(producer.tornDown).toBe(true);
+        expect(rawResponse.listenerCount('close')).toBe(0);
+
+        await pending;
+        expect(adapterReplySpy).not.toHaveBeenCalled();
+      });
+
+      it('should still reply when neither the socket nor the response can report the close', async () => {
+        const plainResponse = {};
+
+        await handler(of('value'), plainResponse, {
+          socket: { remoteAddress: '127.0.0.1' },
+        });
+
+        expect(adapterReplySpy).toHaveBeenCalledWith(
+          plainResponse,
+          'value',
+          200,
+        );
+      });
+
+      it('should watch the raw request socket (e.g. Fastify)', async () => {
+        const { producer, observable } = createProducer();
+
+        const pending = handler(observable, response, { raw: request });
+        request.socket.emit('close');
+        await pending;
+
+        expect(producer.tornDown).toBe(true);
+      });
+
+      it('should reply and stop watching the socket once the Observable completes', async () => {
+        await handler(of('a', 'b'), response, request);
+
+        expect(adapterReplySpy).toHaveBeenCalledWith(response, 'b', 200);
+        expect(request.socket.listenerCount('close')).toBe(0);
+      });
+
+      it('should propagate errors emitted before the client disconnects', async () => {
+        const error = new Error('producer failed');
+
+        await expect(
+          handler(
+            throwError(() => error),
+            response,
+            request,
           ),
-        ).to.be.true;
+        ).rejects.toBe(error);
+      });
+
+      it('should propagate an error thrown while attaching a stream error listener', async () => {
+        const error = new Error('listener registration failed');
+        const stream = new PassThrough();
+        stream.on('newListener', event => {
+          if (event === 'error') {
+            throw error;
+          }
+        });
+
+        try {
+          await expect(
+            handler(of(stream, 'fallback'), response, request),
+          ).rejects.toBe(error);
+          expect(adapterReplySpy).not.toHaveBeenCalled();
+        } finally {
+          stream.destroy();
+        }
+      });
+
+      it('should ignore a disconnect when the handler did not return the (intercepted) Observable', async () => {
+        const { producer, source, observable } = createProducer();
+        const expressResponse = { socket: request.socket };
+
+        const pending = handler(
+          observable,
+          expressResponse,
+          request,
+          new Subject(),
+        );
+        request.socket.emit('close');
+        source.next('value');
+        source.complete();
+        await pending;
+
+        expect(adapterReplySpy).toHaveBeenCalledWith(
+          expressResponse,
+          'value',
+          200,
+        );
+      });
+
+      it('should tear down an intercepted Observable once the handler reports its own Observable', async () => {
+        const { producer, observable } = createProducer();
+        const handlerObservable$ = new ReplaySubject<void>(1);
+
+        const pending = handler(
+          observable,
+          response,
+          request,
+          handlerObservable$,
+        );
+        request.socket.emit('close');
+        expect(producer.tornDown).toBe(false);
+
+        request.socket.destroyed = true;
+        handlerObservable$.next();
+        await pending;
+
+        expect(producer.tornDown).toBe(true);
+        expect(adapterReplySpy).not.toHaveBeenCalled();
+      });
+
+      it('should destroy the stream of a StreamableFile it does not send', async () => {
+        const stream = new PassThrough();
+        const files = new Subject<StreamableFile>();
+
+        const pending = handler(files, response, request);
+        files.next(new StreamableFile(stream));
+        request.socket.emit('close');
+        await pending;
+
+        expect(adapterReplySpy).not.toHaveBeenCalled();
+        expect(stream.destroyed).toBe(true);
+      });
+
+      it('should listen for the error of a stream an Observable emits before it completes', async () => {
+        // As `fs.createReadStream()` of a file that does not exist
+        const stream = new PassThrough();
+        const error = new Error('ENOENT');
+        const streams = new Subject<PassThrough>();
+
+        const pending = handler(streams, response, request);
+        streams.next(stream);
+        expect(stream.listenerCount('error')).toBe(1);
+        stream.destroy(error);
+        await new Promise(resolve => setImmediate(resolve));
+        streams.complete();
+
+        // For the exception filters to answer
+        await expect(pending).rejects.toBe(error);
+      });
+
+      const disconnectWhileAnInterceptorHolds = async (
+        handlerResult: (file: StreamableFile) => unknown,
+      ) => {
+        const stream = new PassThrough();
+        let holding!: () => void;
+        const held = new Promise<void>(resolve => (holding = resolve));
+        vi.spyOn(contextCreator, 'getMetadata').mockReturnValue({
+          argsLength: 0,
+          fnHandleResponse: handler,
+          isSseHandler: false,
+          paramtypes: [],
+          getParamsMetadata: vi.fn().mockReturnValue([]),
+          httpStatusCode: 200,
+          hasCustomHeaders: false,
+          responseHeaders: [],
+        } as any);
+        vi.spyOn(contextCreator, 'createGuardsFn').mockReturnValue(null as any);
+        vi.spyOn(contextCreator, 'createPipesFn').mockReturnValue(null as any);
+        vi.spyOn(
+          (contextCreator as any).interceptorsContextCreator,
+          'create',
+        ).mockReturnValue([
+          {
+            // e.g. writing an audit log entry before passing the file on
+            intercept: (_, next) =>
+              next.handle().pipe(
+                concatMap(async file => {
+                  holding();
+                  await new Promise(() => {});
+                  return file;
+                }),
+              ),
+          },
+        ]);
+        const proxy = contextCreator.create(
+          {} as any,
+          { apply: () => handlerResult(new StreamableFile(stream)) } as any,
+          '',
+          '',
+          0,
+        );
+
+        const pending = proxy(request, response, vi.fn());
+        await held;
+        request.socket.emit('close');
+        await pending;
+        return stream;
+      };
+
+      it('should destroy the stream of a StreamableFile an interceptor holds', async () => {
+        const stream = await disconnectWhileAnInterceptorHolds(of);
+
+        expect(adapterReplySpy).not.toHaveBeenCalled();
+        expect(stream.destroyed).toBe(true);
+      });
+
+      it('should destroy one emitted by an Observable the handler resolves to', async () => {
+        const stream = await disconnectWhileAnInterceptorHolds(async file =>
+          of(file),
+        );
+
+        expect(adapterReplySpy).not.toHaveBeenCalled();
+        expect(stream.destroyed).toBe(true);
+      });
+
+      it('should destroy one emitted by an Observable a thenable of the handler resolves to', async () => {
+        const stream = await disconnectWhileAnInterceptorHolds(file => ({
+          then: (resolve: (value: unknown) => void) => resolve(of(file)),
+        }));
+
+        expect(adapterReplySpy).not.toHaveBeenCalled();
+        expect(stream.destroyed).toBe(true);
+      });
+    });
+
+    describe('when the adapter fails to send a StreamableFile', () => {
+      it('should destroy its stream', async () => {
+        vi.spyOn(contextCreator, 'reflectRenderTemplate').mockReturnValue(
+          undefined!,
+        );
+        vi.spyOn(contextCreator, 'reflectSse').mockReturnValue(undefined!);
+        const handler = contextCreator.createHandleResponseFn(
+          null!,
+          false,
+          undefined,
+          200,
+        ) as HandlerResponseBasicFn;
+        // e.g. a header value Node.js rejects
+        const error = new TypeError('Invalid character in header content');
+        vi.spyOn(adapter, 'reply').mockImplementation(() => {
+          throw error;
+        });
+        const stream = new PassThrough();
+
+        await expect(handler(new StreamableFile(stream), {})).rejects.toBe(
+          error,
+        );
+        expect(stream.destroyed).toBe(true);
+      });
+
+      it('should destroy the stream of the file an interceptor replaced', async () => {
+        const handler = contextCreator.createHandleResponseFn(
+          (() => undefined) as any,
+          false,
+        ) as HandlerResponseBasicFn;
+        const error = new TypeError('Invalid character in header content');
+        vi.spyOn(adapter, 'reply').mockImplementation(() => {
+          throw error;
+        });
+        const stream = new PassThrough();
+
+        await expect(
+          handler('replaced', {}, {}, undefined, [new StreamableFile(stream)]),
+        ).rejects.toBe(error);
+        expect(stream.destroyed).toBe(true);
+      });
+    });
+
+    describe('when an interceptor replaced a stream of the handler', () => {
+      let handler: HandlerResponseBasicFn;
+      let request: { socket: EventEmitter & { destroyed?: boolean } };
+      let response: Writable;
+      let stream: PassThrough;
+
+      beforeEach(() => {
+        handler = contextCreator.createHandleResponseFn(
+          (() => undefined) as any,
+          false,
+        ) as HandlerResponseBasicFn;
+        vi.spyOn(adapter, 'reply').mockReturnValue(undefined);
+        request = { socket: new EventEmitter() };
+        response = new Writable({ write: (chunk, encoding, done) => done() });
+        stream = new PassThrough();
+      });
+
+      // e.g. an empty 304 for a client that has the file already
+      const reply = () =>
+        handler(undefined, response, request, undefined, [
+          new StreamableFile(stream),
+        ]);
+
+      it('should destroy its stream once the response is over', async () => {
+        await reply();
+        // What is sent instead may still read from it
+        expect(stream.destroyed).toBe(false);
+
+        response.end();
+        await vi.waitFor(() => expect(stream.destroyed).toBe(true));
+        expect(request.socket.listenerCount('close')).toBe(0);
+      });
+
+      it('should destroy its stream once the raw response is over', async () => {
+        await handler(
+          undefined,
+          { raw: response },
+          { raw: request },
+          undefined,
+          [new StreamableFile(stream)],
+        );
+
+        response.end();
+        await vi.waitFor(() => expect(stream.destroyed).toBe(true));
+      });
+
+      it('should destroy its stream if the connection closes before the response is sent', async () => {
+        await reply();
+
+        request.socket.emit('close');
+        expect(stream.destroyed).toBe(true);
+      });
+
+      it('should destroy its stream if the connection is closed already', async () => {
+        request.socket.destroyed = true;
+
+        await reply();
+        expect(stream.destroyed).toBe(true);
+      });
+
+      it('should cancel a stream replaced with something that is not one', async () => {
+        const onCancel = vi.fn();
+
+        await handler({ replaced: true }, response, request, undefined, [
+          new ReadableStream({ cancel: onCancel }),
+        ]);
+        expect(onCancel).not.toHaveBeenCalled();
+
+        response.end();
+        await vi.waitFor(() => expect(onCancel).toHaveBeenCalledTimes(1));
+      });
+
+      it('should cancel a stream replaced with a file', async () => {
+        const onCancel = vi.fn();
+        const file = new StreamableFile(Buffer.from('file'));
+
+        await handler(file, response, request, undefined, [
+          new ReadableStream({ cancel: onCancel }),
+        ]);
+
+        response.end();
+        await vi.waitFor(() => expect(onCancel).toHaveBeenCalledTimes(1));
+      });
+
+      it('should leave the stream of the file it sends alone', async () => {
+        const file = new StreamableFile(stream);
+        await handler(file, response, request, undefined, [file]);
+
+        response.end();
+        await new Promise(resolve => setImmediate(resolve));
+        expect(stream.destroyed).toBe(false);
+      });
+
+      it('should leave the stream it sends alone, also wrapped', async () => {
+        vi.spyOn(
+          contextCreator['responseController'],
+          'stream',
+        ).mockReturnValue(Promise.resolve());
+        const body = Readable.from(['chunk']);
+
+        await handler({ data: body }, response, request, undefined, [body]);
+
+        response.end();
+        await new Promise(resolve => setImmediate(resolve));
+        expect(body.destroyed).toBe(false);
+      });
+
+      it('should destroy the stream of the file the route handler returned', async () => {
+        vi.spyOn(contextCreator, 'getMetadata').mockReturnValue({
+          argsLength: 0,
+          fnHandleResponse: handler,
+          isSseHandler: false,
+          paramtypes: [],
+          getParamsMetadata: vi.fn().mockReturnValue([]),
+          httpStatusCode: 200,
+          hasCustomHeaders: false,
+          responseHeaders: [],
+        } as any);
+        vi.spyOn(contextCreator, 'createGuardsFn').mockReturnValue(null as any);
+        vi.spyOn(contextCreator, 'createPipesFn').mockReturnValue(null as any);
+        vi.spyOn(
+          (contextCreator as any).interceptorsContextCreator,
+          'create',
+        ).mockReturnValue([
+          { intercept: (_, next) => next.handle().pipe(map(() => undefined)) },
+        ]);
+        const proxy = contextCreator.create(
+          {} as any,
+          { apply: () => new StreamableFile(stream) } as any,
+          '',
+          '',
+          0,
+        );
+
+        await proxy(request, response, vi.fn());
+        expect(stream.destroyed).toBe(false);
+
+        response.end();
+        await vi.waitFor(() => expect(stream.destroyed).toBe(true));
       });
     });
 
@@ -425,24 +1779,31 @@ describe('RouterExecutionContext', () => {
       it('should delegate result to SseStream', async () => {
         const result = of('test');
         const response = new PassThrough();
-        response.write = sinon.spy();
+        response.write = vi.fn();
 
-        const request = new PassThrough();
-        request.on = sinon.spy();
+        const request = attachSocket(new PassThrough());
+        request.socket.once = vi.fn(
+          request.socket.once.bind(request.socket),
+        ) as any;
 
-        sinon.stub(contextCreator, 'reflectRenderTemplate').returns(undefined);
-        sinon.stub(contextCreator, 'reflectSse').returns('/');
+        vi.spyOn(contextCreator, 'reflectRenderTemplate').mockReturnValue(
+          undefined!,
+        );
+        vi.spyOn(contextCreator, 'reflectSse').mockReturnValue('/');
 
         const handler = contextCreator.createHandleResponseFn(
-          null,
+          () => {},
           true,
           undefined,
           200,
         ) as HandlerResponseBasicFn;
         await handler(result, response, request);
 
-        expect((response.write as any).called).to.be.true;
-        expect((request.on as any).called).to.be.true;
+        expect(response.write).toHaveBeenCalled();
+        expect(request.socket.once).toHaveBeenCalledWith(
+          'close',
+          expect.any(Function),
+        );
       });
 
       it('should not allow a non-observable result', async () => {
@@ -450,11 +1811,13 @@ describe('RouterExecutionContext', () => {
         const response = new PassThrough();
         const request = new PassThrough();
 
-        sinon.stub(contextCreator, 'reflectRenderTemplate').returns(undefined);
-        sinon.stub(contextCreator, 'reflectSse').returns('/');
+        vi.spyOn(contextCreator, 'reflectRenderTemplate').mockReturnValue(
+          undefined!,
+        );
+        vi.spyOn(contextCreator, 'reflectSse').mockReturnValue('/');
 
         const handler = contextCreator.createHandleResponseFn(
-          null,
+          () => {},
           true,
           undefined,
           200,
@@ -463,10 +1826,228 @@ describe('RouterExecutionContext', () => {
         try {
           await handler(result, response, request);
         } catch (e) {
-          expect(e.message).to.equal(
+          expect(e.message).toBe(
             'You must return an Observable stream to use Server-Sent Events (SSE).',
           );
         }
+      });
+
+      it('should apply any headers that exists on the response', async () => {
+        const result = of('test');
+        const response = new PassThrough() as HeaderStream;
+        response.write = vi.fn();
+        response.writeHead = vi.fn();
+        response.flushHeaders = vi.fn();
+        response.getHeaders = vi
+          .fn()
+          .mockReturnValue({ 'access-control-headers': 'some-cors-value' });
+
+        const request = attachSocket(new PassThrough());
+
+        vi.spyOn(contextCreator, 'reflectRenderTemplate').mockReturnValue(
+          undefined!,
+        );
+        vi.spyOn(contextCreator, 'reflectSse').mockReturnValue('/');
+
+        const handler = contextCreator.createHandleResponseFn(
+          () => {},
+          true,
+          undefined,
+          200,
+        ) as HandlerResponseBasicFn;
+        await handler(result, response, request);
+
+        expect(response.writeHead).toHaveBeenCalledWith(
+          200,
+          expect.objectContaining({
+            'access-control-headers': 'some-cors-value',
+          }),
+        );
+      });
+
+      it('should pass through status and headers from the wrapper response', async () => {
+        const rawResponse = new PassThrough() as HeaderStream;
+        rawResponse.write = vi.fn() as any;
+        rawResponse.writeHead = vi.fn() as any;
+        rawResponse.flushHeaders = vi.fn() as any;
+
+        const response = {
+          raw: rawResponse,
+          statusCode: 203,
+          getHeaders: vi
+            .fn()
+            .mockReturnValue({ 'access-control-headers': 'at-handle-time' }),
+        };
+        const result = of('test');
+
+        const request = attachSocket(new PassThrough());
+
+        vi.spyOn(contextCreator, 'reflectRenderTemplate').mockReturnValue(
+          undefined!,
+        );
+        vi.spyOn(contextCreator, 'reflectSse').mockReturnValue('/');
+
+        const handler = contextCreator.createHandleResponseFn(
+          () => {},
+          true,
+          undefined,
+          200,
+        ) as HandlerResponseBasicFn;
+        await handler(result, response as any, request);
+
+        expect(rawResponse.writeHead).toHaveBeenCalledWith(
+          203,
+          expect.objectContaining({
+            'access-control-headers': 'at-handle-time',
+          }),
+        );
+      });
+
+      it('should read status and headers from the wrapper response when the stream commits', async () => {
+        const rawResponse = new PassThrough() as HeaderStream;
+        rawResponse.write = vi.fn() as any;
+        rawResponse.writeHead = vi.fn() as any;
+        rawResponse.flushHeaders = vi.fn() as any;
+
+        let replyHeaders: Record<string, string> = {};
+        const response = {
+          raw: rawResponse,
+          statusCode: 200,
+          getHeaders: () => replyHeaders,
+        };
+        const result = new Subject<string>();
+
+        const request = attachSocket(new PassThrough());
+
+        vi.spyOn(contextCreator, 'reflectRenderTemplate').mockReturnValue(
+          undefined!,
+        );
+        vi.spyOn(contextCreator, 'reflectSse').mockReturnValue('/');
+
+        const handler = contextCreator.createHandleResponseFn(
+          () => {},
+          true,
+          undefined,
+          200,
+        ) as HandlerResponseBasicFn;
+        const handled = handler(result, response as any, request);
+
+        response.statusCode = 202;
+        replyHeaders = { 'x-late': 'set' };
+        await vi.waitFor(() =>
+          expect(rawResponse.writeHead).toHaveBeenCalled(),
+        );
+
+        expect(rawResponse.writeHead).toHaveBeenCalledWith(
+          202,
+          expect.objectContaining({ 'x-late': 'set' }),
+        );
+        result.complete();
+        await handled;
+      });
+
+      it('should fall back to the raw response status when the wrapper has none', async () => {
+        const rawResponse = new PassThrough() as HeaderStream;
+        rawResponse.write = vi.fn() as any;
+        rawResponse.writeHead = vi.fn() as any;
+        rawResponse.flushHeaders = vi.fn() as any;
+        Object.assign(rawResponse, { statusCode: 201 });
+
+        const response = { raw: rawResponse, getHeaders: () => ({}) };
+        const result = new Subject<string>();
+
+        const request = attachSocket(new PassThrough());
+
+        vi.spyOn(contextCreator, 'reflectRenderTemplate').mockReturnValue(
+          undefined!,
+        );
+        vi.spyOn(contextCreator, 'reflectSse').mockReturnValue('/');
+
+        const handler = contextCreator.createHandleResponseFn(
+          () => {},
+          true,
+          undefined,
+          200,
+        ) as HandlerResponseBasicFn;
+        const handled = handler(result, response as any, request);
+
+        await vi.waitFor(() =>
+          expect(rawResponse.writeHead).toHaveBeenCalled(),
+        );
+
+        expect(rawResponse.writeHead).toHaveBeenCalledWith(
+          201,
+          expect.any(Object),
+        );
+        result.complete();
+        await handled;
+      });
+
+      it('should prefer the wrapper status over the raw response status', async () => {
+        const rawResponse = new PassThrough() as HeaderStream;
+        rawResponse.write = vi.fn() as any;
+        rawResponse.writeHead = vi.fn() as any;
+        rawResponse.flushHeaders = vi.fn() as any;
+        Object.assign(rawResponse, { statusCode: 200 });
+
+        const response = {
+          raw: rawResponse,
+          statusCode: 202,
+          getHeaders: () => ({}),
+        };
+        const result = new Subject<string>();
+
+        const request = attachSocket(new PassThrough());
+
+        vi.spyOn(contextCreator, 'reflectRenderTemplate').mockReturnValue(
+          undefined!,
+        );
+        vi.spyOn(contextCreator, 'reflectSse').mockReturnValue('/');
+
+        const handler = contextCreator.createHandleResponseFn(
+          () => {},
+          true,
+          undefined,
+          200,
+        ) as HandlerResponseBasicFn;
+        const handled = handler(result, response as any, request);
+
+        await vi.waitFor(() =>
+          expect(rawResponse.writeHead).toHaveBeenCalled(),
+        );
+
+        expect(rawResponse.writeHead).toHaveBeenCalledWith(
+          202,
+          expect.any(Object),
+        );
+        result.complete();
+        await handled;
+      });
+
+      it('should pass the maximum pending data length of the route to the SSE response', async () => {
+        class TestController {
+          @Sse('events', { maxPendingDataLength: 1024 })
+          events() {}
+        }
+        const sse = vi
+          .spyOn(contextCreator['responseController'], 'sse')
+          .mockResolvedValue(undefined);
+        const result = of('test');
+        const response = new PassThrough();
+        const request = new PassThrough();
+
+        const handler = contextCreator.createHandleResponseFn(
+          TestController.prototype.events,
+          true,
+        ) as HandlerResponseBasicFn;
+        await handler(result, response, request);
+
+        expect(sse).toHaveBeenCalledWith(
+          result,
+          response,
+          request,
+          expect.objectContaining({ maxPendingDataLength: 1024 }),
+        );
       });
     });
   });

@@ -1,0 +1,327 @@
+import {
+  BadRequestException,
+  type CallHandler,
+  PayloadTooLargeException,
+  StreamableFile,
+} from '@nestjs/common';
+import { EventEmitter } from 'events';
+import { PassThrough, Readable } from 'stream';
+import { lastValueFrom, of, throwError } from 'rxjs';
+import { FileStreamInterceptor } from '../../../multipart/interceptors/file-stream.interceptor.js';
+import { UPLOAD_DISCARDED_MESSAGE } from '../../../multipart/multipart/multipart.constants.js';
+import { MultipartError } from '../../../multipart/multipart/multipart.error.js';
+import {
+  createContext,
+  createFakeRequest,
+  field,
+  file,
+} from '../fake-request.js';
+
+describe('FileStreamInterceptor', () => {
+  const handler: CallHandler = { handle: () => of('test') };
+  const createReply = () => ({ raw: new PassThrough() });
+
+  it('should return metatype with expected structure', () => {
+    const targetClass = FileStreamInterceptor('file');
+    expect(targetClass.prototype.intercept).not.toBeUndefined();
+  });
+
+  it('should hand the handler the stream, with the preceding fields in req.body', async () => {
+    const target = new (FileStreamInterceptor('upload'))();
+    const req = createFakeRequest([
+      field('purpose', 'backup'),
+      file('upload', 'streamed', 'blob.bin'),
+      field('ignored', 'x'),
+    ]);
+    await target.intercept(createContext(req, createReply()), handler);
+
+    expect(req.body).toEqual({ purpose: 'backup' });
+    expect(req.file).toMatchObject({
+      fieldname: 'upload',
+      originalname: 'blob.bin',
+    });
+    const chunks: Buffer[] = [];
+    for await (const chunk of req.file.stream) {
+      chunks.push(chunk);
+    }
+    expect(Buffer.concat(chunks).toString()).toBe('streamed');
+  });
+
+  it('should close the gaps that array indexes leave in req.body', async () => {
+    const target = new (FileStreamInterceptor('upload'))();
+    const req = createFakeRequest([
+      field('tags[3]', 'b'),
+      field('tags[1]', 'a'),
+      file('upload'),
+    ]);
+    await target.intercept(createContext(req, createReply()), handler);
+    expect(req.body.tags).toEqual(['a', 'b']);
+    req.file.stream.resume();
+  });
+
+  it('should stop parsing once the file has been read', async () => {
+    const target = new (FileStreamInterceptor('upload'))();
+    const req = createFakeRequest([file('upload', 'streamed')]);
+    await target.intercept(createContext(req, createReply()), handler);
+    expect(req.raw.unpipe).not.toHaveBeenCalled();
+    req.file.stream.resume();
+    await vi.waitFor(() => expect(req.raw.unpipe).toHaveBeenCalled());
+  });
+
+  it('should leave req.files undefined', async () => {
+    const target = new (FileStreamInterceptor('upload'))();
+    const req = createFakeRequest([file('upload')]);
+    await target.intercept(createContext(req, createReply()), handler);
+    expect(Object.hasOwn(req, 'files')).toBe(true);
+    expect(req.files).toBeUndefined();
+  });
+
+  it('should fail the stream when the file is over fileSize before it is handed over', async () => {
+    // busboy parses as much of the part as the chunk at hand holds before
+    // the part reaches the interceptor, so the limit may have been hit
+    // already, and 'limit' will not fire again.
+    const target = new (FileStreamInterceptor('upload', {
+      limits: { fileSize: 4 },
+    }))();
+    const req = createFakeRequest([
+      { ...file('upload', '0123'), truncated: true },
+    ]);
+    await target.intercept(createContext(req, createReply()), handler);
+
+    await expect(async () => {
+      for await (const _ of req.file.stream) {
+        // consume
+      }
+    }).rejects.toEqual(
+      new PayloadTooLargeException('File too large', {
+        cause: new MultipartError('LIMIT_FILE_SIZE', 'upload'),
+      }),
+    );
+  });
+
+  it('should fail the stream once the file goes over fileSize', async () => {
+    const target = new (FileStreamInterceptor('upload', {
+      limits: { fileSize: 4 },
+    }))();
+    const req = createFakeRequest([file('upload', '0123')]);
+    await target.intercept(createContext(req, createReply()), handler);
+
+    req.file.stream.emit('limit');
+    await expect(async () => {
+      for await (const _ of req.file.stream) {
+        // consume
+      }
+    }).rejects.toEqual(
+      new PayloadTooLargeException('File too large', {
+        cause: new MultipartError('LIMIT_FILE_SIZE', 'upload'),
+      }),
+    );
+  });
+
+  it('should apply the field name limits to the fields before the file', async () => {
+    const target = new (FileStreamInterceptor('upload', {
+      limits: { fieldNestingDepth: 1, fieldArrayIndexLimit: 2 },
+    }))();
+    await expect(
+      target.intercept(
+        createContext(
+          createFakeRequest([field('a[b][c]', 'x'), file('upload')]),
+          createReply(),
+        ),
+        handler,
+      ),
+    ).rejects.toEqual(
+      new BadRequestException('Field name nesting too deep - a[b][c]', {
+        cause: new MultipartError('LIMIT_FIELD_NESTING', 'a[b][c]'),
+      }),
+    );
+    await expect(
+      target.intercept(
+        createContext(
+          createFakeRequest([field('a[3]', 'x'), file('upload')]),
+          createReply(),
+        ),
+        handler,
+      ),
+    ).rejects.toEqual(
+      new BadRequestException('Field name array index too large - a[3]', {
+        cause: new MultipartError('LIMIT_FIELD_ARRAY_INDEX', 'a[3]'),
+      }),
+    );
+  });
+
+  it('should apply the default field name limits to the fields before the file', async () => {
+    const target = new (FileStreamInterceptor('upload'))();
+    await expect(
+      target.intercept(
+        createContext(
+          createFakeRequest([field('a[1001]', 'x'), file('upload')]),
+          createReply(),
+        ),
+        handler,
+      ),
+    ).rejects.toEqual(
+      new BadRequestException('Field name array index too large - a[1001]', {
+        cause: new MultipartError('LIMIT_FIELD_ARRAY_INDEX', 'a[1001]'),
+      }),
+    );
+  });
+
+  it('should reject a file in another field', async () => {
+    const target = new (FileStreamInterceptor('upload'))();
+    const req = createFakeRequest([file('other')]);
+    await expect(
+      target.intercept(createContext(req, createReply()), handler),
+    ).rejects.toEqual(
+      new BadRequestException('Unexpected file field - other', {
+        cause: new MultipartError('LIMIT_UNEXPECTED_FILE', 'other'),
+      }),
+    );
+  });
+
+  describe('when the handler leaves the stream unread', () => {
+    it('should discard the rest of the body before responding', async () => {
+      const target = new (FileStreamInterceptor('upload'))();
+      const req = createFakeRequest([file('upload')]);
+      const result$ = await target.intercept(
+        createContext(req, createReply()),
+        handler,
+      );
+
+      expect(req.raw.unpipe).not.toHaveBeenCalled();
+      expect(await lastValueFrom(result$)).toBe('test');
+      expect(req.raw.unpipe).toHaveBeenCalled();
+      expect(req.raw.readableEnded).toBe(true);
+    });
+
+    it('should discard the rest of the body before rethrowing handler errors', async () => {
+      const target = new (FileStreamInterceptor('upload'))();
+      const req = createFakeRequest([file('upload')]);
+      const error = new Error('handler failed');
+      const result$ = await target.intercept(
+        createContext(req, createReply()),
+        { handle: () => throwError(() => error) },
+      );
+
+      await expect(lastValueFrom(result$)).rejects.toBe(error);
+      expect(req.raw.unpipe).toHaveBeenCalled();
+    });
+
+    it('should not wait for the body before responding with a StreamableFile', async () => {
+      const target = new (FileStreamInterceptor('upload'))();
+      const req = createFakeRequest([file('upload')]);
+      const reply = createReply();
+      const streamable = new StreamableFile(Buffer.from('x'));
+      const result$ = await target.intercept(createContext(req, reply), {
+        handle: () => of(streamable),
+      });
+
+      expect(await lastValueFrom(result$)).toBe(streamable);
+      expect(req.raw.unpipe).not.toHaveBeenCalled();
+      reply.raw.emit('close');
+      expect(req.raw.unpipe).toHaveBeenCalled();
+    });
+  });
+
+  describe('when the rest of the upload is discarded while the handler reads it', () => {
+    /** A request whose file is still arriving: its stream does not end. */
+    const createUploadingRequest = () => {
+      const req = createFakeRequest([]);
+      const stream = new Readable({ read() {} });
+      stream.push('first chunk');
+      // @fastify/multipart always listens for file stream errors.
+      stream.on('error', () => undefined);
+      req.parts = () =>
+        (async function* () {
+          yield {
+            type: 'file',
+            fieldname: 'upload',
+            filename: 'a.bin',
+            encoding: '7bit',
+            mimetype: 'application/octet-stream',
+            file: stream,
+          };
+        })();
+      return { req, stream };
+    };
+
+    it('should fail the stream once the response is sent', async () => {
+      const target = new (FileStreamInterceptor('upload'))();
+      const { req, stream } = createUploadingRequest();
+      const reply = createReply();
+      await target.intercept(createContext(req, reply), handler);
+      expect(stream.destroyed).toBe(false);
+
+      reply.raw.emit('close');
+      expect(stream.destroyed).toBe(true);
+      expect(stream.errored?.message).toBe(UPLOAD_DISCARDED_MESSAGE);
+      expect(req.raw.unpipe).toHaveBeenCalled();
+    });
+
+    it('should fail the stream when the connection of a pipelined request closes', async () => {
+      // A response queued behind an unread one on the same connection: it has
+      // no socket of its own, and may never be closed itself
+      const connection = Object.assign(new EventEmitter(), {
+        destroyed: false,
+      });
+      const target = new (FileStreamInterceptor('upload'))();
+      const { req, stream } = createUploadingRequest();
+      req.raw.socket = connection;
+      const reply = {
+        raw: Object.assign(new PassThrough(), { req: req.raw }),
+      };
+      await target.intercept(createContext(req, reply), handler);
+      expect(stream.destroyed).toBe(false);
+
+      connection.emit('close');
+      expect(stream.destroyed).toBe(true);
+      expect(stream.errored?.message).toBe(UPLOAD_DISCARDED_MESSAGE);
+      expect(req.raw.unpipe).toHaveBeenCalled();
+    });
+
+    it('should fail the stream before the result of the handler is sent', async () => {
+      const target = new (FileStreamInterceptor('upload'))();
+      const { req, stream } = createUploadingRequest();
+      const result$ = await target.intercept(
+        createContext(req, createReply()),
+        handler,
+      );
+      expect(await lastValueFrom(result$)).toBe('test');
+      expect(stream.errored?.message).toBe(UPLOAD_DISCARDED_MESSAGE);
+    });
+
+    it('should fail the stream at once when the response was sent already', async () => {
+      const target = new (FileStreamInterceptor('upload'))();
+      const { req, stream } = createUploadingRequest();
+      const reply = {
+        raw: Object.assign(new EventEmitter(), { writableFinished: true }),
+      };
+      await target.intercept(createContext(req, reply), handler);
+      expect(stream.errored?.message).toBe(UPLOAD_DISCARDED_MESSAGE);
+    });
+
+    it('should leave a stream that was read to its end', async () => {
+      const target = new (FileStreamInterceptor('upload'))();
+      const req = createFakeRequest([file('upload', 'streamed')]);
+      const reply = createReply();
+      await target.intercept(createContext(req, reply), handler);
+      const chunks: Buffer[] = [];
+      for await (const chunk of req.file.stream) {
+        chunks.push(chunk);
+      }
+      reply.raw.emit('close');
+      expect(req.file.stream.errored).toBeNull();
+      expect(Buffer.concat(chunks).toString()).toBe('streamed');
+    });
+
+    it('should leave the stream of a request that was destroyed', async () => {
+      const target = new (FileStreamInterceptor('upload'))();
+      const { req, stream } = createUploadingRequest();
+      const reply = createReply();
+      await target.intercept(createContext(req, reply), handler);
+      req.raw.destroy();
+      reply.raw.emit('close');
+      expect(stream.destroyed).toBe(false);
+    });
+  });
+});

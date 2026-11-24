@@ -1,13 +1,21 @@
-import { CanActivate } from '@nestjs/common';
-import { GUARDS_METADATA } from '@nestjs/common/constants';
-import { Controller } from '@nestjs/common/interfaces';
-import { isEmpty, isFunction } from '@nestjs/common/utils/shared.utils';
+import type { CanActivate } from '@nestjs/common';
 import { iterate } from 'iterare';
-import { ApplicationConfig } from '../application-config';
-import { ContextCreator } from '../helpers/context-creator';
-import { STATIC_CONTEXT } from '../injector/constants';
-import { NestContainer } from '../injector/container';
-import { InstanceWrapper } from '../injector/instance-wrapper';
+import { ApplicationConfig } from '../application-config.js';
+import {
+  assertEnhancer,
+  describeEnhancer,
+} from '../helpers/assert-enhancer.js';
+import { ContextCreator } from '../helpers/context-creator.js';
+import { STATIC_CONTEXT } from '../injector/constants.js';
+import { NestContainer } from '../injector/container.js';
+import { InstanceWrapper } from '../injector/instance-wrapper.js';
+import {
+  GUARDS_METADATA,
+  type Controller,
+  isEmpty,
+  isFunction,
+} from '@nestjs/common/internal';
+import type { Type } from '@nestjs/common';
 
 export class GuardsContextCreator extends ContextCreator {
   private moduleContext: string;
@@ -42,39 +50,58 @@ export class GuardsContextCreator extends ContextCreator {
     inquirerId?: string,
   ): R {
     if (isEmpty(metadata)) {
-      return [] as R;
+      return [] as unknown[] as R;
     }
     return iterate(metadata)
-      .filter((guard: any) => guard && (guard.name || guard.canActivate))
+      .filter(
+        (guard: any) =>
+          guard && (isFunction(guard) || isFunction(guard.canActivate)),
+      )
       .map(guard =>
         this.getGuardInstance(guard as Function, contextId, inquirerId),
       )
-      .filter((guard: CanActivate) => guard && isFunction(guard.canActivate))
+      .filter(
+        (guard: CanActivate | null) => !!guard && isFunction(guard.canActivate),
+      )
       .toArray() as R;
   }
 
   public getGuardInstance(
-    guard: Function | CanActivate,
+    metatype: Function | CanActivate,
     contextId = STATIC_CONTEXT,
     inquirerId?: string,
   ): CanActivate | null {
-    const isObject = (guard as CanActivate).canActivate;
-    if (isObject) {
-      return guard as CanActivate;
+    if (!isFunction(metatype)) {
+      return metatype;
     }
-    const instanceWrapper = this.getInstanceByMetatype(guard);
+    const instanceWrapper = this.getInstanceByMetatype(
+      metatype as Type<unknown>,
+    );
     if (!instanceWrapper) {
-      return null;
+      return this.pickEnhancer<CanActivate>(metatype, null, 'canActivate');
     }
     const instanceHost = instanceWrapper.getInstanceByContextId(
-      contextId,
+      this.getContextId(contextId, instanceWrapper),
       inquirerId,
     );
-    return instanceHost && instanceHost.instance;
+    const enhancer = this.pickEnhancer<CanActivate>(
+      metatype,
+      instanceHost && instanceHost.instance,
+      'canActivate',
+    );
+    // Nest constructed the bound class, and neither the instance nor the
+    // class can run as a guard. A request-scoped or transient guard outside of
+    // its context is only a placeholder whose constructor never ran, and a
+    // class that resolves to no provider (a host outside of every module)
+    // is skipped as before.
+    if (instanceHost?.isConstructorCalled) {
+      assertEnhancer(enhancer, 'guard', describeEnhancer(metatype));
+    }
+    return enhancer;
   }
 
-  public getInstanceByMetatype<T extends Record<string, any> | Function>(
-    guard: T,
+  public getInstanceByMetatype(
+    metatype: Type<unknown>,
   ): InstanceWrapper | undefined {
     if (!this.moduleContext) {
       return;
@@ -85,7 +112,7 @@ export class GuardsContextCreator extends ContextCreator {
       return;
     }
     const injectables = moduleRef.injectables;
-    return injectables.get(guard.name as string);
+    return injectables.get(metatype);
   }
 
   public getGlobalMetadata<T extends unknown[]>(
@@ -93,17 +120,29 @@ export class GuardsContextCreator extends ContextCreator {
     inquirerId?: string,
   ): T {
     if (!this.config) {
-      return [] as T;
+      return [] as unknown[] as T;
     }
     const globalGuards = this.config.getGlobalGuards() as T;
     if (contextId === STATIC_CONTEXT && !inquirerId) {
       return globalGuards;
     }
-    const scopedGuardWrappers = this.config.getGlobalRequestGuards() as InstanceWrapper[];
+    const scopedGuardWrappers =
+      this.config.getGlobalRequestGuards() as InstanceWrapper[];
     const scopedGuards = iterate(scopedGuardWrappers)
-      .map(wrapper => wrapper.getInstanceByContextId(contextId, inquirerId))
+      .map(wrapper =>
+        wrapper.getInstanceByContextId(
+          this.getContextId(contextId, wrapper),
+          inquirerId,
+        ),
+      )
       .filter(host => !!host)
-      .map(host => host.instance)
+      .map(host => {
+        // A scoped instance only exists here, once per context
+        if (host.isConstructorCalled) {
+          assertEnhancer(host.instance, 'guard');
+        }
+        return host.instance;
+      })
       .toArray();
 
     return globalGuards.concat(scopedGuards) as T;

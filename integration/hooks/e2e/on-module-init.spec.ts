@@ -1,11 +1,8 @@
+import { Inject, Injectable, Module, OnModuleInit } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import { expect } from 'chai';
-import * as Sinon from 'sinon';
-import { Injectable, OnModuleInit } from '@nestjs/common';
-
 @Injectable()
 class TestInjectable implements OnModuleInit {
-  onModuleInit = Sinon.spy();
+  onModuleInit = vi.fn();
 }
 
 describe('OnModuleInit', () => {
@@ -17,7 +14,8 @@ describe('OnModuleInit', () => {
     const app = module.createNestApplication();
     await app.init();
     const instance = module.get(TestInjectable);
-    expect(instance.onModuleInit.called).to.be.true;
+    expect(instance.onModuleInit).toHaveBeenCalled();
+    await app.close();
   });
 
   it('should not throw an error when onModuleInit is null', async () => {
@@ -26,7 +24,8 @@ describe('OnModuleInit', () => {
     }).compile();
 
     const app = module.createNestApplication();
-    await app.init().then(obj => expect(obj).to.not.be.undefined);
+    await app.init().then(obj => expect(obj).not.toBeUndefined());
+    await app.close();
   });
 
   it('should not throw an error when onModuleInit is undefined', async () => {
@@ -35,6 +34,208 @@ describe('OnModuleInit', () => {
     }).compile();
 
     const app = module.createNestApplication();
-    await app.init().then(obj => expect(obj).to.not.be.undefined);
+    await app.init().then(obj => expect(obj).not.toBeUndefined());
+    await app.close();
+  });
+
+  it('should sort modules by distance (topological sort) - DESC order', async () => {
+    @Injectable()
+    class CC implements OnModuleInit {
+      public field: string;
+
+      async onModuleInit() {
+        this.field = 'c-field';
+      }
+    }
+
+    @Module({})
+    class C {
+      static forRoot() {
+        return {
+          module: C,
+          global: true,
+          providers: [
+            {
+              provide: CC,
+              useValue: new CC(),
+            },
+          ],
+          exports: [CC],
+        };
+      }
+    }
+
+    @Injectable()
+    class BB implements OnModuleInit {
+      public field: string;
+      constructor(private cc: CC) {}
+
+      async onModuleInit() {
+        this.field = this.cc.field + '_b-field';
+      }
+    }
+
+    @Module({
+      providers: [BB],
+      exports: [BB],
+    })
+    class B {}
+
+    @Injectable()
+    class AA implements OnModuleInit {
+      public field: string;
+      constructor(private bb: BB) {}
+
+      async onModuleInit() {
+        this.field = this.bb.field + '_a-field';
+      }
+    }
+    @Module({
+      imports: [B],
+      providers: [AA],
+    })
+    class A {}
+
+    @Module({
+      imports: [A, C.forRoot()],
+    })
+    class AppModule {}
+
+    const module = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+
+    const app = module.createNestApplication();
+    await app.init();
+
+    const instance = module.get(AA);
+    expect(instance.field).toBe('c-field_b-field_a-field');
+    await app.close();
+  });
+
+  it('should call onModuleInit of an imported module first when a longer import path also leads to it', async () => {
+    @Injectable()
+    class DatabaseService implements OnModuleInit {
+      onModuleInit = vi.fn();
+    }
+
+    @Module({
+      providers: [DatabaseService],
+      exports: [DatabaseService],
+    })
+    class DatabaseModule {}
+
+    @Injectable()
+    class UsersService implements OnModuleInit {
+      constructor(private db: DatabaseService) {}
+      onModuleInit = vi.fn();
+    }
+
+    @Module({
+      imports: [DatabaseModule],
+      providers: [UsersService],
+      exports: [UsersService],
+    })
+    class UsersModule {}
+
+    @Module({ imports: [UsersModule] })
+    class PaymentsModule {}
+
+    @Module({ imports: [PaymentsModule] })
+    class OrdersModule {}
+
+    const module = await Test.createTestingModule({
+      imports: [DatabaseModule, UsersModule, OrdersModule],
+    }).compile();
+
+    const app = module.createNestApplication();
+    await app.init();
+    await app.close();
+
+    const db = module.get(DatabaseService);
+    const users = module.get(UsersService);
+    expect(db.onModuleInit).toHaveBeenCalledBefore(users.onModuleInit);
+  });
+
+  it('should sort components within a single module by injection hierarchy - DESC order', async () => {
+    @Injectable()
+    class A implements OnModuleInit {
+      onModuleInit = vi.fn();
+    }
+
+    @Injectable()
+    class AHost implements OnModuleInit {
+      constructor(private a: A) {}
+      onModuleInit = vi.fn();
+    }
+
+    @Injectable()
+    class Composition implements OnModuleInit {
+      constructor(
+        private a: A,
+        private host: AHost,
+      ) {}
+      onModuleInit = vi.fn();
+    }
+
+    @Module({
+      providers: [AHost, A, Composition],
+    })
+    class AModule {}
+
+    const module = await Test.createTestingModule({
+      imports: [AModule],
+    }).compile();
+
+    const app = module.createNestApplication();
+    await app.init();
+    await app.close();
+
+    const child = module.get(A);
+    const parent = module.get(AHost);
+    const composition = module.get(Composition);
+    expect(child.onModuleInit.mock.invocationCallOrder[0]).toBeLessThan(
+      parent.onModuleInit.mock.invocationCallOrder[0],
+    );
+    expect(parent.onModuleInit.mock.invocationCallOrder[0]).toBeLessThan(
+      composition.onModuleInit.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('should call onModuleInit of a property dependency first', async () => {
+    const calls: string[] = [];
+
+    @Injectable()
+    class DatabaseService implements OnModuleInit {
+      async onModuleInit() {
+        await new Promise(resolve => setTimeout(resolve, 10));
+        calls.push('database');
+      }
+    }
+
+    @Injectable()
+    class UsersService implements OnModuleInit {
+      @Inject(DatabaseService)
+      private readonly db: DatabaseService;
+
+      onModuleInit() {
+        calls.push('users');
+      }
+    }
+
+    @Module({
+      providers: [UsersService, DatabaseService],
+    })
+    class AModule {}
+
+    const module = await Test.createTestingModule({
+      imports: [AModule],
+    }).compile();
+
+    const app = module.createNestApplication();
+    await app.init();
+    await app.close();
+
+    expect(calls).toEqual(['database', 'users']);
   });
 });

@@ -1,20 +1,26 @@
-import { Transport } from '../enums/transport.enum';
-import { ChannelOptions } from '../external/grpc-options.interface';
+import type { InjectionToken, Type } from '@nestjs/common';
+import { TlsOptions } from 'tls';
+import { Transport } from '../enums/transport.enum.js';
+import { ChannelOptions } from '../external/grpc-options.interface.js';
 import {
   ConsumerConfig,
   ConsumerRunConfig,
-  ConsumerSubscribeTopic,
+  ConsumerSubscribeTopics,
   KafkaConfig,
   ProducerConfig,
   ProducerRecord,
-} from '../external/kafka.interface';
-import { MqttClientOptions } from '../external/mqtt-options.interface';
-import { ClientOpts } from '../external/redis.interface';
-import { RmqUrl } from '../external/rmq-url.interface';
-import { Server } from '../server/server';
-import { CustomTransportStrategy } from './custom-transport-strategy.interface';
-import { Deserializer } from './deserializer.interface';
-import { Serializer } from './serializer.interface';
+} from '../external/kafka.interface.js';
+import { MqttClientOptions, QoS } from '../external/mqtt-options.interface.js';
+import { IORedisOptions } from '../external/redis.interface.js';
+import {
+  AmqpConnectionManagerSocketOptions,
+  AmqplibQueueOptions,
+  RmqUrl,
+} from '../external/rmq-url.interface.js';
+import { TcpSocket } from '../helpers/index.js';
+import { CustomTransportStrategy } from './custom-transport-strategy.interface.js';
+import { Deserializer } from './deserializer.interface.js';
+import { Serializer } from './serializer.interface.js';
 
 export type MicroserviceOptions =
   | GrpcOptions
@@ -26,11 +32,29 @@ export type MicroserviceOptions =
   | KafkaOptions
   | CustomStrategy;
 
+export type TransportId = Transport | symbol;
+
+export type AsyncMicroserviceOptions = {
+  inject: InjectionToken[];
+  useFactory: (...args: any[]) => MicroserviceOptions;
+};
+
+export type AsyncOptions<T extends object> = {
+  inject: InjectionToken[];
+  useFactory: (...args: any[]) => T;
+};
+
+/**
+ * @publicApi
+ */
 export interface CustomStrategy {
   strategy: CustomTransportStrategy;
-  options?: {};
+  options?: Record<string, any>;
 }
 
+/**
+ * @publicApi
+ */
 export interface GrpcOptions {
   transport?: Transport.GRPC;
   options: {
@@ -49,9 +73,40 @@ export interface GrpcOptions {
     };
     channelOptions?: ChannelOptions;
     credentials?: any;
-    protoPath: string | string[];
+    protoPath?: string | string[];
     package: string | string[];
     protoLoader?: string;
+    packageDefinition?: any;
+    /**
+     * When enabled, closing the server stops accepting calls and waits for
+     * the calls in progress to finish ("tryShutdown()"), for "gracePeriod" at
+     * most, before it cancels those still running ("forceShutdown()").
+     * Applies only to the server.
+     * @default false
+     */
+    gracefulShutdown?: boolean;
+    /**
+     * With "gracefulShutdown", the longest time in milliseconds to wait for
+     * the calls in progress before cancelling those still running. Set it to
+     * 0 to cancel them at once, or to a larger value to wait longer (e.g.,
+     * for long-running streams). Applies only to the server.
+     * @default 10000
+     */
+    gracePeriod?: number;
+    /**
+     * Maximum number of responses of a streaming call that may wait for a
+     * client that is not reading them (default: 1000). A handler's Observable
+     * cannot be paused, so what it emits meanwhile is held in memory; once
+     * more than this many responses wait, the call is failed with
+     * RESOURCE_EXHAUSTED and the Observable is unsubscribed from. Responses
+     * a handler emits in one go while its client is keeping up, such as a
+     * result returned with `from(rows)`, are not counted. The limit applies
+     * to each call: to limit the calls a connection can have open at once,
+     * set "grpc.max_concurrent_streams" in "channelOptions".
+     * Set to 0 to disable.
+     */
+    maxPendingResponses?: number;
+    onLoadPackageDefinition?: (pkg: any, server: any) => void;
     loader?: {
       keepCase?: boolean;
       alternateCommentMode?: boolean;
@@ -68,43 +123,205 @@ export interface GrpcOptions {
   };
 }
 
+/**
+ * @publicApi
+ */
 export interface TcpOptions {
   transport?: Transport.TCP;
   options?: {
+    /**
+     * The host to listen on (default: 'localhost'). An empty value
+     * (undefined, null or '') means 'localhost' as well. Set it to '0.0.0.0'
+     * or '::' to accept connections on every interface.
+     */
     host?: string;
     port?: number;
     retryAttempts?: number;
     retryDelay?: number;
     serializer?: Serializer;
+    tlsOptions?: TlsOptions;
     deserializer?: Deserializer;
+    socketClass?: Type<TcpSocket>;
+    /**
+     * Maximum buffer size in characters (default: 16 * 1024 * 1024, which a
+     * string holds in 16 to 32MB). This limit prevents memory exhaustion
+     * when receiving large TCP messages; a packet declaring a greater length
+     * is rejected before any of it is buffered. A complete packet is parsed
+     * in one go, which blocks the event loop meanwhile, and the parsed value
+     * can take many times the memory of its text (about 40 bytes per
+     * character for an array of small objects), so raise it with care.
+     */
+    maxBufferSize?: number;
+    /**
+     * How long a peer may stay silent in the middle of a packet before the
+     * connection is dropped, in milliseconds (default: 30000). The timer is
+     * refreshed on every read, so it never interrupts a slow but progressing
+     * transfer (see "messageReceiveTimeout"); it only fires when a peer stops
+     * sending mid-packet, which would otherwise pin the partial packet in
+     * memory indefinitely.
+     * Set to 0 to disable.
+     */
+    incompleteMessageTimeout?: number;
+    /**
+     * How long a peer may take to send a single packet, from its first
+     * character to its last, before the connection is dropped, in milliseconds
+     * (default: 300000). Unlike "incompleteMessageTimeout", it is not extended
+     * by further reads, so a peer cannot hold a partial packet in memory by
+     * sending a little now and then. Time spent with reading suspended due to
+     * backpressure does not count. Set to 0 to disable.
+     */
+    messageReceiveTimeout?: number;
+    /**
+     * Maximum number of response bytes that may sit queued for a single peer
+     * that is not reading them, in bytes (default: 128MB). Reading from a peer
+     * is suspended while its outgoing buffer is backed up, and the connection
+     * is dropped once this limit is passed. Set to 0 to disable.
+     */
+    maxSendBufferSize?: number;
+    /**
+     * How long the responses queued for a peer may go without any of them
+     * being written out, while reading from that peer is suspended, before
+     * the connection is dropped, in milliseconds (default: 30000). The timer
+     * is refreshed whenever queued responses have been written out in full,
+     * so a peer that keeps reading is given more time, while one that stops
+     * reading can no longer hold its responses, up to "maxSendBufferSize",
+     * in memory indefinitely. Set to 0 to disable.
+     *
+     * It also bounds how long reading may stay suspended because of
+     * "maxConcurrentMessages" with no pending message settling.
+     */
+    drainTimeout?: number;
+    /**
+     * How many messages of a single peer may be handled at the same time
+     * (default: 1000). A message counts from the moment it is read until its
+     * handler, and the stream the handler returned, have settled. Later
+     * messages wait, and once more than "maxBufferSize" characters are
+     * waiting, reading from the peer is suspended. If none of its pending
+     * messages settles for "drainTimeout" after that, the connection is
+     * dropped. Set to 0 to disable.
+     */
+    maxConcurrentMessages?: number;
+    /**
+     * When enabled, closing the server keeps the connections that have
+     * requests or events being handled open until those are done, for
+     * "gracePeriod" at most, and takes no further message from them. The
+     * other connections are closed right away. (default: false)
+     */
+    gracefulShutdown?: boolean;
+    /**
+     * With "gracefulShutdown", the longest time in milliseconds before every
+     * connection is closed. (default: 10000)
+     */
+    gracePeriod?: number;
   };
 }
 
+/**
+ * @publicApi
+ */
 export interface RedisOptions {
   transport?: Transport.REDIS;
   options?: {
-    url?: string;
+    host?: string;
+    port?: number;
     retryAttempts?: number;
     retryDelay?: number;
+    /**
+     * Use `psubscribe`/`pmessage` to enable wildcards in the patterns
+     */
+    wildcards?: boolean;
+    /**
+     * With "wildcards", the maximum length, in characters, of the channel a
+     * request matched by a wildcard pattern may be published to (default:
+     * 1024). Its replies are published on a copy of that channel, which the
+     * sender chooses. A request on a longer channel is dropped and an error
+     * is logged. Set to 0 to disable.
+     */
+    maxWildcardChannelLength?: number;
+    /**
+     * When enabled, closing the server first stops receiving messages, then
+     * waits for the requests and events being handled, for "gracePeriod" at
+     * most, before it closes its connections. (default: false)
+     */
+    gracefulShutdown?: boolean;
+    /**
+     * With "gracefulShutdown", the longest time in milliseconds to wait for
+     * the requests and events being handled. (default: 10000)
+     */
+    gracePeriod?: number;
     serializer?: Serializer;
     deserializer?: Deserializer;
-  } & ClientOpts;
+  } & IORedisOptions;
 }
 
+/**
+ * @publicApi
+ */
 export interface MqttOptions {
   transport?: Transport.MQTT;
   options?: MqttClientOptions & {
     url?: string;
     serializer?: Serializer;
     deserializer?: Deserializer;
+    subscribeOptions?: {
+      /**
+       * The QoS
+       */
+      qos: QoS;
+      /*
+       * No local flag
+       * */
+      nl?: boolean;
+      /*
+       * Retain as Published flag
+       * */
+      rap?: boolean;
+      /*
+       * Retain Handling option
+       * */
+      rh?: number;
+    };
+    userProperties?: Record<string, string | string[]>;
+    /**
+     * Maximum number of connection attempts before the server gives up and
+     * reports the failure to the bootstrap callback.
+     * Applies only to the server configuration, and only to the initial
+     * connection - once connected, reconnections are retried indefinitely.
+     * -1 === infinite
+     * @default -1
+     */
+    maxConnectionAttempts?: number;
+    /**
+     * When enabled, closing the server first stops receiving messages, then
+     * waits for the requests and events being handled, for "gracePeriod" at
+     * most, before it closes its connection. Applies only to the server
+     * configuration. With a persistent session ("clean: false", plus a
+     * "sessionExpiryInterval" on MQTT 5), unsubscribing removes the
+     * subscriptions from the session, so QoS 1 and 2 messages published to a
+     * non-shared subscription while the instance restarts are not queued for
+     * it. (default: false)
+     */
+    gracefulShutdown?: boolean;
+    /**
+     * With "gracefulShutdown", the longest time in milliseconds to wait for
+     * the requests and events being handled. (default: 10000)
+     */
+    gracePeriod?: number;
   };
 }
 
+/**
+ * @publicApi
+ */
 export interface NatsOptions {
   transport?: Transport.NATS;
   options?: {
+    headers?: Record<string, string>;
+    authenticator?: any;
+    debug?: boolean;
+    ignoreClusterUpdates?: boolean;
+    inboxPrefix?: string;
     encoding?: string;
-    url?: string;
     name?: string;
     user?: string;
     pass?: string;
@@ -114,7 +331,7 @@ export interface NatsOptions {
     reconnectJitter?: number;
     reconnectJitterTLS?: number;
     reconnectDelayHandler?: any;
-    servers?: string[];
+    servers?: string[] | string;
     nkey?: any;
     reconnect?: boolean;
     pedantic?: boolean;
@@ -136,38 +353,197 @@ export interface NatsOptions {
     token?: string;
     yieldTime?: number;
     tokenHandler?: any;
+    /**
+     * When enabled, closing the server first unsubscribes from every subject,
+     * then waits for the requests and events being handled, for "gracePeriod"
+     * at most, before it closes the connection. (default: false)
+     */
+    gracefulShutdown?: boolean;
+    /**
+     * With "gracefulShutdown", the longest time in milliseconds to wait for
+     * the requests and events being handled. (default: 10000)
+     */
+    gracePeriod?: number;
     [key: string]: any;
   };
 }
 
+/**
+ * @publicApi
+ */
 export interface RmqOptions {
   transport?: Transport.RMQ;
   options?: {
+    /**
+     * An array of connection URLs to try in order.
+     */
     urls?: string[] | RmqUrl[];
+    /**
+     * The name of the queue.
+     */
     queue?: string;
+    /**
+     * A prefetch count for this channel. The count given is the maximum number of messages sent over the channel that can be awaiting acknowledgement;
+     * once there are count messages outstanding, the server will not send more messages on this channel until one or more have been acknowledged.
+     */
     prefetchCount?: number;
+    /**
+     * Sets the per-channel behavior for prefetching messages.
+     */
     isGlobalPrefetchCount?: boolean;
-    queueOptions?: any; // AmqplibQueueOptions;
-    socketOptions?: any; // AmqpConnectionManagerSocketOptions;
+    /**
+     * Amqplib queue options.
+     * @see https://amqp-node.github.io/amqplib/channel_api.html#channel_assertQueue
+     */
+    queueOptions?: AmqplibQueueOptions;
+    /**
+     * AMQP Connection Manager socket options.
+     */
+    socketOptions?: AmqpConnectionManagerSocketOptions;
+    /**
+     * If true, the broker won’t expect an acknowledgement of messages delivered to this consumer; i.e., it will dequeue messages as soon as they’ve been sent down the wire.
+     * @default true
+     */
     noAck?: boolean;
+    /**
+     * A name which the server will use to distinguish message deliveries for the consumer; mustn’t be already in use on the channel. It’s usually easier to omit this, in which case the server will create a random name and supply it in the reply.
+     */
+    consumerTag?: string;
+    /**
+     * A serializer for the message payload.
+     */
     serializer?: Serializer;
+    /**
+     * A deserializer for the message payload.
+     */
     deserializer?: Deserializer;
+    /**
+     * A reply queue for the producer.
+     * @default 'amq.rabbitmq.reply-to'
+     */
     replyQueue?: string;
+    /**
+     * If truthy, the message will survive broker restarts provided it’s in a queue that also survives restarts.
+     */
     persistent?: boolean;
+    /**
+     * Additional headers to be sent with every message.
+     * Applies only to the producer configuration.
+     */
+    headers?: Record<string, string>;
+    /**
+     * When true, a queue will not be asserted before consuming.
+     * @default false
+     */
+    noAssert?: boolean;
+    /**
+     * Name for the exchange. Defaults to the queue name when "wildcards" is set to true or "exchangeType" is 'fanout'.
+     * @default ''
+     */
+    exchange?: string;
+    /**
+     * Type of the exchange.
+     * Accepts the AMQP standard types ('direct', 'fanout', 'topic', 'headers') or any custom exchange type name provided as a string literal.
+     * @default 'topic'
+     */
+    exchangeType?: 'direct' | 'fanout' | 'topic' | 'headers' | (string & {});
+    /**
+     * Exchange arguments
+     */
+    exchangeArguments?: Record<string, string>;
+    /**
+     * Additional routing key for the topic exchange.
+     */
+    routingKey?: string;
+    /**
+     * Set to true only if you want to use Topic Exchange for routing messages to queues.
+     * Enabling this will allow you to use wildcards (*, #) as message and event patterns.
+     * @see https://www.rabbitmq.com/tutorials/tutorial-five-python#topic-exchange
+     * @default false
+     */
+    wildcards?: boolean;
+    /**
+     * Maximum size of a message body in bytes. The server logs and skips a
+     * larger message instead of decoding it (it is negatively acknowledged,
+     * without requeue, when "noAck" is false, and a request is answered with an
+     * error), and the client fails the request that a larger reply answers.
+     * Decoding JSON can take dozens of times the size of the body in memory,
+     * so a process with a small heap may need a lower limit.
+     * @default 16777216 (16 MiB)
+     */
+    maxMessageSize?: number;
+    /**
+     * Maximum number of connection attempts.
+     * Applies only to the consumer configuration.
+     * -1 === infinite
+     * @default -1
+     */
+    maxConnectionAttempts?: number;
+    /**
+     * When enabled, closing the server first cancels its consumer, then waits
+     * for the requests and events being handled, for "gracePeriod" at most,
+     * before it closes its channel and its connection.
+     * Applies only to the consumer configuration.
+     * @default false
+     */
+    gracefulShutdown?: boolean;
+    /**
+     * With "gracefulShutdown", the longest time in milliseconds to wait for
+     * the requests and events being handled.
+     * @default 10000
+     */
+    gracePeriod?: number;
   };
 }
 
+/**
+ * @publicApi
+ */
+export interface KafkaParserConfig {
+  keepBinary?: boolean;
+  /**
+   * Maximum size of a message in bytes, after decompression: its key, its
+   * headers and, unless `keepBinary` is set, its value. A larger message is
+   * logged and skipped instead of being decoded.
+   * @default 16777216 (16 MiB)
+   */
+  maxMessageSize?: number;
+}
+
+/**
+ * @publicApi
+ */
 export interface KafkaOptions {
   transport?: Transport.KAFKA;
   options?: {
+    /**
+     * Defaults to `"-server"` on server side and `"-client"` on client side.
+     */
     postfixId?: string;
     client?: KafkaConfig;
     consumer?: ConsumerConfig;
+    /**
+     * Options passed to KafkaJS consumer.run().
+     * Note: `partitionsConsumedConcurrently` (KafkaJS parameter) controls
+     * concurrent processing at the partition level (not topic level).
+     */
     run?: Omit<ConsumerRunConfig, 'eachBatch' | 'eachMessage'>;
-    subscribe?: Omit<ConsumerSubscribeTopic, 'topic'>;
+    subscribe?: Omit<ConsumerSubscribeTopics, 'topics'>;
     producer?: ProducerConfig;
     send?: Omit<ProducerRecord, 'topic' | 'messages'>;
     serializer?: Serializer;
     deserializer?: Deserializer;
+    parser?: KafkaParserConfig;
+    producerOnlyMode?: boolean;
+    /**
+     * The longest time in milliseconds that closing the server waits, once
+     * its consumer has disconnected, for the requests and events still being
+     * handled (e.g., the rest of a stream that a handler returned, or a reply
+     * still being serialized or published) before it disconnects its
+     * producer. Set it to `0` to disconnect the producer without waiting.
+     * Applies only to the server.
+     * @default 10000
+     */
+    gracePeriod?: number;
   };
 }

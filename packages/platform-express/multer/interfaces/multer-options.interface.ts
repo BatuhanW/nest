@@ -1,34 +1,69 @@
 /**
+ * @publicApi
+ */
+export interface MulterLimits {
+  /** Max field name size (Default: 100 bytes) */
+  fieldNameSize?: number;
+  /** Max field value size (Default: 1MB) */
+  fieldSize?: number;
+  /** Max number of non- file fields (Default: Infinity) */
+  fields?: number;
+  /** For multipart forms, the max file size (in bytes)(Default: Infinity) */
+  fileSize?: number;
+  /** For multipart forms, the max number of file fields (Default: Infinity) */
+  files?: number;
+  /**
+   * For multipart forms, the max number of parts (fields + files) (Default:
+   * 1000, as on Fastify, where multer's own default is Infinity). Set it to
+   * `Infinity` to lift the limit.
+   */
+  parts?: number;
+  /** For multipart forms, the max number of header key=> value pairs to parse Default: 2000(same as node's http). */
+  headerPairs?: number;
+  /**
+   * Max nesting depth of field names; `a[b][c]` has 2 levels (Default: 32,
+   * where multer's own default is Infinity). Set it to `Infinity` to lift
+   * the limit.
+   */
+  fieldNestingDepth?: number;
+  /**
+   * Max numeric array index accepted in field names; `a[3]` uses index 3
+   * (Default: 1000, where multer's own default is Infinity). Set it to
+   * `Infinity` to lift the limit.
+   */
+  fieldArrayIndexLimit?: number;
+}
+
+/**
  * @see https://github.com/expressjs/multer
+ *
+ * @publicApi
  */
 export interface MulterOptions {
-  dest?: string;
+  dest?: string | Function;
   /** The storage engine to use for uploaded files. */
   storage?: any;
   /**
-   * An object specifying the size limits of the following optional properties. This object is passed to busboy
-   * directly, and the details of properties can be found on https://github.com/mscdex/busboy#busboy-methods
+   * An object specifying the size limits of the following optional properties. This object is passed to multer
+   * and on to busboy, with `fieldNestingDepth`, `fieldArrayIndexLimit` and `parts` set to their defaults when absent.
+   * The details of the busboy properties can be found on https://github.com/mscdex/busboy#busboy-methods
+   *
+   * Since multer 2.4.0, this can also be a function of the request that returns such an object.
    */
-  limits?: {
-    /** Max field name size (Default: 100 bytes) */
-    fieldNameSize?: number;
-    /** Max field value size (Default: 1MB) */
-    fieldSize?: number;
-    /** Max number of non- file fields (Default: Infinity) */
-    fields?: number;
-    /** For multipart forms, the max file size (in bytes)(Default: Infinity) */
-    fileSize?: number;
-    /** For multipart forms, the max number of file fields (Default: Infinity) */
-    files?: number;
-    /** For multipart forms, the max number of parts (fields + files)(Default: Infinity) */
-    parts?: number;
-    /** For multipart forms, the max number of header key=> value pairs to parse Default: 2000(same as node's http). */
-    headerPairs?: number;
-  };
+  limits?: MulterLimits | ((req: any) => MulterLimits);
 
   /** Keep the full path of files instead of just the base name (Default: false) */
   preservePath?: boolean;
 
+  /** Default character set for part header values (e.g. filename) (Default: 'latin1') */
+  defParamCharset?: string;
+
+  /**
+   * Decides which files are stored. Call `callback(null, false)` to skip a
+   * file, or `callback(error, false)` to fail the request with `error`. An
+   * error the filter throws, or an async filter rejects with, before it
+   * calls back fails the request in the same way.
+   */
   fileFilter?(
     req: any,
     file: {
@@ -55,6 +90,9 @@ export interface MulterOptions {
   ): void;
 }
 
+/**
+ * @publicApi
+ */
 export interface MulterField {
   /** The field name. */
   name: string;

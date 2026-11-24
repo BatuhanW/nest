@@ -1,11 +1,12 @@
 /*
  * Nest @testing
- * Copyright(c) 2017 - 2020 Kamil Mysliwiec
+ * Copyright(c) 2017 - 2025 Kamil Mysliwiec
  * https://nestjs.com
  * MIT Licensed
  */
 
-export * from './interfaces';
-export * from './test';
-export * from './testing-module';
-export * from './testing-module.builder';
+export type * from './interfaces/index.js';
+export * from './services/capturing-logger.service.js';
+export * from './test.js';
+export * from './testing-module.js';
+export * from './testing-module.builder.js';

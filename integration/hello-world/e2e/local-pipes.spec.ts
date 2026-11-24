@@ -1,7 +1,8 @@
 import { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import * as request from 'supertest';
-import { ApplicationModule } from '../src/app.module';
+import request from 'supertest';
+import { AppModule } from '../src/app.module.js';
+import { listenOnLoopback } from '../../_support/listen-on-loopback.js';
 
 describe('Hello world (default adapter)', () => {
   let server;
@@ -9,12 +10,12 @@ describe('Hello world (default adapter)', () => {
 
   beforeEach(async () => {
     const module = await Test.createTestingModule({
-      imports: [ApplicationModule],
+      imports: [AppModule],
     }).compile();
 
     app = module.createNestApplication();
     server = app.getHttpServer();
-    await app.init();
+    await listenOnLoopback(app);
   });
 
   it(`host=example.com should execute locally injected pipe by HelloController`, () => {

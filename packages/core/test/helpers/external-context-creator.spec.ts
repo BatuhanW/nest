@@ -1,26 +1,36 @@
-import { ForbiddenException } from '@nestjs/common';
-import { CUSTOM_ROUTE_AGRS_METADATA } from '@nestjs/common/constants';
-import { RouteParamtypes } from '@nestjs/common/enums/route-paramtypes.enum';
-import { expect } from 'chai';
+import {
+  createParamDecorator,
+  ExecutionContext,
+  ForbiddenException,
+  SetMetadata,
+} from '@nestjs/common';
+import {
+  CUSTOM_ROUTE_ARGS_METADATA,
+  ENTRY_PROVIDER_WATERMARK,
+  ROUTE_ARGS_METADATA,
+} from '@nestjs/common/constants.js';
+import { RouteParamtypes } from '@nestjs/common/enums/route-paramtypes.enum.js';
 import { of } from 'rxjs';
-import * as sinon from 'sinon';
-import { ExternalExceptionFilterContext } from '../../exceptions/external-exception-filter-context';
-import { GuardsConsumer } from '../../guards/guards-consumer';
-import { GuardsContextCreator } from '../../guards/guards-context-creator';
-import { ExternalContextCreator } from '../../helpers/external-context-creator';
-import { NestContainer } from '../../injector/container';
-import { ModulesContainer } from '../../injector/modules-container';
-import { InterceptorsConsumer } from '../../interceptors/interceptors-consumer';
-import { InterceptorsContextCreator } from '../../interceptors/interceptors-context-creator';
-import { PipesConsumer } from '../../pipes/pipes-consumer';
-import { PipesContextCreator } from '../../pipes/pipes-context-creator';
-import { RouteParamsFactory } from '../../router/route-params-factory';
+import { ExternalExceptionFilterContext } from '../../exceptions/external-exception-filter-context.js';
+import { GuardsConsumer } from '../../guards/guards-consumer.js';
+import { GuardsContextCreator } from '../../guards/guards-context-creator.js';
+import { ExternalContextCreator } from '../../helpers/external-context-creator.js';
+import { STATIC_CONTEXT } from '../../injector/constants.js';
+import { NestContainer } from '../../injector/container.js';
+import { InstanceWrapper } from '../../injector/instance-wrapper.js';
+import { Module } from '../../injector/module.js';
+import { ModulesContainer } from '../../injector/modules-container.js';
+import { InterceptorsConsumer } from '../../interceptors/interceptors-consumer.js';
+import { InterceptorsContextCreator } from '../../interceptors/interceptors-context-creator.js';
+import { PipesConsumer } from '../../pipes/pipes-consumer.js';
+import { PipesContextCreator } from '../../pipes/pipes-context-creator.js';
+import { RouteParamsFactory } from '../../router/route-params-factory.js';
 
 describe('ExternalContextCreator', () => {
   let contextCreator: ExternalContextCreator;
   let callback: any;
-  let bindSpy: sinon.SinonSpy;
-  let applySpy: sinon.SinonSpy;
+  let bindSpy: ReturnType<typeof vi.fn>;
+  let applySpy: ReturnType<typeof vi.fn>;
   let guardsConsumer: GuardsConsumer;
   let pipesConsumer: PipesConsumer;
   let guardsContextCreator: GuardsContextCreator;
@@ -30,13 +40,13 @@ describe('ExternalContextCreator', () => {
       bind: () => ({}),
       apply: () => ({}),
     };
-    bindSpy = sinon.spy(callback, 'bind');
-    applySpy = sinon.spy(callback, 'apply');
+    bindSpy = vi.spyOn(callback, 'bind');
+    applySpy = vi.spyOn(callback, 'apply');
 
     guardsConsumer = new GuardsConsumer();
     pipesConsumer = new PipesConsumer();
     guardsContextCreator = new GuardsContextCreator(new NestContainer());
-    sinon.stub(guardsContextCreator, 'create').returns([{}] as any);
+    vi.spyOn(guardsContextCreator, 'create').mockReturnValue([{}] as any);
     contextCreator = new ExternalContextCreator(
       guardsContextCreator,
       guardsConsumer,
@@ -49,14 +59,250 @@ describe('ExternalContextCreator', () => {
     );
   });
   describe('create', () => {
-    it('should call "getContextModuleName" with expected argument', done => {
-      const getContextModuleNameSpy = sinon.spy(
-        contextCreator,
-        'getContextModuleName',
-      );
-      contextCreator.create({ foo: 'bar' }, callback as any, '', '', null);
-      expect(getContextModuleNameSpy.called).to.be.true;
-      done();
+    it('should call "getContextModuleName" with expected argument', () =>
+      new Promise<void>(done => {
+        const getContextModuleKeySpy = vi.spyOn(
+          contextCreator,
+          'getContextModuleKey',
+        );
+        contextCreator.create({ foo: 'bar' }, callback, '', '', null!);
+        expect(getContextModuleKeySpy).toHaveBeenCalled();
+        done();
+      }));
+    describe('when the "constructor" of the host prototype was overwritten', () => {
+      it('should look the module up by the registered class', () => {
+        class Mixin {}
+        class Host {}
+        Host.prototype.constructor = Mixin;
+        new InstanceWrapper({ metatype: Host });
+
+        const getContextModuleKeySpy = vi.spyOn(
+          contextCreator,
+          'getContextModuleKey',
+        );
+        contextCreator.create(new Host(), callback, '', '', null!);
+        expect(getContextModuleKeySpy).toHaveBeenCalledWith(Host);
+      });
+    });
+    describe('when no inquirer id is given', () => {
+      @SetMetadata(ENTRY_PROVIDER_WATERMARK, true)
+      class EntryProvider {}
+
+      class PlainProvider {}
+
+      let moduleRef: Module;
+
+      beforeEach(() => {
+        const modules = new ModulesContainer();
+        moduleRef = new Module(class {}, new NestContainer());
+        moduleRef.addProvider(EntryProvider);
+        moduleRef.addProvider(PlainProvider);
+        modules.set('key', moduleRef);
+        (contextCreator as any).modulesContainer = modules;
+      });
+
+      it('should look up the enhancers of an entry provider with that provider as the inquirer', () => {
+        const instance = new EntryProvider();
+        contextCreator.create(instance, callback, '', '', null!);
+
+        expect(guardsContextCreator.create).toHaveBeenCalledWith(
+          instance,
+          callback,
+          'key',
+          STATIC_CONTEXT,
+          moduleRef.providers.get(EntryProvider)!.id,
+        );
+      });
+
+      it('should not use any other provider as the inquirer', () => {
+        const instance = new PlainProvider();
+        contextCreator.create(instance, callback, '', '', null!);
+
+        expect(guardsContextCreator.create).toHaveBeenCalledWith(
+          instance,
+          callback,
+          'key',
+          STATIC_CONTEXT,
+          undefined,
+        );
+      });
+    });
+    describe('when the host is registered under a token other than its class', () => {
+      @SetMetadata(ENTRY_PROVIDER_WATERMARK, true)
+      class Resolver {}
+
+      let wrapper: InstanceWrapper;
+
+      beforeEach(() => {
+        const modules = new ModulesContainer();
+        const moduleRef = new Module(class {}, new NestContainer());
+        moduleRef.addProvider({ provide: 'RESOLVER', useClass: Resolver });
+        wrapper = moduleRef.providers.get('RESOLVER')!;
+        wrapper.instance = new Resolver();
+        modules.set('key', moduleRef);
+        (contextCreator as any).modulesContainer = modules;
+      });
+
+      it('should find its module and inquirer by its instance', () => {
+        contextCreator.create(wrapper.instance, callback, '', '', null!);
+
+        expect(guardsContextCreator.create).toHaveBeenCalledWith(
+          wrapper.instance,
+          callback,
+          'key',
+          STATIC_CONTEXT,
+          wrapper.id,
+        );
+      });
+
+      it('should find its module by the inquirer id', () => {
+        const instance = new Resolver();
+        const contextId = { id: 2 };
+        contextCreator.create(
+          instance,
+          callback,
+          '',
+          '',
+          null!,
+          contextId,
+          wrapper.id,
+        );
+
+        expect(guardsContextCreator.create).toHaveBeenCalledWith(
+          instance,
+          callback,
+          'key',
+          contextId,
+          wrapper.id,
+        );
+      });
+    });
+    describe('when several modules provide the class of the host', () => {
+      class Resolver {}
+
+      let wrapper: InstanceWrapper;
+
+      beforeEach(() => {
+        const modules = new ModulesContainer();
+        const otherModuleRef = new Module(class {}, new NestContainer());
+        otherModuleRef.addProvider(Resolver);
+        otherModuleRef.providers.get(Resolver)!.instance = new Resolver();
+        modules.set('other', otherModuleRef);
+
+        const moduleRef = new Module(class {}, new NestContainer());
+        moduleRef.addProvider(Resolver);
+        wrapper = moduleRef.providers.get(Resolver)!;
+        wrapper.instance = new Resolver();
+        modules.set('key', moduleRef);
+        (contextCreator as any).modulesContainer = modules;
+      });
+
+      it('should find the module of the host by its instance', () => {
+        contextCreator.create(wrapper.instance, callback, '', '', null!);
+
+        expect(guardsContextCreator.create).toHaveBeenCalledWith(
+          wrapper.instance,
+          callback,
+          'key',
+          STATIC_CONTEXT,
+          undefined,
+        );
+      });
+
+      it('should find the module of the host by the inquirer id', () => {
+        const instance = new Resolver();
+        const contextId = { id: 2 };
+        contextCreator.create(
+          instance,
+          callback,
+          '',
+          '',
+          null!,
+          contextId,
+          wrapper.id,
+        );
+
+        expect(guardsContextCreator.create).toHaveBeenCalledWith(
+          instance,
+          callback,
+          'key',
+          contextId,
+          wrapper.id,
+        );
+      });
+
+      it('should find the first module that provides the class when the host cannot be identified', () => {
+        const instance = new Resolver();
+        contextCreator.create(instance, callback, '', '', null!);
+
+        expect(guardsContextCreator.create).toHaveBeenCalledWith(
+          instance,
+          callback,
+          'other',
+          STATIC_CONTEXT,
+          undefined,
+        );
+      });
+    });
+    describe('when a factory provider of another module returns the host', () => {
+      class Resolver {}
+
+      let modules: ModulesContainer;
+      let moduleRef: Module;
+
+      const addFactoryOf = (
+        host: InstanceWrapper,
+        token: string | Function,
+      ) => {
+        const otherModuleRef = new Module(class {}, new NestContainer());
+        otherModuleRef.addProvider({
+          provide: token,
+          useFactory: () => host.instance,
+        });
+        otherModuleRef.providers.get(token)!.instance = host.instance;
+        modules.set('other', otherModuleRef);
+        modules.set('key', moduleRef);
+      };
+
+      beforeEach(() => {
+        modules = new ModulesContainer();
+        moduleRef = new Module(class {}, new NestContainer());
+        (contextCreator as any).modulesContainer = modules;
+      });
+
+      it('should find the module that provides the host under its class', () => {
+        moduleRef.addProvider(Resolver);
+        const wrapper = moduleRef.providers.get(Resolver)!;
+        wrapper.instance = new Resolver();
+        addFactoryOf(wrapper, Resolver);
+
+        contextCreator.create(wrapper.instance, callback, '', '', null!);
+
+        expect(guardsContextCreator.create).toHaveBeenCalledWith(
+          wrapper.instance,
+          callback,
+          'key',
+          STATIC_CONTEXT,
+          undefined,
+        );
+      });
+
+      it('should find the module that provides the host under another token', () => {
+        moduleRef.addProvider({ provide: 'RESOLVER', useClass: Resolver });
+        const wrapper = moduleRef.providers.get('RESOLVER')!;
+        wrapper.instance = new Resolver();
+        addFactoryOf(wrapper, 'FACTORY');
+
+        contextCreator.create(wrapper.instance, callback, '', '', null!);
+
+        expect(guardsContextCreator.create).toHaveBeenCalledWith(
+          wrapper.instance,
+          callback,
+          'key',
+          STATIC_CONTEXT,
+          undefined,
+        );
+      });
     });
     describe('returns proxy function', () => {
       let proxyContext;
@@ -64,107 +310,65 @@ describe('ExternalContextCreator', () => {
 
       beforeEach(() => {
         instance = { foo: 'bar' };
-        proxyContext = contextCreator.create(
-          instance,
-          callback as any,
-          '',
-          '',
-          null,
-        );
+        proxyContext = contextCreator.create(instance, callback, '', '', null!);
       });
       it('should be a function', () => {
-        expect(proxyContext).to.be.a('function');
+        expect(proxyContext).toBeTypeOf('function');
       });
       describe('when proxy function called', () => {
         describe('when can not activate', () => {
           it('should throw exception when "tryActivate" returns false', async () => {
-            sinon
-              .stub(guardsConsumer, 'tryActivate')
-              .callsFake(async () => false);
+            vi.spyOn(guardsConsumer, 'tryActivate').mockImplementation(
+              async () => false,
+            );
             let err: any;
             try {
               await proxyContext(1, 2, 3);
             } catch (e) {
               err = e;
             }
-            expect(err).to.be.instanceOf(ForbiddenException);
+            expect(err).toBeInstanceOf(ForbiddenException);
           });
         });
         describe('when can activate', () => {
           it('should apply context and args', async () => {
             const args = [1, 2, 3];
-            sinon
-              .stub(guardsConsumer, 'tryActivate')
-              .callsFake(async () => true);
+            vi.spyOn(guardsConsumer, 'tryActivate').mockImplementation(
+              async () => true,
+            );
 
             await proxyContext(...args);
-            expect(applySpy.called).to.be.true;
+            expect(applySpy).toHaveBeenCalled();
           });
         });
       });
     });
   });
-  describe('getContextModuleName', () => {
-    describe('when constructor name is undefined', () => {
+  describe('getContextModuleKey', () => {
+    describe('when constructor is undefined', () => {
       it('should return empty string', () => {
-        expect(contextCreator.getContextModuleName({} as any)).to.be.eql('');
+        expect(contextCreator.getContextModuleKey(undefined)).toEqual('');
       });
     });
-    describe('when provider exists', () => {
+    describe('when module reference provider exists', () => {
       it('should return module key', () => {
         const modules = new Map();
-        const providerKey = 'test';
         const moduleKey = 'key';
 
-        modules.set(moduleKey, {});
+        const moduleRef = new Module(class {}, modules as any);
+        modules.set(moduleKey, moduleRef);
         (contextCreator as any).modulesContainer = modules;
-        sinon
-          .stub(contextCreator, 'getProviderByClassName')
-          .callsFake(() => true);
+
+        vi.spyOn(moduleRef, 'hasProvider').mockImplementation(() => true);
 
         expect(
-          contextCreator.getContextModuleName({ name: providerKey } as any),
-        ).to.be.eql(moduleKey);
+          contextCreator.getContextModuleKey({ randomObject: true } as any),
+        ).toEqual(moduleKey);
       });
     });
     describe('when provider does not exists', () => {
       it('should return empty string', () => {
-        sinon
-          .stub(contextCreator, 'getProviderByClassName')
-          .callsFake(() => false);
-        expect(contextCreator.getContextModuleName({} as any)).to.be.eql('');
-      });
-    });
-  });
-  describe('getProviderByClassName', () => {
-    describe('when provider exists', () => {
-      it('should return true', () => {
-        const providers = new Map();
-        const key = 'test';
-        providers.set(key, key);
-
-        expect(
-          contextCreator.getProviderByClassName(
-            {
-              providers,
-            } as any,
-            key,
-          ),
-        ).to.be.true;
-      });
-    });
-    describe('when provider does not exists', () => {
-      it('should return false', () => {
-        const providers = new Map();
-        const key = 'test';
-        expect(
-          contextCreator.getProviderByClassName(
-            {
-              providers,
-            } as any,
-            key,
-          ),
-        ).to.be.false;
+        expect(contextCreator.getContextModuleKey({} as any)).toEqual('');
       });
     });
   });
@@ -173,7 +377,7 @@ describe('ExternalContextCreator', () => {
       const metadata = {
         [RouteParamtypes.REQUEST]: { index: 0, data: 'test', pipes: [] },
         [RouteParamtypes.BODY]: { index: 2, data: 'test', pipes: [] },
-        [`key${CUSTOM_ROUTE_AGRS_METADATA}`]: {
+        [`key${CUSTOM_ROUTE_ARGS_METADATA}`]: {
           index: 3,
           data: 'custom',
           pipes: [],
@@ -189,35 +393,207 @@ describe('ExternalContextCreator', () => {
       const expectedValues = [
         { index: 0, type: RouteParamtypes.REQUEST, data: 'test' },
         { index: 2, type: RouteParamtypes.BODY, data: 'test' },
-        { index: 3, type: `key${CUSTOM_ROUTE_AGRS_METADATA}`, data: 'custom' },
+        { index: 3, type: `key${CUSTOM_ROUTE_ARGS_METADATA}`, data: 'custom' },
       ];
-      expect(values[0]).to.deep.include(expectedValues[0]);
-      expect(values[1]).to.deep.include(expectedValues[1]);
+      expect(values[0]).toMatchObject(expectedValues[0]);
+      expect(values[1]).toMatchObject(expectedValues[1]);
     });
   });
   describe('getParamValue', () => {
-    let consumerApplySpy: sinon.SinonSpy;
+    let consumerApplySpy: ReturnType<typeof vi.fn>;
     const value = 3,
       metatype = null,
-      transforms = [{ transform: sinon.spy() }];
+      transforms = [{ transform: vi.fn() }];
 
     beforeEach(() => {
-      consumerApplySpy = sinon.spy(pipesConsumer, 'apply');
+      consumerApplySpy = vi.spyOn(pipesConsumer, 'apply');
     });
-    it('should call "consumer.apply"', () => {
-      contextCreator.getParamValue(
+    it('should call "consumer.apply"', async () => {
+      await contextCreator.getParamValue(
         value,
         { metatype, type: RouteParamtypes.NEXT, data: null },
         transforms,
       );
-      expect(consumerApplySpy.called).to.be.true;
+      expect(consumerApplySpy).toHaveBeenCalled();
+    });
+  });
+  describe('createPipesFn without pipes', () => {
+    const param = (
+      index: number,
+      extractValue: (...args: any[]) => unknown,
+      type: number | string = 'test',
+    ) => ({ index, type, data: undefined as any, pipes: [], extractValue });
+
+    it('fills the args without returning a promise', () => {
+      const pipesFn = contextCreator.createPipesFn(
+        [],
+        [
+          param(1, (first: unknown) => first),
+          param(0, (_first: unknown, second: unknown) => second),
+        ],
+      )!;
+      const args: unknown[] = [undefined, undefined];
+
+      expect(pipesFn(args, 'a', 'b')).toBeUndefined();
+      expect(args).toEqual(['b', 'a']);
+    });
+    it('settles a thenable value, calling "then()" once', async () => {
+      const thenable = { then: vi.fn(resolve => resolve('settled')) };
+      const pipesFn = contextCreator.createPipesFn(
+        [],
+        [param(0, () => thenable)],
+      )!;
+      const args: unknown[] = [undefined];
+
+      await pipesFn(args);
+
+      expect(args).toEqual(['settled']);
+      expect(thenable.then).toHaveBeenCalledOnce();
+    });
+    it('runs every extractor and rejects with the first error', async () => {
+      const first = new Error('first');
+      const last = vi.fn(() => 'last');
+      const pipesFn = contextCreator.createPipesFn(
+        [],
+        [
+          param(0, () => {
+            throw first;
+          }),
+          param(1, () => {
+            throw new Error('second');
+          }),
+          param(2, last),
+        ],
+      )!;
+
+      await expect(pipesFn([])).rejects.toBe(first);
+      expect(last).toHaveBeenCalledOnce();
+    });
+    it('rejects with an extractor error before an earlier thenable rejects', async () => {
+      const error = new Error('extractor');
+      const thenable = {
+        then: vi.fn((_resolve, reject) => reject(new Error('thenable'))),
+      };
+      const pipesFn = contextCreator.createPipesFn(
+        [],
+        [
+          param(0, () => thenable),
+          param(1, () => {
+            throw error;
+          }),
+        ],
+      )!;
+
+      await expect(pipesFn([])).rejects.toBe(error);
+      expect(thenable.then).toHaveBeenCalledOnce();
+    });
+  });
+  describe('createPipesFn with pipes', () => {
+    it('runs the global pipes, then the param pipes, with the metadata of the param on every call', async () => {
+      const globalPipe = { transform: vi.fn(async value => `${value}-g`) };
+      const paramPipe = { transform: vi.fn(value => `${value}-p`) };
+      const pipesFn = contextCreator.createPipesFn(
+        [globalPipe],
+        [
+          {
+            index: 0,
+            type: 'test',
+            data: 'id',
+            pipes: [paramPipe],
+            extractValue: () => '42',
+          },
+          {
+            index: 1,
+            type: 'test',
+            data: undefined as any,
+            pipes: [],
+            extractValue: () => '7',
+          },
+        ],
+      )!;
+      const args: unknown[] = [undefined, undefined];
+
+      await pipesFn(args);
+      await pipesFn(args);
+
+      expect(args).toEqual(['42-g-p', '7-g']);
+      expect(globalPipe.transform).toHaveBeenCalledTimes(4);
+      expect(globalPipe.transform).toHaveBeenCalledWith('42', {
+        metatype: undefined,
+        type: 'custom',
+        data: 'id',
+        schema: undefined,
+      });
+      expect(paramPipe.transform).toHaveBeenCalledTimes(2);
+    });
+    it('keeps a pipeless param synchronous next to a piped one', async () => {
+      const pipe = { transform: vi.fn(async value => `${value}-p`) };
+      const pipesFn = contextCreator.createPipesFn(
+        [],
+        [
+          {
+            index: 0,
+            type: 'test',
+            data: undefined as any,
+            pipes: [pipe],
+            extractValue: () => 'a',
+          },
+          {
+            index: 1,
+            type: 'test',
+            data: undefined as any,
+            pipes: [],
+            extractValue: () => 'b',
+          },
+        ],
+      )!;
+      const args: unknown[] = [undefined, undefined];
+
+      const result = pipesFn(args);
+
+      expect(result).toBeInstanceOf(Promise);
+      expect(args[1]).toBe('b');
+      await result;
+      expect(args).toEqual(['a-p', 'b']);
+    });
+    it("starts each param's pipes right after extracting it", async () => {
+      const order: string[] = [];
+      const pipe = {
+        transform: (value: string) => {
+          order.push(`transform ${value}`);
+          return value;
+        },
+      };
+      const query = (index: number) => ({
+        index,
+        type: 'test',
+        data: undefined as any,
+        pipes: [],
+        extractValue: () => {
+          order.push(`extract ${index}`);
+          return `${index}`;
+        },
+      });
+      const pipesFn = contextCreator.createPipesFn(
+        [pipe],
+        [query(0), query(1)],
+      )!;
+
+      await pipesFn([]);
+
+      expect(order).toEqual([
+        'extract 0',
+        'transform 0',
+        'extract 1',
+        'transform 1',
+      ]);
     });
   });
   describe('createPipesFn', () => {
     describe('when "paramsOptions" is empty', () => {
       it('returns null', async () => {
         const pipesFn = contextCreator.createPipesFn([], []);
-        expect(pipesFn).to.be.null;
+        expect(pipesFn).toBeNull();
       });
     });
     describe('when "paramsOptions" is not empty', () => {
@@ -228,44 +604,88 @@ describe('ExternalContextCreator', () => {
             {
               index: 1,
               type: 'test',
-              data: null,
+              data: null!,
               pipes: [],
               extractValue: () => null,
             },
           ],
-        );
+        )!;
         await pipesFn([]);
-        expect(pipesFn).to.be.a('function');
+        expect(pipesFn).toBeTypeOf('function');
       });
     });
   });
 
   describe('transformToResult', () => {
-    describe('when resultOrDeffered', () => {
+    describe('when resultOrDeferred', () => {
       describe('is Promise', () => {
-        it('should returns Promise', async () => {
+        it('should return Promise', async () => {
           const value = 100;
           expect(
             await contextCreator.transformToResult(Promise.resolve(value)),
-          ).to.be.eq(100);
+          ).toBe(100);
         });
       });
 
       describe('is Observable', () => {
-        it('should returns Promise', async () => {
+        it('should return Promise', async () => {
           const value = 100;
-          expect(await contextCreator.transformToResult(of(value))).to.be.eq(
-            100,
-          );
+          expect(await contextCreator.transformToResult(of(value))).toBe(100);
         });
       });
 
       describe('is value', () => {
-        it('should returns Promise', async () => {
+        it('should return Promise', async () => {
           const value = 100;
-          expect(await contextCreator.transformToResult(value)).to.be.eq(100);
+          expect(await contextCreator.transformToResult(value)).toBe(100);
         });
       });
+    });
+  });
+  describe('getMetadata', () => {
+    const ContextType = createParamDecorator(
+      (_data: unknown, ctx: ExecutionContext) => ctx.getType<string>(),
+    );
+    class Tools {
+      find(@ContextType() type: string) {
+        return type;
+      }
+    }
+    const paramsFactory = { exchangeKeyForValue: () => undefined };
+
+    it('should cache an entry per context type', () => {
+      const instance = new Tools();
+      const get = (type: string) =>
+        contextCreator.getMetadata(
+          instance,
+          'find',
+          ROUTE_ARGS_METADATA,
+          paramsFactory,
+          type,
+        );
+      const first = get('mcp');
+      expect(get('mcp')).toBe(first);
+      expect(get('ai')).not.toBe(first);
+    });
+
+    it('should give param decorators the context type of each wrapper of the same method', async () => {
+      const instance = new Tools();
+      const wrap = (type: string) =>
+        contextCreator.create(
+          instance,
+          instance.find,
+          'find',
+          ROUTE_ARGS_METADATA,
+          paramsFactory,
+          undefined,
+          undefined,
+          { guards: false, interceptors: false, filters: false },
+          type,
+        );
+      const mcp = wrap('mcp');
+      const ai = wrap('ai');
+      expect(await mcp({}, {})).toBe('mcp');
+      expect(await ai({}, {})).toBe('ai');
     });
   });
 });

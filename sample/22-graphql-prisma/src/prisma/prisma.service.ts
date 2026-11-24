@@ -1,12 +1,18 @@
-import { Injectable } from '@nestjs/common';
-import { Prisma } from './prisma.binding';
+import { Injectable, OnModuleInit } from '@nestjs/common';
+import { PrismaBetterSqlite3 } from '@prisma/adapter-better-sqlite3';
+import { PrismaClient } from '../generated/prisma/client.js';
+
+const adapter = new PrismaBetterSqlite3({
+  url: 'file:./prisma/dev.db',
+});
 
 @Injectable()
-export class PrismaService extends Prisma {
+export class PrismaService extends PrismaClient implements OnModuleInit {
   constructor() {
-    super({
-      endpoint: 'https://eu1.prisma.sh/public-agatepuma-476/my-app/dev',
-      debug: false,
-    });
+    super({ adapter });
+  }
+
+  async onModuleInit() {
+    await this.$connect();
   }
 }

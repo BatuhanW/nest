@@ -1,9 +1,8 @@
 import { INestApplication, Logger } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import { expect } from 'chai';
-import * as sinon from 'sinon';
-import * as request from 'supertest';
-import { HelloModule } from '../src/inject-inquirer/hello.module';
+import request from 'supertest';
+import { HelloModule } from '../src/inject-inquirer/hello.module.js';
+import { listenOnLoopback } from '../../_support/listen-on-loopback.js';
 
 describe('Inject Inquirer', () => {
   let logger: Record<string, any>;
@@ -11,7 +10,7 @@ describe('Inject Inquirer', () => {
   let app: INestApplication;
 
   beforeEach(async () => {
-    logger = { log: sinon.spy() };
+    logger = { log: vi.fn() };
 
     const module = await Test.createTestingModule({
       imports: [HelloModule],
@@ -22,35 +21,34 @@ describe('Inject Inquirer', () => {
 
     app = module.createNestApplication();
     server = app.getHttpServer();
-    await app.init();
+    await listenOnLoopback(app);
   });
 
   it(`should allow the injection of inquirer in a Transient Scope`, async () => {
     await request(server).get('/hello/transient');
 
-    expect(
-      logger.log.calledWith({
+    expect(logger.log).toHaveBeenCalledWith(
+      expect.objectContaining({
         message: 'Hello transient!',
         feature: 'transient',
       }),
-    ).to.be.true;
+    );
   });
 
   it(`should allow the injection of the inquirer in a Request Scope`, async () => {
     await request(server).get('/hello/request');
 
-    expect(
-      logger.log.calledWith({
+    expect(logger.log).toHaveBeenCalledWith(
+      expect.objectContaining({
         message: 'Hello request!',
-        requestId: sinon.match.string,
         feature: 'request',
       }),
-    ).to.be.true;
+    );
 
-    const requestId = logger.log.getCall(0).args[0].requestId;
+    const requestId = logger.log.mock.calls[0][0].requestId;
 
-    expect(
-      logger.log.calledWith({
+    expect(logger.log).toHaveBeenCalledWith(
+      expect.objectContaining({
         message: 'Goodbye request!',
         requestId,
         feature: 'request',

@@ -1,5 +1,5 @@
 import { Injectable, Scope } from '@nestjs/common';
-import { Cat } from './interfaces/cat.interface';
+import { Cat } from './interfaces/cat.interface.js';
 
 @Injectable({ scope: Scope.REQUEST })
 export class CatsRequestScopedService {
@@ -20,6 +20,6 @@ export class CatsRequestScopedService {
   }
 
   findOneById(id: number): Cat {
-    return this.cats.find(cat => cat.id === id);
+    return this.cats.find(cat => cat.id === id)!;
   }
 }

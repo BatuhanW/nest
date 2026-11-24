@@ -1,147 +1,524 @@
-import { expect } from 'chai';
-import { Subject } from 'rxjs';
-import * as sinon from 'sinon';
-import { ClientRedis } from '../../client/client-redis';
-import { ERROR_EVENT } from '../../constants';
+import { EventEmitter } from 'events';
+import { AddressInfo, createServer } from 'net';
+import { ClientRedis } from '../../client/client-redis.js';
+
+/**
+ * Stands in for an ioredis client. Like ioredis, it emits the connection
+ * events before the `connect()` promise they settle is observed.
+ */
+class FakeRedisClient extends EventEmitter {
+  public status = 'wait';
+  public options?: ReturnType<ClientRedis['getClientOptions']>;
+  private settle?: {
+    resolve: () => void;
+    reject: (err: Error) => void;
+  };
+  public readonly connect = vi.fn(
+    () =>
+      new Promise<void>((resolve, reject) => {
+        this.status = 'connecting';
+        this.settle = { resolve, reject };
+      }),
+  );
+  public readonly quit = vi.fn(async () => 'OK');
+  public readonly disconnect = vi.fn(() => {
+    this.status = 'end';
+  });
+
+  /** Connected (or reconnected). */
+  public ready() {
+    this.status = 'ready';
+    this.emit('ready');
+    this.settle?.resolve();
+  }
+
+  /** Connection closed, ioredis schedules a retry. */
+  public closeAndRetry() {
+    this.status = 'reconnecting';
+    this.settle?.reject(new Error('Connection is closed.'));
+    this.emit('reconnecting');
+  }
+
+  /** Connection closed, ioredis gives up on the client. */
+  public closeAndEnd() {
+    this.status = 'end';
+    this.settle?.reject(new Error('Connection is closed.'));
+    this.emit('end');
+  }
+}
 
 describe('ClientRedis', () => {
   const test = 'test';
   const client = new ClientRedis({});
+  const untypedClient = client as any;
 
   describe('getRequestPattern', () => {
     it(`should leave pattern as it is`, () => {
       const expectedResult = test;
-      expect(client.getRequestPattern(test)).to.equal(expectedResult);
+      expect(client.getRequestPattern(test)).toBe(expectedResult);
     });
   });
   describe('getReplyPattern', () => {
     it(`should append ".reply" to string`, () => {
       const expectedResult = test + '.reply';
-      expect(client.getReplyPattern(test)).to.equal(expectedResult);
+      expect(client.getReplyPattern(test)).toBe(expectedResult);
     });
   });
   describe('publish', () => {
     const pattern = 'test';
     const msg = { pattern, data: 'data' };
-    let subscribeSpy: sinon.SinonSpy,
-      publishSpy: sinon.SinonSpy,
-      onSpy: sinon.SinonSpy,
-      removeListenerSpy: sinon.SinonSpy,
-      unsubscribeSpy: sinon.SinonSpy,
-      connectSpy: sinon.SinonSpy,
-      sub,
-      pub;
+    let subscribeSpy: ReturnType<typeof vi.fn>,
+      publishSpy: ReturnType<typeof vi.fn>,
+      onSpy: ReturnType<typeof vi.fn>,
+      removeListenerSpy: ReturnType<typeof vi.fn>,
+      unsubscribeSpy: ReturnType<typeof vi.fn>,
+      connectSpy: ReturnType<typeof vi.fn>,
+      sub: Record<string, Function>,
+      pub: Record<string, Function>;
 
     beforeEach(() => {
-      subscribeSpy = sinon.spy((name, fn) => fn());
-      publishSpy = sinon.spy();
-      onSpy = sinon.spy();
-      removeListenerSpy = sinon.spy();
-      unsubscribeSpy = sinon.spy();
+      subscribeSpy = vi.fn((name, fn) => fn());
+      publishSpy = vi.fn();
+      onSpy = vi.fn();
+      removeListenerSpy = vi.fn();
+      unsubscribeSpy = vi.fn();
 
       sub = {
         subscribe: subscribeSpy,
         on: (type, handler) => (type === 'subscribe' ? handler() : onSpy()),
         removeListener: removeListenerSpy,
         unsubscribe: unsubscribeSpy,
-        addListener: () => ({}),
       };
       pub = { publish: publishSpy };
-      (client as any).subClient = sub;
-      (client as any).pubClient = pub;
-      connectSpy = sinon.spy(client, 'connect');
+      untypedClient.subClient = sub;
+      untypedClient.pubClient = pub;
+      untypedClient.connectionPromise = Promise.resolve();
+      connectSpy = vi.spyOn(client, 'connect');
     });
     afterEach(() => {
-      connectSpy.restore();
+      connectSpy.mockRestore();
+      untypedClient.connectionPromise = null;
     });
     it('should subscribe to response pattern name', () => {
       client['publish'](msg, () => {});
-      expect(subscribeSpy.calledWith(`${pattern}.reply`)).to.be.true;
+      expect(subscribeSpy.mock.calls[0][0]).toEqual(`${pattern}.reply`);
     });
-    it('should publish stringified message to request pattern name', async () => {
-      await client['publish'](msg, () => {});
-      expect(publishSpy.calledWith(pattern, JSON.stringify(msg))).to.be.true;
+    it('should publish stringified message to request pattern name', () => {
+      client['publish'](msg, () => {});
+      expect(publishSpy).toHaveBeenCalledWith(
+        pattern,
+        JSON.stringify(msg),
+        expect.any(Function),
+      );
+    });
+    it('should not keep a count for the reply channels no request waits on', () => {
+      client['subscriptionsCount'].clear();
+      // Patterns may be built from request data, e.g. one per device
+      for (const device of ['a', 'b', 'c']) {
+        const dispose = client['publish'](
+          { pattern: `devices.${device}`, data: 'data' },
+          () => {},
+        );
+        dispose();
+      }
+
+      expect(client['subscriptionsCount'].size).toBe(0);
     });
     describe('on error', () => {
-      let assignPacketIdStub: sinon.SinonStub;
+      let assignPacketIdStub: ReturnType<typeof vi.fn>;
       beforeEach(() => {
-        assignPacketIdStub = sinon
-          .stub(client, 'assignPacketId' as any)
-          .callsFake(() => {
+        assignPacketIdStub = vi
+          .spyOn(client, 'assignPacketId' as any)
+          .mockImplementation(() => {
             throw new Error();
           });
       });
       afterEach(() => {
-        assignPacketIdStub.restore();
+        assignPacketIdStub.mockRestore();
       });
 
       it('should call callback', () => {
-        const callback = sinon.spy();
+        const callback = vi.fn();
         client['publish'](msg, callback);
 
-        expect(callback.called).to.be.true;
-        expect(callback.getCall(0).args[0].err).to.be.instanceof(Error);
+        expect(callback).toHaveBeenCalled();
+        expect(callback.mock.calls[0][0].err).toBeInstanceOf(Error);
+      });
+    });
+    describe('when subscribing to the response pattern fails', () => {
+      it('should call callback with the error and not publish', () => {
+        client['subscriptionsCount'].clear();
+        client['routingMap'].clear();
+        const error = new Error('Connection is closed.');
+        subscribeSpy.mockImplementation((name, fn) => fn(error));
+        const callback = vi.fn();
+
+        client['publish'](msg, callback);
+
+        expect(callback).toHaveBeenCalledWith({ err: error });
+        expect(publishSpy).not.toHaveBeenCalled();
+        expect(client['routingMap'].size).toBe(0);
+        expect(client['subscriptionsCount'].has(`${pattern}.reply`)).toBe(
+          false,
+        );
+        expect(client['pendingSubscriptions'].size).toBe(0);
+      });
+    });
+    describe('when disposed before the subscription is confirmed', () => {
+      it('should not publish and give the subscription up again', () => {
+        client['subscriptionsCount'].clear();
+        client['routingMap'].clear();
+        let confirmSubscription: () => void = () => {};
+        subscribeSpy.mockImplementation((name, fn) => {
+          confirmSubscription = () => fn();
+        });
+        const callback = vi.fn();
+
+        const dispose = client['publish'](msg, callback);
+        dispose();
+        confirmSubscription();
+
+        expect(publishSpy).not.toHaveBeenCalled();
+        expect(client['routingMap'].size).toBe(0);
+        expect(client['subscriptionsCount'].has(`${pattern}.reply`)).toBe(
+          false,
+        );
+        expect(client['pendingSubscriptions'].size).toBe(0);
+        expect(unsubscribeSpy).toHaveBeenCalledExactlyOnceWith(
+          `${pattern}.reply`,
+          expect.any(Function),
+        );
+        expect(callback).not.toHaveBeenCalled();
+      });
+    });
+    describe('when another request waits for the subscription', () => {
+      let confirmations: Array<() => void>;
+
+      beforeEach(() => {
+        client['subscriptionsCount'].clear();
+        client['routingMap'].clear();
+        confirmations = [];
+        subscribeSpy.mockImplementation((name, fn) => {
+          confirmations.push(() => fn());
+        });
+      });
+      afterEach(() => {
+        client['subscriptionsCount'].clear();
+        client['pendingSubscriptions'].clear();
+        client['routingMap'].clear();
+      });
+
+      it('should keep the channel subscribed when disposed before the confirmation', () => {
+        const dispose = client['publish'](msg, vi.fn());
+        client['publish'](msg, vi.fn());
+        dispose();
+        confirmations.forEach(confirm => confirm());
+
+        expect(unsubscribeSpy).not.toHaveBeenCalled();
+        expect(publishSpy).toHaveBeenCalledOnce();
+        expect(client['subscriptionsCount'].get(`${pattern}.reply`)).toBe(1);
+      });
+      it('should keep the channel subscribed when disposed after the confirmation', () => {
+        const dispose = client['publish'](msg, vi.fn());
+        client['publish'](msg, vi.fn());
+        confirmations[0]();
+        dispose();
+        confirmations[1]();
+
+        expect(unsubscribeSpy).not.toHaveBeenCalled();
+        expect(publishSpy).toHaveBeenCalledTimes(2);
+        expect(client['subscriptionsCount'].get(`${pattern}.reply`)).toBe(1);
+      });
+      it('should not publish a request before its own subscription is confirmed', () => {
+        // Requests are not published on the connection that subscribes, so
+        // the reply could arrive before the subscription is in place
+        client['publish'](msg, vi.fn());
+        client['publish'](msg, vi.fn());
+
+        expect(subscribeSpy).toHaveBeenCalledTimes(2);
+        expect(publishSpy).not.toHaveBeenCalled();
+
+        confirmations.forEach(confirm => confirm());
+        client['publish'](msg, vi.fn());
+
+        expect(subscribeSpy).toHaveBeenCalledTimes(2);
+        expect(publishSpy).toHaveBeenCalledTimes(3);
+        expect(client['subscriptionsCount'].get(`${pattern}.reply`)).toBe(3);
+        expect(client['pendingSubscriptions'].size).toBe(0);
+      });
+      it('should subscribe again once the channel was given up', () => {
+        const dispose = client['publish'](msg, vi.fn());
+        dispose();
+        client['publish'](msg, vi.fn());
+        // The first confirmation is for the subscription that was given up
+        confirmations[0]();
+
+        expect(subscribeSpy).toHaveBeenCalledTimes(2);
+        expect(publishSpy).not.toHaveBeenCalled();
+
+        confirmations[1]();
+
+        expect(publishSpy).toHaveBeenCalledOnce();
+        expect(unsubscribeSpy).toHaveBeenCalledOnce();
+        expect(client['subscriptionsCount'].get(`${pattern}.reply`)).toBe(1);
+      });
+      it('should leave no channel behind when many requests are disposed before the confirmation', () => {
+        // Patterns may be built from request data, e.g. one per device
+        for (const device of ['a', 'b', 'c']) {
+          const dispose = client['publish'](
+            { pattern: `devices.${device}`, data: 'data' },
+            vi.fn(),
+          );
+          dispose();
+        }
+        confirmations.forEach(confirm => confirm());
+
+        expect(unsubscribeSpy.mock.calls.map(([channel]) => channel)).toEqual([
+          'devices.a.reply',
+          'devices.b.reply',
+          'devices.c.reply',
+        ]);
+        expect(client['subscriptionsCount'].size).toBe(0);
+        expect(client['pendingSubscriptions'].size).toBe(0);
+        expect(publishSpy).not.toHaveBeenCalled();
+      });
+
+      it('should fail a request that waits for the acknowledgement on close', async () => {
+        client['routingMap'].clear();
+        client['subscriptionsCount'].clear();
+        client['pendingSubscriptions'].clear();
+        let confirmSubscription: (err?: Error) => void = () => {};
+        subscribeSpy.mockImplementation((name, fn) => {
+          confirmSubscription = err => fn(err);
+        });
+        const error = vi.fn();
+        client.send(pattern, 'data').subscribe({ error });
+        await vi.waitFor(() => expect(subscribeSpy).toHaveBeenCalled());
+
+        client.handleClose();
+        // ioredis still answers the SUBSCRIBE (or fails it) afterwards
+        confirmSubscription();
+        confirmSubscription(new Error('Connection is closed.'));
+
+        expect(error).toHaveBeenCalledExactlyOnceWith(
+          expect.objectContaining({ message: 'Connection closed' }),
+        );
+        expect(publishSpy).not.toHaveBeenCalled();
+        expect(client['routingMap'].size).toBe(0);
+        expect(client['subscriptionsCount'].size).toBe(0);
+        expect(unsubscribeSpy).toHaveBeenCalledExactlyOnceWith(
+          `${pattern}.reply`,
+          expect.any(Function),
+        );
       });
     });
     describe('dispose callback', () => {
-      let assignStub: sinon.SinonStub, getReplyPatternStub: sinon.SinonStub;
-      let callback: sinon.SinonSpy, subscription;
+      let assignStub: ReturnType<typeof vi.fn>,
+        getReplyPatternStub: ReturnType<typeof vi.fn>;
+      let callback: ReturnType<typeof vi.fn>, subscription;
 
       const channel = 'channel';
       const id = '1';
 
       beforeEach(async () => {
-        callback = sinon.spy();
-        assignStub = sinon
-          .stub(client, 'assignPacketId' as any)
-          .callsFake(packet => Object.assign(packet, { id }));
+        callback = vi.fn();
+        assignStub = vi
+          .spyOn(client, 'assignPacketId' as any)
+          .mockImplementation(packet =>
+            Object.assign(packet as object, { id }),
+          );
 
-        getReplyPatternStub = sinon
-          .stub(client, 'getReplyPattern')
-          .callsFake(() => channel);
-        subscription = await client['publish'](msg, callback);
+        getReplyPatternStub = vi
+          .spyOn(client, 'getReplyPattern')
+          .mockImplementation(() => channel);
+        subscription = client['publish'](msg, callback);
         subscription(channel, JSON.stringify({ isDisposed: true, id }));
       });
       afterEach(() => {
-        assignStub.restore();
-        getReplyPatternStub.restore();
+        assignStub.mockRestore();
+        getReplyPatternStub.mockRestore();
       });
 
       it('should unsubscribe to response pattern name', () => {
-        expect(unsubscribeSpy.calledWith(channel)).to.be.true;
+        expect(unsubscribeSpy).toHaveBeenCalledWith(
+          channel,
+          expect.any(Function),
+        );
       });
       it('should clean routingMap', () => {
-        expect(client['routingMap'].has(id)).to.be.false;
+        expect(client['routingMap'].has(id)).toBe(false);
+      });
+    });
+
+    describe('when publishing throws', () => {
+      const responseChannel = `${pattern}.reply`;
+
+      beforeEach(() => {
+        client['subscriptionsCount'].clear();
+        client['routingMap'].clear();
+        publishSpy.mockImplementation(() => {
+          throw new Error('Send error');
+        });
+      });
+
+      it('should undo what the request had already set up', () => {
+        client['publish'](msg, vi.fn());
+
+        expect(client['routingMap'].size).toBe(0);
+        expect(client['subscriptionsCount'].has(responseChannel)).toBe(false);
+      });
+
+      it('should undo it as well when the subscription is acknowledged later', () => {
+        let acknowledge = () => {};
+        subscribeSpy.mockImplementation((_channel, done) => {
+          acknowledge = () => done();
+        });
+        const callback = vi.fn();
+
+        client['publish'](msg, callback);
+        acknowledge();
+
+        expect(client['routingMap'].size).toBe(0);
+        expect(client['subscriptionsCount'].has(responseChannel)).toBe(false);
+        expect(callback).toHaveBeenCalledWith({
+          err: expect.objectContaining({ message: 'Send error' }),
+        });
+      });
+
+      it('should leave the response channel subscribed', () => {
+        // A concurrent request on this pattern may still be waiting for its
+        // own subscribe reply, so the subscription is left to self-heal.
+        client['publish'](msg, vi.fn());
+
+        expect(unsubscribeSpy).not.toHaveBeenCalled();
+      });
+
+      it('should undo the bookkeeping once', () => {
+        const teardown = client['publish'](msg, vi.fn());
+
+        teardown();
+
+        expect(client['routingMap'].size).toBe(0);
+        expect(client['subscriptionsCount'].has(responseChannel)).toBe(false);
+        expect(unsubscribeSpy).not.toHaveBeenCalled();
+      });
+
+      it('should keep the count of the requests already using the channel', () => {
+        client['subscriptionsCount'].set(responseChannel, 1);
+
+        const teardown = client['publish'](msg, vi.fn());
+        teardown();
+
+        expect(subscribeSpy).not.toHaveBeenCalled();
+        expect(client['routingMap'].size).toBe(0);
+        expect(client['subscriptionsCount'].get(responseChannel)).toBe(1);
+        expect(unsubscribeSpy).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('when unsubscribing fails on close', () => {
+      const unhandledRejection = vi.fn();
+      let unsubscribed: string[];
+
+      beforeEach(() => {
+        client['subscriptionsCount'].clear();
+        client['routingMap'].clear();
+        unhandledRejection.mockClear();
+        unsubscribed = [];
+        process.on('unhandledRejection', unhandledRejection);
+        // ioredis rejects the returned promise when no callback is passed
+        sub.unsubscribe = (channel: string, done?: Function) => {
+          unsubscribed.push(channel);
+          const result = Promise.reject(new Error('Connection is closed.'));
+          if (done) {
+            result.catch(err => done(err));
+          }
+          return result;
+        };
+      });
+      afterEach(() => {
+        process.off('unhandledRejection', unhandledRejection);
+      });
+
+      it('should fail the request without an unhandled rejection', async () => {
+        const error = vi.fn();
+
+        client.send(pattern, 'data').subscribe({ error });
+        await new Promise(resolve => setImmediate(resolve));
+        client.handleClose();
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(unsubscribed).toEqual([`${pattern}.reply`]);
+        expect(unhandledRejection).not.toHaveBeenCalled();
+        expect(error).toHaveBeenCalledWith(
+          expect.objectContaining({ message: 'Connection closed' }),
+        );
+      });
+    });
+
+    describe('when publishing fails later', () => {
+      const responseChannel = `${pattern}.reply`;
+      const publishError = new Error('Connection is closed.');
+
+      beforeEach(() => {
+        client['subscriptionsCount'].clear();
+        client['routingMap'].clear();
+        publishSpy.mockImplementation((_channel, _message, done) =>
+          setImmediate(() => done(publishError)),
+        );
+      });
+
+      it('should fail the request and undo what it had set up', async () => {
+        const callback = vi.fn();
+
+        client['publish'](msg, callback);
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(callback).toHaveBeenCalledWith({ err: publishError });
+        expect(client['routingMap'].size).toBe(0);
+        expect(client['subscriptionsCount'].has(responseChannel)).toBe(false);
+      });
+
+      it('should not fail a request again once it is torn down', async () => {
+        const callback = vi.fn();
+
+        const teardown = client['publish'](msg, callback);
+        teardown();
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(callback).not.toHaveBeenCalled();
+        expect(client['subscriptionsCount'].has(responseChannel)).toBe(false);
       });
     });
   });
   describe('createResponseCallback', () => {
-    let callback: sinon.SinonSpy, subscription;
+    let callback: ReturnType<typeof vi.fn>, subscription; // : ReturnType<typeof client['createResponseCallback']>;
     const responseMessage = {
       response: 'test',
       id: '1',
     };
 
     describe('not completed', () => {
-      beforeEach(() => {
-        callback = sinon.spy();
+      beforeEach(async () => {
+        callback = vi.fn();
 
         subscription = client.createResponseCallback();
         client['routingMap'].set(responseMessage.id, callback);
-        subscription('channel', Buffer.from(JSON.stringify(responseMessage)));
+        await subscription(
+          'channel',
+          Buffer.from(JSON.stringify(responseMessage)),
+        );
       });
       it('should call callback with expected arguments', () => {
-        expect(
-          callback.calledWith({
-            err: undefined,
-            response: responseMessage.response,
-          }),
-        ).to.be.true;
+        expect(callback).toHaveBeenCalledWith({
+          err: undefined,
+          response: responseMessage.response,
+        });
       });
     });
     describe('disposed and "id" is correct', () => {
       beforeEach(async () => {
-        callback = sinon.spy();
+        callback = vi.fn();
         subscription = client.createResponseCallback();
         client['routingMap'].set(responseMessage.id, callback);
         subscription(
@@ -156,184 +533,951 @@ describe('ClientRedis', () => {
       });
 
       it('should call callback with dispose param', () => {
-        expect(callback.called).to.be.true;
-        expect(
-          callback.calledWith({
-            isDisposed: true,
-            response: responseMessage.response,
-            err: undefined,
-          }),
-        ).to.be.true;
+        expect(callback).toHaveBeenCalledWith({
+          isDisposed: true,
+          response: responseMessage.response,
+          err: undefined,
+        });
       });
     });
     describe('disposed and "id" is incorrect', () => {
       beforeEach(() => {
-        callback = sinon.spy();
+        callback = vi.fn();
         subscription = client.createResponseCallback();
         subscription('channel', Buffer.from(JSON.stringify(responseMessage)));
       });
 
       it('should not call callback', () => {
-        expect(callback.called).to.be.false;
+        expect(callback).not.toHaveBeenCalled();
+      });
+    });
+    describe('response that no request waits for', () => {
+      let redisClient: ClientRedis;
+      let logDebug: ReturnType<typeof vi.spyOn>;
+      let pendingCallback: ReturnType<typeof vi.fn>;
+      let subscription: ReturnType<ClientRedis['createResponseCallback']>;
+
+      beforeEach(() => {
+        redisClient = new ClientRedis({});
+        logDebug = vi
+          .spyOn(Reflect.get(redisClient, 'logger'), 'debug')
+          .mockImplementation(() => {});
+        pendingCallback = vi.fn();
+        Reflect.get(redisClient, 'routingMap').set('1', pendingCallback);
+        subscription = redisClient.createResponseCallback();
+      });
+
+      it('should log its id and drop it', async () => {
+        await subscription('channel', JSON.stringify({ id: '2' }));
+
+        expect(logDebug).toHaveBeenCalledWith(
+          'No matching callback found for Redis response packet with id: 2',
+        );
+        expect(pendingCallback).not.toHaveBeenCalled();
+      });
+
+      it.each([
+        ['an object that cannot be converted to a string', '{"toString":1}'],
+        ['a list of such objects', '[{"toString":1}]'],
+      ])('should drop it when its id is %s', async (_, id) => {
+        // Whoever publishes on the reply channel chooses the id
+        await expect(
+          subscription('channel', `{"id":${id}}`),
+        ).resolves.toBeUndefined();
+
+        expect(logDebug).toHaveBeenCalledWith(
+          'No matching callback found for Redis response packet with id: (object)',
+        );
+        expect(pendingCallback).not.toHaveBeenCalled();
+      });
+    });
+    describe('custom binary format (not json)', () => {
+      it('should use buffer directly without parsing it as json', async () => {
+        const clientWithBuffers = new ClientRedis({ returnBuffers: true });
+        const callback = vi.fn();
+        const str = `${responseMessage.id}|${responseMessage.response}`;
+        const bufferMessage = Buffer.from(str);
+        vi.spyOn(
+          Reflect.get(clientWithBuffers, 'deserializer'),
+          'deserialize',
+        ).mockResolvedValue({
+          ...responseMessage,
+          response: bufferMessage,
+        });
+        const subscription = clientWithBuffers.createResponseCallback();
+
+        clientWithBuffers['routingMap'].set(responseMessage.id, callback);
+        await subscription('channel', bufferMessage as any);
+
+        expect(callback).toHaveBeenCalledWith({
+          err: undefined,
+          response: bufferMessage,
+        });
+      });
+    });
+    describe('response that cannot be deserialized', () => {
+      const error = new TypeError('Cannot read properties of undefined');
+      const buffer = JSON.stringify({ id: '1', response: 'test' });
+      let redisClient: ClientRedis;
+      let logError: ReturnType<typeof vi.spyOn>;
+      let pendingCallback: ReturnType<typeof vi.fn>;
+
+      const createResponseCallbackWith = (
+        deserialize: () => unknown,
+      ): ReturnType<ClientRedis['createResponseCallback']> => {
+        redisClient = new ClientRedis({});
+        Object.assign(redisClient, { deserializer: { deserialize } });
+        logError = vi
+          .spyOn(Reflect.get(redisClient, 'logger'), 'error')
+          .mockImplementation(() => {});
+        pendingCallback = vi.fn();
+        Reflect.get(redisClient, 'routingMap').set('1', pendingCallback);
+        return redisClient.createResponseCallback();
+      };
+
+      it('should log the error and resolve when the deserializer throws', async () => {
+        const subscription = createResponseCallbackWith(() => {
+          throw error;
+        });
+
+        await expect(subscription('channel', buffer)).resolves.toBeUndefined();
+
+        expect(logError).toHaveBeenCalledTimes(1);
+        expect(logError).toHaveBeenCalledWith(
+          `Dropped a response that the deserializer failed on: ${error}`,
+          error.stack,
+        );
+      });
+
+      it('should log the error and resolve when the deserializer rejects', async () => {
+        const subscription = createResponseCallbackWith(() =>
+          Promise.reject(error),
+        );
+
+        await expect(subscription('channel', buffer)).resolves.toBeUndefined();
+
+        expect(logError).toHaveBeenCalledTimes(1);
+        expect(logError).toHaveBeenCalledWith(
+          `Dropped a response that the deserializer failed on: ${error}`,
+          error.stack,
+        );
+      });
+
+      it('should leave the pending request untouched', async () => {
+        const subscription = createResponseCallbackWith(() =>
+          Promise.reject(error),
+        );
+
+        await subscription('channel', buffer);
+
+        expect(pendingCallback).not.toHaveBeenCalled();
+        expect(Reflect.get(redisClient, 'routingMap').get('1')).toBe(
+          pendingCallback,
+        );
+      });
+
+      it('should not report a failing callback as an undecodable response', async () => {
+        const callbackError = new Error('callback failed');
+        const subscription = createResponseCallbackWith(() => ({
+          id: '1',
+          response: 'test',
+        }));
+        pendingCallback.mockImplementation(() => {
+          throw callbackError;
+        });
+
+        await expect(subscription('channel', buffer)).rejects.toBe(
+          callbackError,
+        );
+
+        expect(logError).not.toHaveBeenCalled();
       });
     });
   });
   describe('close', () => {
-    let pubClose: sinon.SinonSpy;
-    let subClose: sinon.SinonSpy;
-    let pub, sub;
+    const untypedClient = client as any;
+
+    let pubClose: ReturnType<typeof vi.fn>;
+    let subClose: ReturnType<typeof vi.fn>;
+    let callback: ReturnType<typeof vi.fn>;
+    let routingMap: Map<string, Function>;
+    let pub: any, sub: any;
+
     beforeEach(() => {
-      pubClose = sinon.spy();
-      subClose = sinon.spy();
+      pubClose = vi.fn();
+      subClose = vi.fn();
+      callback = vi.fn();
+      routingMap = new Map<string, Function>();
+      routingMap.set('some id', callback);
       pub = { quit: pubClose };
       sub = { quit: subClose };
-      (client as any).pubClient = pub;
-      (client as any).subClient = sub;
+      untypedClient.pubClient = pub;
+      untypedClient.subClient = sub;
+      untypedClient.routingMap = routingMap;
     });
-    it('should close "pub" when it is not null', () => {
-      client.close();
-      expect(pubClose.called).to.be.true;
+    afterEach(() => {
+      vi.restoreAllMocks();
     });
-    it('should not close "pub" when it is null', () => {
-      (client as any).pubClient = null;
-      client.close();
-      expect(pubClose.called).to.be.false;
+    it('should close "pub" when it is not null', async () => {
+      await client.close();
+      expect(pubClose).toHaveBeenCalled();
     });
-    it('should close "sub" when it is not null', () => {
-      client.close();
-      expect(subClose.called).to.be.true;
+    it('should not close "pub" when it is null', async () => {
+      untypedClient.pubClient = null;
+      await client.close();
+      expect(pubClose).not.toHaveBeenCalled();
     });
-    it('should not close "sub" when it is null', () => {
-      (client as any).subClient = null;
-      client.close();
-      expect(subClose.called).to.be.false;
+    it('should close "sub" when it is not null', async () => {
+      await client.close();
+      expect(subClose).toHaveBeenCalled();
+    });
+    it('should not close "sub" when it is null', async () => {
+      untypedClient.subClient = null;
+      await client.close();
+      expect(subClose).not.toHaveBeenCalled();
+    });
+    it('should clear out the routing map', async () => {
+      await client.close();
+      expect(untypedClient.routingMap.size).toBe(0);
+    });
+    it('should disconnect a client whose "quit" fails and still close the other one', async () => {
+      pub.quit = vi
+        .fn()
+        .mockRejectedValue(
+          new Error(
+            "Stream isn't writeable and enableOfflineQueue options is false",
+          ),
+        );
+      pub.disconnect = vi.fn();
+
+      await expect(client.close()).resolves.toBeUndefined();
+
+      expect(pub.disconnect).toHaveBeenCalledOnce();
+      expect(subClose).toHaveBeenCalledOnce();
+      expect(untypedClient.pubClient).toBeNull();
+      expect(untypedClient.subClient).toBeNull();
+      expect(untypedClient.isManuallyClosed).toBe(false);
+    });
+    it('should call pending callbacks with connection closed error', async () => {
+      await client.close();
+      expect(callback).toHaveBeenCalledWith({
+        err: expect.objectContaining({ message: 'Connection closed' }),
+      });
+    });
+    it('should fail every pending request when a callback throws', async () => {
+      const loggerErrorSpy = vi
+        .spyOn(untypedClient.logger, 'error')
+        .mockImplementation(() => {});
+      const throwingCallback = vi.fn().mockImplementation(() => {
+        throw new Error('Callback error');
+      });
+      let pendingDuringFlush: number | undefined;
+      const otherCallback = vi.fn(() => {
+        pendingDuringFlush = untypedClient.routingMap.size;
+      });
+      routingMap.set('throwing id', throwingCallback);
+      routingMap.set('other id', otherCallback);
+
+      await client.close();
+
+      expect(throwingCallback).toHaveBeenCalledTimes(1);
+      expect(otherCallback).toHaveBeenCalledWith({
+        err: expect.objectContaining({ message: 'Connection closed' }),
+      });
+      expect(loggerErrorSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ message: 'Callback error' }),
+      );
+      expect(pendingDuringFlush).toBe(0);
+      expect(pubClose).toHaveBeenCalled();
+      expect(subClose).toHaveBeenCalled();
+      expect(untypedClient.routingMap.size).toBe(0);
+    });
+    it('should not log error when "end" event is handled during close', async () => {
+      let endHandler: Function | undefined;
+      const logError = vi.spyOn(untypedClient.logger, 'error');
+      sub.on = (event, handler) => {
+        if (event === 'end') endHandler = handler;
+      };
+      sub.quit = async () => {
+        if (endHandler) {
+          endHandler();
+        }
+      };
+      client.registerEndListener(sub);
+      await client.close();
+      expect(logError).not.toHaveBeenCalled();
+    });
+
+    it('should reset connection state for a subsequent connection', async () => {
+      untypedClient.isManuallyClosed = false;
+      untypedClient.wasInitialConnectionSuccessful = true;
+
+      await client.close();
+
+      expect(untypedClient.isManuallyClosed).toBe(false);
+      expect(untypedClient.wasInitialConnectionSuccessful).toBe(false);
+    });
+
+    it('should register the response listener after close and reconnect', async () => {
+      const firstSubClient = { quit: vi.fn() };
+      const secondSubClient = { status: 'ready', on: vi.fn() };
+      untypedClient.pubClient = { quit: vi.fn() };
+      untypedClient.subClient = firstSubClient;
+      untypedClient.wasInitialConnectionSuccessful = true;
+
+      await client.close();
+      untypedClient.pubClient = { status: 'ready' };
+      untypedClient.subClient = secondSubClient;
+      client.registerReadyListener(secondSubClient);
+
+      const readyHandler = secondSubClient.on.mock.calls[0][1];
+      readyHandler();
+
+      expect(secondSubClient.on).toHaveBeenCalledWith(
+        'message',
+        expect.any(Function),
+      );
     });
   });
   describe('connect', () => {
-    let createClientSpy: sinon.SinonSpy;
-    let handleErrorsSpy: sinon.SinonSpy;
+    let createClientSpy: ReturnType<typeof vi.fn>;
+    let registerErrorListenerSpy: ReturnType<typeof vi.fn>;
 
-    beforeEach(() => {
-      createClientSpy = sinon.stub(client, 'createClient').callsFake(
+    beforeEach(async () => {
+      untypedClient.connectionPromise = null;
+      createClientSpy = vi.spyOn(client, 'createClient').mockImplementation(
         () =>
           ({
+            on: () => null,
             addListener: () => null,
             removeListener: () => null,
-          } as any),
+            connect: () => Promise.resolve(),
+          }) as any,
       );
-      handleErrorsSpy = sinon.spy(client, 'handleError');
+      registerErrorListenerSpy = vi.spyOn(client, 'registerErrorListener');
 
-      client.connect();
+      await client.connect();
       client['pubClient'] = null;
     });
     afterEach(() => {
-      createClientSpy.restore();
-      handleErrorsSpy.restore();
+      createClientSpy.mockRestore();
+      registerErrorListenerSpy.mockRestore();
     });
     it('should call "createClient" twice', () => {
-      expect(createClientSpy.calledTwice).to.be.true;
+      expect(createClientSpy).toHaveBeenCalledTimes(2);
     });
-    it('should call "handleError" twice', () => {
-      expect(handleErrorsSpy.calledTwice).to.be.true;
+    it('should call "registerErrorListener" twice', () => {
+      expect(registerErrorListenerSpy).toHaveBeenCalledTimes(2);
     });
   });
-  describe('handleError', () => {
+  describe('connection lifecycle', () => {
+    const connectionLost = 'Error: Connection lost. Trying to reconnect...';
+    let lifecycleClient: ClientRedis;
+    let untypedLifecycleClient: any;
+    let created: FakeRedisClient[];
+
+    const setUp = (options: ConstructorParameters<typeof ClientRedis>[0]) => {
+      lifecycleClient = new ClientRedis(options);
+      untypedLifecycleClient = lifecycleClient as any;
+      vi.spyOn(untypedLifecycleClient.logger, 'log').mockImplementation(
+        () => {},
+      );
+      vi.spyOn(untypedLifecycleClient.logger, 'error').mockImplementation(
+        () => {},
+      );
+      created = [];
+      vi.spyOn(lifecycleClient, 'createClient').mockImplementation(async () => {
+        const fake = new FakeRedisClient();
+        fake.options = lifecycleClient.getClientOptions();
+        created.push(fake);
+        return fake;
+      });
+    };
+
+    /**
+     * Calls `connect()` and lets it create the pair and start connecting it.
+     */
+    const startConnecting = async () => {
+      const attempt = lifecycleClient.connect();
+      attempt.catch(() => {});
+      await new Promise(resolve => setImmediate(resolve));
+      const [pub, sub] = created.slice(-2);
+      return { attempt, pub, sub };
+    };
+    const connectPair = async () => {
+      const { attempt, pub, sub } = await startConnecting();
+      pub.ready();
+      sub.ready();
+      await attempt;
+      return [pub, sub];
+    };
+    const currentPair = () => [
+      untypedLifecycleClient.pubClient,
+      untypedLifecycleClient.subClient,
+    ];
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    describe('when "retryAttempts" is set', () => {
+      beforeEach(() => setUp({ retryAttempts: 1 }));
+
+      it('should let ioredis retry a failed first attempt in the background', async () => {
+        const { attempt, pub, sub } = await startConnecting();
+        pub.closeAndRetry();
+        sub.closeAndRetry();
+
+        await expect(attempt).rejects.toThrow('Connection is closed.');
+        await expect(lifecycleClient.connect()).rejects.toBe(connectionLost);
+        expect(currentPair()).toEqual([pub, sub]);
+        expect(pub.disconnect).not.toHaveBeenCalled();
+        expect(pub.quit).not.toHaveBeenCalled();
+
+        pub.ready();
+        sub.ready();
+
+        await expect(lifecycleClient.connect()).resolves.toBeUndefined();
+        expect(created).toHaveLength(2);
+        expect(sub.listenerCount('message')).toBe(1);
+      });
+
+      it('should start over once the retries of the first attempt are exhausted', async () => {
+        const { attempt, pub, sub } = await startConnecting();
+        pub.closeAndRetry();
+        sub.closeAndRetry();
+        await expect(attempt).rejects.toThrow('Connection is closed.');
+
+        pub.closeAndEnd();
+        sub.closeAndEnd();
+        const [newPub, newSub] = await connectPair();
+
+        expect(created).toHaveLength(4);
+        expect(currentPair()).toEqual([newPub, newSub]);
+        expect(newSub.listenerCount('message')).toBe(1);
+      });
+
+      it('should start over once a lost connection runs out of retries', async () => {
+        const [pub, sub] = await connectPair();
+        pub.closeAndRetry();
+        sub.closeAndRetry();
+        await expect(lifecycleClient.connect()).rejects.toBe(connectionLost);
+
+        pub.closeAndEnd();
+        expect(currentPair()).toEqual([null, null]);
+        expect(sub.disconnect).toHaveBeenCalled();
+        sub.closeAndEnd();
+
+        const [, newSub] = await connectPair();
+        expect(created).toHaveLength(4);
+        expect(newSub.listenerCount('message')).toBe(1);
+      });
+    });
+
+    describe('when "retryAttempts" is not set', () => {
+      beforeEach(() => setUp({}));
+
+      it('should start over after the connection is lost', async () => {
+        const [pub, sub] = await connectPair();
+        pub.closeAndEnd();
+        sub.closeAndEnd();
+
+        const [newPub, newSub] = await connectPair();
+
+        expect(created).toHaveLength(4);
+        expect(currentPair()).toEqual([newPub, newSub]);
+        expect(newSub.listenerCount('message')).toBe(1);
+      });
+
+      it('should drop both clients when only one of them fails to connect', async () => {
+        const { attempt, pub, sub } = await startConnecting();
+        pub.ready();
+        sub.closeAndEnd();
+
+        await expect(attempt).rejects.toThrow('Connection is closed.');
+        expect(pub.disconnect).toHaveBeenCalled();
+        expect(currentPair()).toEqual([null, null]);
+
+        const [, newSub] = await connectPair();
+        expect(newSub.listenerCount('message')).toBe(1);
+      });
+    });
+
+    describe('when closed while the clients are being created', () => {
+      beforeEach(() => setUp({}));
+
+      it('should not connect the clients once "close" has run', async () => {
+        const attempt = lifecycleClient.connect();
+        attempt.catch(() => {});
+        await lifecycleClient.close();
+        await new Promise(resolve => setImmediate(resolve));
+
+        await expect(attempt).rejects.toThrow('Connection closed');
+        for (const fake of created) {
+          expect(fake.connect).not.toHaveBeenCalled();
+        }
+        expect(currentPair()).toEqual([null, null]);
+        expect(untypedLifecycleClient.connectionPromise).toBeNull();
+      });
+
+      it('should not replace the clients of a "connect" called after "close"', async () => {
+        const stale = lifecycleClient.connect();
+        stale.catch(() => {});
+        await lifecycleClient.close();
+        const fresh = lifecycleClient.connect();
+        await new Promise(resolve => setImmediate(resolve));
+
+        const [pub, sub] = currentPair();
+        pub.ready();
+        sub.ready();
+
+        await expect(fresh).resolves.toBeUndefined();
+        await expect(stale).rejects.toThrow('Connection closed');
+        expect(currentPair()).toEqual([pub, sub]);
+        expect(created.filter(fake => fake.connect.mock.calls.length)).toEqual([
+          pub,
+          sub,
+        ]);
+      });
+
+      it('should not wipe a new connection started while quit is still pending', async () => {
+        const [firstPub] = await connectPair();
+        let finishQuit!: () => void;
+        firstPub.quit.mockImplementation(
+          () =>
+            new Promise<string>(resolve => {
+              finishQuit = () => resolve('OK');
+            }),
+        );
+
+        const closing = lifecycleClient.close();
+        const fresh = lifecycleClient.connect();
+        await new Promise(resolve => setImmediate(resolve));
+
+        const [secondPub, secondSub] = currentPair();
+        secondPub.ready();
+        secondSub.ready();
+        await expect(fresh).resolves.toBeUndefined();
+
+        finishQuit();
+        await closing;
+
+        expect(currentPair()).toEqual([secondPub, secondSub]);
+        await expect(lifecycleClient.connect()).resolves.toBeUndefined();
+        expect(secondSub.listenerCount('message')).toBe(1);
+      });
+
+      it('should let a connection started while quit is still pending reconnect', async () => {
+        setUp({ retryAttempts: 3, retryDelay: 10 });
+        const [firstPub, firstSub] = await connectPair();
+        let finishQuit!: () => void;
+        firstPub.quit.mockImplementation(
+          () =>
+            new Promise<string>(resolve => {
+              finishQuit = () => resolve('OK');
+            }),
+        );
+
+        const closing = lifecycleClient.close();
+        const fresh = lifecycleClient.connect();
+        await new Promise(resolve => setImmediate(resolve));
+        const [secondPub, secondSub] = currentPair();
+        secondPub.ready();
+        secondSub.ready();
+        await fresh;
+
+        expect(secondPub.options.retryStrategy(1)).toBe(10);
+        expect(firstSub.options!.retryStrategy!(1)).toBeUndefined();
+        secondPub.closeAndRetry();
+        await expect(lifecycleClient.connect()).rejects.toBe(connectionLost);
+
+        finishQuit();
+        await closing;
+        expect(currentPair()).toEqual([secondPub, secondSub]);
+      });
+
+      it('should reject an in-flight connect() when close() runs before the clients finish connecting', async () => {
+        const { attempt, pub, sub } = await startConnecting();
+        await lifecycleClient.close();
+        pub.ready();
+        sub.ready();
+
+        await expect(attempt).rejects.toThrow('Connection closed');
+        expect(currentPair()).toEqual([null, null]);
+        expect(untypedLifecycleClient.connectionPromise).toBeNull();
+      });
+    });
+
+    it.each([
+      ['set', { retryAttempts: 1 }],
+      ['not set', {}],
+    ])(
+      'should ignore the events of a dropped client ("retryAttempts" %s)',
+      async (_, options) => {
+        setUp(options);
+        const [pub, sub] = await connectPair();
+        sub.closeAndEnd();
+        const [newPub, newSub] = await connectPair();
+
+        // The pub client dropped along with the sub one only shuts down now
+        pub.emit('reconnecting');
+        pub.emit('end');
+
+        expect(currentPair()).toEqual([newPub, newSub]);
+        expect(newPub.disconnect).not.toHaveBeenCalled();
+        await expect(lifecycleClient.connect()).resolves.toBeUndefined();
+        expect(created).toHaveLength(4);
+      },
+    );
+
+    it('should start over when creating the clients fails', async () => {
+      setUp({});
+      const error = new Error('cannot create client');
+      vi.mocked(lifecycleClient.createClient)
+        .mockImplementationOnce(async () => {
+          const fake = new FakeRedisClient();
+          created.push(fake);
+          return fake;
+        })
+        .mockRejectedValueOnce(error);
+
+      await expect(lifecycleClient.connect()).rejects.toBe(error);
+      expect(created[0].disconnect).toHaveBeenCalled();
+      expect(untypedLifecycleClient.connectionPromise).toBeNull();
+
+      await connectPair();
+      expect(currentPair()).toEqual(created.slice(1));
+    });
+
+    it('should attach the listeners registered with "on" to every new pair', async () => {
+      setUp({});
+      const registeredBeforeConnect = vi.fn();
+      const registeredWhileConnected = vi.fn();
+      lifecycleClient.on('warning', registeredBeforeConnect);
+
+      const [pub, sub] = await connectPair();
+      lifecycleClient.on('warning', registeredWhileConnected);
+      pub.closeAndEnd();
+      sub.closeAndEnd();
+      const [newPub, newSub] = await connectPair();
+      newPub.emit('warning', 'first');
+      newSub.emit('warning', 'second');
+
+      for (const listener of [
+        registeredBeforeConnect,
+        registeredWhileConnected,
+      ]) {
+        expect(listener).toHaveBeenCalledWith('pub', 'first');
+        expect(listener).toHaveBeenCalledWith('sub', 'second');
+      }
+    });
+
+    it('should let a real ioredis client retry, then start over once it gives up', async () => {
+      let acceptedConnections = 0;
+      const server = createServer(socket => {
+        acceptedConnections++;
+        socket.destroy();
+      });
+      await new Promise<void>(resolve =>
+        server.listen(0, '127.0.0.1', resolve),
+      );
+      const { port } = server.address() as AddressInfo;
+      const realClient = new ClientRedis({
+        host: '127.0.0.1',
+        port,
+        retryAttempts: 2,
+        retryDelay: 10,
+      });
+      vi.spyOn((realClient as any).logger, 'log').mockImplementation(() => {});
+      vi.spyOn((realClient as any).logger, 'error').mockImplementation(
+        () => {},
+      );
+      const realClients: any[] = [];
+      const createClient = realClient.createClient.bind(realClient);
+      const createClientSpy = vi
+        .spyOn(realClient, 'createClient')
+        .mockImplementation(async () => {
+          const redis = await createClient();
+          realClients.push(redis);
+          return redis;
+        });
+      // Once ioredis gives up on one client of the pair, the other one is
+      // disconnected. If it was waiting to reconnect, ioredis cancels the retry
+      // but leaves it in "reconnecting", so wait for the connection attempts
+      // to stop rather than for every client to reach "end".
+      const givenUp = async () => {
+        await vi.waitFor(() =>
+          expect(
+            realClients.slice(-2).some(redis => redis.status === 'end'),
+          ).toBe(true),
+        );
+        const connections = acceptedConnections;
+        await new Promise(resolve => setTimeout(resolve, 100));
+        expect(acceptedConnections).toBe(connections);
+      };
+
+      try {
+        await expect(realClient.connect()).rejects.toThrow();
+        await givenUp();
+        // The client that gave up first made its initial attempt plus both
+        // retries, alongside at least the initial attempt of the other one
+        expect(acceptedConnections).toBeGreaterThanOrEqual(4);
+
+        await expect(realClient.connect()).rejects.toThrow();
+        expect(createClientSpy).toHaveBeenCalledTimes(4);
+        await givenUp();
+      } finally {
+        await realClient.close();
+        await new Promise(resolve => server.close(resolve));
+      }
+    });
+  });
+  describe('registerErrorListener', () => {
     it('should bind error event handler', () => {
-      const callback = sinon.stub().callsFake((_, fn) => fn({ code: 'test' }));
+      const callback = vi
+        .fn()
+        .mockImplementation((_, fn) => fn({ code: 'test' }));
       const emitter = {
         addListener: callback,
       };
-      client.handleError(emitter as any);
-      expect(callback.getCall(0).args[0]).to.be.eql(ERROR_EVENT);
+      client.registerErrorListener(emitter as any);
+      expect(callback.mock.calls[0][0]).toEqual('error');
+    });
+  });
+  describe('registerEndListener', () => {
+    it('should bind end event handler', () => {
+      const callback = vi
+        .fn()
+        .mockImplementation((_, fn) => fn({ code: 'test' }));
+      const emitter = {
+        on: callback,
+      };
+      client.registerEndListener(emitter as any);
+      expect(callback.mock.calls[0][0]).toEqual('end');
+    });
+    it('should call pending callbacks when connection ends unexpectedly', () => {
+      const client = new ClientRedis({});
+      const callback = vi.fn();
+      const emitter = {
+        on: vi.fn().mockImplementation((_, fn) => fn()),
+        disconnect: vi.fn(),
+      };
+
+      client['routingMap'].set('some id', callback);
+      client['subscriptionsCount'].set('channel', 1);
+      (client as any).isManuallyClosed = false;
+      (client as any).subClient = emitter;
+
+      client.registerEndListener(emitter as any);
+
+      expect(client['routingMap'].size).toBe(0);
+      expect(client['subscriptionsCount'].size).toBe(0);
+      expect(callback).toHaveBeenCalledWith({
+        err: expect.objectContaining({ message: 'Connection closed' }),
+      });
+    });
+  });
+  describe('registerReadyListener', () => {
+    it('should bind ready event handler', () => {
+      const callback = vi
+        .fn()
+        .mockImplementation((_, fn) => fn({ code: 'test' }));
+      const emitter = {
+        on: callback,
+      };
+      client.registerReadyListener(emitter as any);
+      expect(callback.mock.calls[0][0]).toEqual('ready');
+    });
+    it('should log an error that the response listener rejects with', async () => {
+      // ioredis does not handle the promise its listeners return
+      const onSpy = vi.fn();
+      const client = new ClientRedis({});
+      const untypedClient = client as any;
+      const error = new Error('callback failed');
+      vi.spyOn(client, 'createResponseCallback').mockReturnValue(() =>
+        Promise.reject(error),
+      );
+      const logError = vi
+        .spyOn(untypedClient.logger, 'error')
+        .mockImplementation(() => {});
+      const emitter = { status: 'ready', on: onSpy };
+      untypedClient.pubClient = { status: 'ready' };
+      untypedClient.subClient = emitter;
+
+      client.registerReadyListener(emitter as any);
+      onSpy.mock.calls[0][1]();
+      const listener = onSpy.mock.calls[1][1];
+
+      await expect(listener('channel', '{}')).resolves.toBeUndefined();
+      expect(logError).toHaveBeenCalledWith(error);
+    });
+    it('should register "message" event when returnBuffers is not set', () => {
+      const onSpy = vi.fn();
+      const client = new ClientRedis({});
+      const untypedClient = client as any;
+      const emitter = {
+        status: 'ready',
+        on: onSpy,
+      };
+
+      untypedClient.wasInitialConnectionSuccessful = false;
+      untypedClient.pubClient = { status: 'ready' };
+      untypedClient.subClient = emitter;
+
+      client.registerReadyListener(emitter as any);
+      const readyHandler = onSpy.mock.calls[0][1];
+      readyHandler();
+
+      expect(onSpy).toHaveBeenCalledTimes(2);
+      expect(onSpy.mock.calls[1][0]).toEqual('message');
+    });
+    it('should register "message" event when returnBuffers is false', () => {
+      const onSpy = vi.fn();
+      const client = new ClientRedis({ returnBuffers: false });
+      const untypedClient = client as any;
+
+      const emitter = {
+        status: 'ready',
+        on: onSpy,
+      };
+
+      untypedClient.wasInitialConnectionSuccessful = false;
+      untypedClient.pubClient = { status: 'ready' };
+      untypedClient.subClient = emitter;
+
+      client.registerReadyListener(emitter as any);
+      const readyHandler = onSpy.mock.calls[0][1];
+      readyHandler();
+
+      expect(onSpy).toHaveBeenCalledTimes(2);
+      expect(onSpy.mock.calls[1][0]).toEqual('message');
+    });
+    it('should register "messageBuffer" event when returnBuffers is true', () => {
+      const onSpy = vi.fn();
+      const clientWithBuffers = new ClientRedis({ returnBuffers: true });
+      const untypedClientWithBuffers = clientWithBuffers as any;
+
+      const emitter = {
+        status: 'ready',
+        on: onSpy,
+      };
+
+      untypedClientWithBuffers.wasInitialConnectionSuccessful = false;
+      untypedClientWithBuffers.pubClient = { status: 'ready' };
+      untypedClientWithBuffers.subClient = emitter;
+
+      clientWithBuffers.registerReadyListener(emitter as any);
+      const readyHandler = onSpy.mock.calls[0][1];
+      readyHandler();
+
+      expect(onSpy).toHaveBeenCalledTimes(2);
+      expect(onSpy.mock.calls[1][0]).toEqual('messageBuffer');
+    });
+  });
+  describe('registerReconnectListener', () => {
+    it('should bind reconnect event handler', () => {
+      const callback = vi
+        .fn()
+        .mockImplementation((_, fn) => fn({ code: 'test' }));
+      const emitter = {
+        on: callback,
+      };
+      client.registerReconnectListener(emitter as any);
+      expect(callback.mock.calls[0][0]).toEqual('reconnecting');
     });
   });
   describe('getClientOptions', () => {
-    it('should return options object with "retry_strategy" and call "createRetryStrategy"', () => {
-      const createSpy = sinon.spy(client, 'createRetryStrategy');
-      const { retry_strategy } = client.getClientOptions(new Subject());
+    it('should return options object with "retryStrategy" and call "createRetryStrategy"', () => {
+      const createSpy = vi.spyOn(client, 'createRetryStrategy');
+      const { retryStrategy } = client.getClientOptions()!;
       try {
-        retry_strategy({} as any);
-      } catch {}
-      expect(createSpy.called).to.be.true;
+        retryStrategy!({} as any);
+      } catch {
+        // No empty
+      }
+      expect(createSpy).toHaveBeenCalled();
     });
   });
   describe('createRetryStrategy', () => {
-    const subject = new Subject<Error>();
     describe('when is terminated', () => {
       it('should return undefined', () => {
-        (client as any).isExplicitlyTerminated = true;
-        const result = client.createRetryStrategy({} as any, subject);
-        expect(result).to.be.undefined;
+        untypedClient.isManuallyClosed = true;
+        const result = client.createRetryStrategy(0);
+        expect(result).toBeUndefined();
       });
     });
     describe('when "retryAttempts" does not exist', () => {
-      it('should return an error', () => {
-        (client as any).isExplicitlyTerminated = false;
-        (client as any).options.options = {};
-        (client as any).options.options.retryAttempts = undefined;
-        const result = client.createRetryStrategy({} as any, subject);
-        expect(result).to.be.instanceOf(Error);
+      it('should return undefined', () => {
+        untypedClient.isManuallyClosed = false;
+        untypedClient.options.options = {};
+        untypedClient.options.options.retryAttempts = undefined;
+        const result = client.createRetryStrategy(1);
+        expect(result).toBeUndefined();
       });
     });
     describe('when "attempts" count is max', () => {
-      it('should return an error', () => {
-        (client as any).isExplicitlyTerminated = false;
-        (client as any).options.options = {};
-        (client as any).options.options.retryAttempts = 3;
-        const result = client.createRetryStrategy(
-          { attempt: 4 } as any,
-          subject,
-        );
-        expect(result).to.be.instanceOf(Error);
-      });
-    });
-    describe('when ECONNREFUSED', () => {
-      it('should return error', () => {
-        (client as any).options.options = {};
-        (client as any).options.options.retryAttempts = 10;
-
-        const error = { code: 'ECONNREFUSED' };
-        const result = client.createRetryStrategy({ error } as any, subject);
-        expect(result).to.be.instanceOf(Error);
+      it('should return undefined', () => {
+        untypedClient.isManuallyClosed = false;
+        untypedClient.options.options = {};
+        untypedClient.options.options.retryAttempts = 3;
+        const result = client.createRetryStrategy(4);
+        expect(result).toBeUndefined();
       });
     });
     describe('otherwise', () => {
       it('should return delay (ms)', () => {
-        (client as any).options = {};
-        (client as any).isExplicitlyTerminated = false;
-        (client as any).options.retryAttempts = 3;
-        (client as any).options.retryDelay = 3;
-        const result = client.createRetryStrategy(
-          { attempt: 2 } as any,
-          subject,
-        );
-        expect(result).to.be.eql((client as any).options.retryDelay);
+        untypedClient.options = {};
+        untypedClient.isManuallyClosed = false;
+        untypedClient.options.retryAttempts = 3;
+        untypedClient.options.retryDelay = 3;
+        const result = client.createRetryStrategy(2);
+        expect(result).toEqual(untypedClient.options.retryDelay);
       });
     });
   });
   describe('dispatchEvent', () => {
     const msg = { pattern: 'pattern', data: 'data' };
-    let publishStub: sinon.SinonStub, pubClient;
+    let publishStub: ReturnType<typeof vi.fn>, pubClient;
 
     beforeEach(() => {
-      publishStub = sinon.stub();
+      publishStub = vi.fn();
       pubClient = {
         publish: publishStub,
       };
-      (client as any).pubClient = pubClient;
+      untypedClient.pubClient = pubClient;
     });
 
     it('should publish packet', async () => {
-      publishStub.callsFake((a, b, c) => c());
+      publishStub.mockImplementation((a, b, c) => c());
       await client['dispatchEvent'](msg);
 
-      expect(publishStub.called).to.be.true;
+      expect(publishStub).toHaveBeenCalled();
     });
     it('should throw error', async () => {
-      publishStub.callsFake((a, b, c) => c(new Error()));
+      publishStub.mockImplementation((a, b, c) => c(new Error()));
       client['dispatchEvent'](msg).catch(err =>
-        expect(err).to.be.instanceOf(Error),
+        expect(err).toBeInstanceOf(Error),
       );
+    });
+  });
+
+  describe('createClient', () => {
+    it('should not set clientInfoTag when not provided', async () => {
+      const clientWithoutTag = new ClientRedis({});
+      const redisClient = await clientWithoutTag.createClient();
+
+      expect(redisClient).toBeTruthy();
+      // Verify no clientInfoTag was set (opt-in only)
+      expect(redisClient.options.clientInfoTag).toBeUndefined();
+    });
+
+    it('should use clientInfoTag when provided', async () => {
+      const clientWithTag = new ClientRedis({ clientInfoTag: 'my-app' });
+      const redisClient = await clientWithTag.createClient();
+
+      expect(redisClient).toBeTruthy();
+      // Verify the clientInfoTag was used
+      expect(redisClient.options.clientInfoTag).toBe('my-app');
     });
   });
 });

@@ -1,11 +1,8 @@
-import { Injectable, OnModuleDestroy } from '@nestjs/common';
+import { Injectable, Module, OnModuleDestroy } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import { expect } from 'chai';
-import * as Sinon from 'sinon';
-
 @Injectable()
 class TestInjectable implements OnModuleDestroy {
-  onModuleDestroy = Sinon.spy();
+  onModuleDestroy = vi.fn();
 }
 
 describe('OnModuleDestroy', () => {
@@ -17,7 +14,7 @@ describe('OnModuleDestroy', () => {
     const app = module.createNestApplication();
     await app.close();
     const instance = module.get(TestInjectable);
-    expect(instance.onModuleDestroy.called).to.be.true;
+    expect(instance.onModuleDestroy).toHaveBeenCalled();
   });
 
   it('should not throw an error when onModuleDestroy is null', async () => {
@@ -26,7 +23,8 @@ describe('OnModuleDestroy', () => {
     }).compile();
 
     const app = module.createNestApplication();
-    await app.init().then(obj => expect(obj).to.not.be.undefined);
+    await app.init().then(obj => expect(obj).not.toBeUndefined());
+    await app.close();
   });
 
   it('should not throw an error when onModuleDestroy is undefined', async () => {
@@ -37,6 +35,135 @@ describe('OnModuleDestroy', () => {
     }).compile();
 
     const app = module.createNestApplication();
-    await app.init().then(obj => expect(obj).to.not.be.undefined);
+    await app.init().then(obj => expect(obj).not.toBeUndefined());
+    await app.close();
+  });
+
+  it('should sort modules by distance (topological sort) - DESC order', async () => {
+    @Injectable()
+    class BB implements OnModuleDestroy {
+      onModuleDestroy = vi.fn();
+    }
+
+    @Module({
+      providers: [BB],
+      exports: [BB],
+    })
+    class B {}
+
+    @Injectable()
+    class AA implements OnModuleDestroy {
+      constructor(private bb: BB) {}
+      onModuleDestroy = vi.fn();
+    }
+
+    @Module({
+      imports: [B],
+      providers: [AA],
+    })
+    class A {}
+
+    const module = await Test.createTestingModule({
+      imports: [A],
+    }).compile();
+
+    const app = module.createNestApplication();
+    await app.init();
+    await app.close();
+
+    const aa = module.get(AA);
+    const bb = module.get(BB);
+    expect(aa.onModuleDestroy.mock.invocationCallOrder[0]).toBeLessThan(
+      bb.onModuleDestroy.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('should call onModuleDestroy of an imported module last when a longer import path also leads to it', async () => {
+    @Injectable()
+    class DatabaseService implements OnModuleDestroy {
+      onModuleDestroy = vi.fn();
+    }
+
+    @Module({
+      providers: [DatabaseService],
+      exports: [DatabaseService],
+    })
+    class DatabaseModule {}
+
+    @Injectable()
+    class UsersService implements OnModuleDestroy {
+      constructor(private db: DatabaseService) {}
+      onModuleDestroy = vi.fn();
+    }
+
+    @Module({
+      imports: [DatabaseModule],
+      providers: [UsersService],
+      exports: [UsersService],
+    })
+    class UsersModule {}
+
+    @Module({ imports: [UsersModule] })
+    class PaymentsModule {}
+
+    @Module({ imports: [PaymentsModule] })
+    class OrdersModule {}
+
+    const module = await Test.createTestingModule({
+      imports: [DatabaseModule, UsersModule, OrdersModule],
+    }).compile();
+
+    const app = module.createNestApplication();
+    await app.init();
+    await app.close();
+
+    const db = module.get(DatabaseService);
+    const users = module.get(UsersService);
+    expect(users.onModuleDestroy).toHaveBeenCalledBefore(db.onModuleDestroy);
+  });
+
+  it('should sort components within a single module by injection hierarchy - ASC order', async () => {
+    @Injectable()
+    class A implements OnModuleDestroy {
+      onModuleDestroy = vi.fn();
+    }
+
+    @Injectable()
+    class AHost implements OnModuleDestroy {
+      constructor(private a: A) {}
+      onModuleDestroy = vi.fn();
+    }
+
+    @Injectable()
+    class Composition implements OnModuleDestroy {
+      constructor(
+        private a: A,
+        private host: AHost,
+      ) {}
+      onModuleDestroy = vi.fn();
+    }
+
+    @Module({
+      providers: [AHost, A, Composition],
+    })
+    class AModule {}
+
+    const module = await Test.createTestingModule({
+      imports: [AModule],
+    }).compile();
+
+    const app = module.createNestApplication();
+    await app.init();
+    await app.close();
+
+    const child = module.get(A);
+    const parent = module.get(AHost);
+    const composition = module.get(Composition);
+    expect(composition.onModuleDestroy).toHaveBeenCalledBefore(
+      parent.onModuleDestroy,
+    );
+    expect(parent.onModuleDestroy).toHaveBeenCalledBefore(
+      child.onModuleDestroy,
+    );
   });
 });

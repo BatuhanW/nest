@@ -1,10 +1,10 @@
-import { HttpStatus } from '../enums/http-status.enum';
-import { HttpException } from './http.exception';
+import { HttpStatus } from '../enums/http-status.enum.js';
+import { HttpException, HttpExceptionOptions } from './http.exception.js';
 
 /**
  * Defines an HTTP exception for *Request Timeout* type errors.
  *
- * @see [Base Exceptions](https://docs.nestjs.com/exception-filters#base-exceptions)
+ * @see [Built-in HTTP exceptions](https://docs.nestjs.com/exception-filters#built-in-http-exceptions)
  *
  * @publicApi
  */
@@ -18,7 +18,7 @@ export class RequestTimeoutException extends HttpException {
    * @usageNotes
    * The HTTP response status code will be 408.
    * - The `objectOrError` argument defines the JSON response body or the message string.
-   * - The `description` argument contains a short description of the HTTP error.
+   * - The `descriptionOrOptions` argument contains either a short description of the HTTP error or an options object used to provide an underlying error cause.
    *
    * By default, the JSON response body contains two properties:
    * - `statusCode`: this will be the value 408.
@@ -31,19 +31,24 @@ export class RequestTimeoutException extends HttpException {
    * and return it as the JSON response body.
    *
    * @param objectOrError string or object describing the error condition.
-   * @param description a short description of the HTTP error.
+   * @param descriptionOrOptions either a short description of the HTTP error or an options object used to provide an underlying error cause
    */
   constructor(
-    objectOrError?: string | object | any,
-    description = 'Request Timeout',
+    objectOrError?: any,
+    descriptionOrOptions: string | HttpExceptionOptions = 'Request Timeout',
   ) {
+    const { description = 'Request Timeout', httpExceptionOptions } =
+      HttpException.extractDescriptionAndOptionsFrom(descriptionOrOptions);
+
     super(
       HttpException.createBody(
         objectOrError,
         description,
         HttpStatus.REQUEST_TIMEOUT,
+        httpExceptionOptions?.errorCode,
       ),
       HttpStatus.REQUEST_TIMEOUT,
+      httpExceptionOptions,
     );
   }
 }

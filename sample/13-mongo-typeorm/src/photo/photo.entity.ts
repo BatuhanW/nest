@@ -1,9 +1,10 @@
-import { Column, Entity, ObjectID, ObjectIdColumn } from 'typeorm';
+import { ObjectId } from 'mongodb';
+import { Column, Entity, ObjectIdColumn } from 'typeorm';
 
 @Entity()
 export class Photo {
   @ObjectIdColumn()
-  id: ObjectID;
+  id: ObjectId;
 
   @Column()
   name: string;

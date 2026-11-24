@@ -1,5 +1,5 @@
 import { Module, Injectable } from '@nestjs/common';
-import { AppController } from './app.controller';
+import { AppController } from './app.controller.js';
 import {
   ClientsModule,
   Transport,
@@ -59,16 +59,17 @@ class ClientOptionService implements ClientsModuleOptionsFactory {
         name: 'USE_CLASS_CLIENT',
         useClass: ClientOptionService,
         inject: [ConfigService],
-      }, {
+      },
+      {
         imports: [ConfigModule],
         inject: [ConfigService],
         name: 'CUSTOM_PROXY_CLIENT',
         useFactory: (config: ConfigService) => ({
-          customClass: ErrorHandlingProxy
-        })
-      }
+          customClass: ErrorHandlingProxy,
+        }),
+      },
     ]),
   ],
   controllers: [AppController],
 })
-export class ApplicationModule {}
+export class AppModule {}

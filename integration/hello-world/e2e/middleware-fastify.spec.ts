@@ -1,86 +1,1676 @@
-import { Controller, Get, MiddlewareConsumer, Module } from '@nestjs/common';
+import {
+  All,
+  BadRequestException,
+  Controller,
+  Get,
+  Injectable,
+  MiddlewareConsumer,
+  Module,
+  NestMiddleware,
+  NestModule,
+  Param,
+  Query,
+  Req,
+  RequestMethod,
+  UnauthorizedException,
+  VersioningType,
+} from '@nestjs/common';
 import {
   FastifyAdapter,
   NestFastifyApplication,
 } from '@nestjs/platform-fastify';
 import { Test } from '@nestjs/testing';
-import { expect } from 'chai';
-import { ApplicationModule } from '../src/app.module';
-
-const RETURN_VALUE = 'test';
-const SCOPED_VALUE = 'test_scoped';
-const WILDCARD_VALUE = 'test_wildcard';
-
-@Controller()
-class TestController {
-  @Get('test')
-  test() {
-    return RETURN_VALUE;
-  }
-
-  @Get('tests/wildcard_nested')
-  wildcard_nested() {
-    return RETURN_VALUE;
-  }
-}
-
-@Module({
-  imports: [ApplicationModule],
-  controllers: [TestController],
-})
-class TestModule {
-  configure(consumer: MiddlewareConsumer) {
-    consumer
-      .apply((req, res, next) => res.end(WILDCARD_VALUE))
-      .forRoutes('tests/(.*)')
-      .apply((req, res, next) => res.end(SCOPED_VALUE))
-      .forRoutes(TestController)
-      .apply((req, res, next) => res.end(RETURN_VALUE))
-      .forRoutes('(.*)');
-  }
-}
+import { FastifyRequest } from 'fastify';
+import { AddressInfo, connect } from 'net';
+import request from 'supertest';
+import { AppModule } from '../src/app.module.js';
+import { listenOnLoopback } from '../../_support/listen-on-loopback.js';
 
 describe('Middleware (FastifyAdapter)', () => {
   let app: NestFastifyApplication;
 
-  beforeEach(async () => {
-    app = (
-      await Test.createTestingModule({
-        imports: [TestModule],
-      }).compile()
-    ).createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+  describe('trailing slash handling', () => {
+    @Injectable()
+    class AuthMiddleware implements NestMiddleware {
+      use(
+        req: FastifyRequest['raw'] & { headers: Record<string, unknown> },
+        res,
+        next: () => void,
+      ) {
+        if (req.headers['x-auth'] === '1') {
+          return next();
+        }
+        res.statusCode = 401;
+        res.end('unauthorized');
+      }
+    }
 
-    await app.init();
-  });
+    @Controller('users')
+    class UsersController {
+      @Get()
+      findAll() {
+        return 'users';
+      }
 
-  it(`forRoutes(*)`, () => {
-    return app
-      .inject({
-        method: 'GET',
-        url: '/hello',
+      @Get(':id')
+      findOne(@Param('id') id: string) {
+        return `user:${id}`;
+      }
+    }
+
+    describe('manual routes', () => {
+      @Module({
+        controllers: [UsersController],
       })
-      .then(({ payload }) => expect(payload).to.be.eql(RETURN_VALUE));
-  });
+      class TrailingSlashModule implements NestModule {
+        configure(consumer: MiddlewareConsumer) {
+          consumer
+            .apply(AuthMiddleware)
+            .forRoutes(
+              { path: 'users', method: RequestMethod.ALL },
+              { path: 'users/:id', method: RequestMethod.ALL },
+            );
+        }
+      }
 
-  it(`forRoutes(TestController)`, () => {
-    return app
-      .inject({
-        method: 'GET',
-        url: '/test',
+      beforeEach(async () => {
+        app = (
+          await Test.createTestingModule({
+            imports: [TrailingSlashModule],
+          }).compile()
+        ).createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+
+        await listenOnLoopback(app);
+      });
+
+      afterEach(async () => {
+        await app.close();
+      });
+
+      it('does not bypass middleware on a trailing slash variant', async () => {
+        await app
+          .inject({
+            method: 'GET',
+            url: '/users',
+          })
+          .then(response => {
+            expect(response.statusCode).toBe(401);
+            expect(response.payload).toBe('unauthorized');
+          });
+
+        await app
+          .inject({
+            method: 'GET',
+            url: '/users/',
+          })
+          .then(response => {
+            expect(response.statusCode).toBe(401);
+            expect(response.payload).toBe('unauthorized');
+          });
+
+        await app
+          .inject({
+            method: 'GET',
+            url: '/users/1',
+          })
+          .then(response => {
+            expect(response.statusCode).toBe(401);
+            expect(response.payload).toBe('unauthorized');
+          });
+      });
+    });
+
+    describe('forRoutes(UsersController)', () => {
+      @Module({
+        controllers: [UsersController],
       })
-      .then(({ payload }) => expect(payload).to.be.eql(SCOPED_VALUE));
+      class TrailingSlashModule implements NestModule {
+        configure(consumer: MiddlewareConsumer) {
+          consumer.apply(AuthMiddleware).forRoutes(UsersController);
+        }
+      }
+
+      beforeEach(async () => {
+        app = (
+          await Test.createTestingModule({
+            imports: [TrailingSlashModule],
+          }).compile()
+        ).createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+
+        await listenOnLoopback(app);
+      });
+
+      afterEach(async () => {
+        await app.close();
+      });
+
+      it('does not bypass middleware on a trailing slash variant', async () => {
+        await app
+          .inject({
+            method: 'GET',
+            url: '/users',
+          })
+          .then(response => {
+            expect(response.statusCode).toBe(401);
+            expect(response.payload).toBe('unauthorized');
+          });
+
+        await app
+          .inject({
+            method: 'GET',
+            url: '/users/',
+          })
+          .then(response => {
+            expect(response.statusCode).toBe(401);
+            expect(response.payload).toBe('unauthorized');
+          });
+
+        await app
+          .inject({
+            method: 'GET',
+            url: '/users/1',
+          })
+          .then(response => {
+            expect(response.statusCode).toBe(401);
+            expect(response.payload).toBe('unauthorized');
+          });
+      });
+    });
   });
 
-  it(`forRoutes(tests/*)`, () => {
-    return app
-      .inject({
-        method: 'GET',
-        url: '/tests/wildcard',
+  describe('should return expected values depending on the route', () => {
+    const INCLUDED_VALUE = 'test_included';
+    const QUERY_VALUE = 'test_query';
+    const REQ_URL_VALUE = 'test_req_url';
+    const RETURN_VALUE = 'test';
+    const SCOPED_VALUE = 'test_scoped';
+    const WILDCARD_VALUE = 'test_wildcard';
+
+    @Controller()
+    class TestController {
+      @Get('express_style_wildcard/wildcard_nested')
+      express_style_wildcard() {
+        return RETURN_VALUE;
+      }
+
+      @Get('legacy_style_wildcard/wildcard_nested')
+      legacy_style_wildcard() {
+        return RETURN_VALUE;
+      }
+
+      @Get('test')
+      test() {
+        return RETURN_VALUE;
+      }
+
+      @Get('query')
+      query() {
+        return RETURN_VALUE;
+      }
+
+      @Get('tests/wildcard_nested')
+      wildcard_nested() {
+        return RETURN_VALUE;
+      }
+
+      @Get('tests/included')
+      included() {
+        return RETURN_VALUE;
+      }
+    }
+
+    @Controller(QUERY_VALUE)
+    class TestQueryController {
+      @Get()
+      [QUERY_VALUE](@Query('test') test: string) {
+        return test;
+      }
+    }
+
+    @Module({
+      imports: [AppModule],
+      controllers: [TestController, TestQueryController],
+    })
+    class TestModule {
+      configure(consumer: MiddlewareConsumer) {
+        consumer
+          .apply((req, res, next) => res.end(INCLUDED_VALUE))
+          .forRoutes({ path: 'tests/included', method: RequestMethod.POST })
+          .apply((req, res, next) => res.end(REQ_URL_VALUE))
+          .forRoutes('req/url/*')
+          .apply((req, res, next) => res.end(WILDCARD_VALUE))
+          .forRoutes(
+            'express_style_wildcard/*',
+            'tests/*path',
+            'legacy_style_wildcard/(.*)',
+          )
+          .apply((req, res, next) => res.end(QUERY_VALUE))
+          .forRoutes('query')
+          .apply((req, res, next) => next())
+          .forRoutes(TestQueryController)
+          .apply((req, res, next) => res.end(SCOPED_VALUE))
+          .forRoutes(TestController)
+          .apply((req, res, next) => res.end(RETURN_VALUE))
+          .exclude({ path: QUERY_VALUE, method: -1 as any })
+          .forRoutes('*');
+      }
+    }
+
+    beforeEach(async () => {
+      app = (
+        await Test.createTestingModule({
+          imports: [TestModule],
+        }).compile()
+      ).createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+
+      await listenOnLoopback(app);
+    });
+
+    it(`forRoutes(*)`, () => {
+      return app
+        .inject({
+          method: 'GET',
+          url: '/hello',
+        })
+        .then(({ payload }) => expect(payload).toEqual(RETURN_VALUE));
+    });
+
+    it(`forRoutes(TestController)`, () => {
+      return app
+        .inject({
+          method: 'GET',
+          url: '/test',
+        })
+        .then(({ payload }) => expect(payload).toEqual(SCOPED_VALUE));
+    });
+
+    it(`query?test=${QUERY_VALUE} forRoutes(query)`, () => {
+      return app
+        .inject({
+          method: 'GET',
+          url: '/query',
+          query: {
+            test: QUERY_VALUE,
+          },
+        })
+        .then(({ payload }) => expect(payload).toEqual(QUERY_VALUE));
+    });
+
+    it(`${QUERY_VALUE}?test=${QUERY_VALUE} forRoutes(${QUERY_VALUE})`, () => {
+      return app
+        .inject({
+          method: 'GET',
+          url: QUERY_VALUE,
+          query: {
+            test: QUERY_VALUE,
+          },
+        })
+        .then(({ payload }) => expect(payload).toEqual(QUERY_VALUE));
+    });
+
+    it(`forRoutes(tests/*path)`, () => {
+      return app
+        .inject({
+          method: 'GET',
+          url: '/tests/wildcard_nested',
+        })
+        .then(({ payload }) => expect(payload).toEqual(WILDCARD_VALUE));
+    });
+
+    it(`forRoutes(express_style_wildcard/*)`, () => {
+      return app
+        .inject({
+          method: 'GET',
+          url: '/express_style_wildcard/wildcard_nested',
+        })
+        .then(({ payload }) => expect(payload).toEqual(WILDCARD_VALUE));
+    });
+
+    it(`forRoutes(legacy_style_wildcard/*)`, () => {
+      return app
+        .inject({
+          method: 'GET',
+          url: '/legacy_style_wildcard/wildcard_nested',
+        })
+        .then(({ payload }) => expect(payload).toEqual(WILDCARD_VALUE));
+    });
+
+    it(`forRoutes(req/url/)`, () => {
+      const reqUrl = '/test';
+      return app
+        .inject({
+          method: 'GET',
+          url: `/req/url${reqUrl}`,
+        })
+        .then(({ payload }) => expect(payload).toEqual(REQ_URL_VALUE));
+    });
+
+    it(`GET forRoutes(POST tests/included)`, () => {
+      return app
+        .inject({
+          method: 'GET',
+          url: '/tests/included',
+        })
+        .then(({ payload }) => expect(payload).toEqual(WILDCARD_VALUE));
+    });
+
+    it(`POST forRoutes(POST tests/included)`, () => {
+      return app
+        .inject({
+          method: 'POST',
+          url: '/tests/included',
+        })
+        .then(({ payload }) => expect(payload).toEqual(INCLUDED_VALUE));
+    });
+
+    it(`GET forRoutes(POST /tests/%69ncluded) - ensure middleware is executed correctly with encoded characters`, () => {
+      return app
+        .inject({
+          method: 'POST',
+          url: '/tests/%69ncluded', // 'i' character is encoded
+        })
+        .then(({ payload }) => expect(payload).toEqual(INCLUDED_VALUE));
+    });
+
+    afterEach(async () => {
+      await app.close();
+    });
+  });
+
+  describe('should execute middleware only once for given routes', () => {
+    class Middleware implements NestMiddleware {
+      use(request: any, reply: any, next: () => void) {
+        if (request.middlewareExecutionCount === undefined) {
+          request.middlewareExecutionCount = 1;
+        } else {
+          request.middlewareExecutionCount++;
+        }
+        next();
+      }
+    }
+
+    @Controller()
+    class AbcController {
+      @Get('/a')
+      async a(@Req() request: any) {
+        return this.validateExecutionCount({
+          request,
+          expected: 1,
+        });
+      }
+
+      @Get('/a/b')
+      async ab(@Req() request: any) {
+        return this.validateExecutionCount({
+          request,
+          expected: 1,
+        });
+      }
+
+      @Get('/a/b/c')
+      async abc(@Req() request: any) {
+        return this.validateExecutionCount({
+          request,
+          expected: 1,
+        });
+      }
+
+      @Get('/similar')
+      async withSimilar(@Req() request: any) {
+        return this.validateExecutionCount({
+          request,
+          expected: 1,
+        });
+      }
+
+      @Get('/similar/test')
+      async withSimilarTest(@Req() request: any) {
+        return this.validateExecutionCount({
+          request,
+          expected: 1,
+        });
+      }
+
+      @Get('/similar/:id')
+      async withSimilarId(@Req() request: any) {
+        return this.validateExecutionCount({
+          request,
+          expected: 1,
+        });
+      }
+
+      private validateExecutionCount({
+        request,
+        expected,
+      }: {
+        request: any;
+        expected: number;
+      }) {
+        let actual: number | undefined;
+        actual = request.raw.middlewareExecutionCount;
+        actual ??= 0;
+
+        return {
+          success: actual === expected,
+          actual,
+          expected,
+        };
+      }
+    }
+
+    @Module({
+      controllers: [AbcController],
+    })
+    class TestModule implements NestModule {
+      configure(consumer: MiddlewareConsumer) {
+        consumer.apply(Middleware).forRoutes(AbcController);
+      }
+    }
+
+    beforeEach(async () => {
+      app = (
+        await Test.createTestingModule({
+          imports: [TestModule],
+        }).compile()
+      ).createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+
+      await listenOnLoopback(app);
+    });
+
+    it(`GET forRoutes(/a/b/c)`, () => {
+      return app
+        .inject({
+          method: 'GET',
+          url: '/a/b/c',
+        })
+        .then(({ payload }) => {
+          expect(payload).toEqual(
+            JSON.stringify({
+              success: true,
+              actual: 1,
+              expected: 1,
+            }),
+          );
+        });
+    });
+
+    it(`GET forRoutes(/a/b)`, () => {
+      return app
+        .inject({
+          method: 'GET',
+          url: '/a/b',
+        })
+        .then(({ payload }) =>
+          expect(payload).toEqual(
+            JSON.stringify({
+              success: true,
+              actual: 1,
+              expected: 1,
+            }),
+          ),
+        );
+    });
+
+    it(`GET forRoutes(/a)`, () => {
+      return app
+        .inject({
+          method: 'GET',
+          url: '/a',
+        })
+        .then(({ payload }) =>
+          expect(payload).toEqual(
+            JSON.stringify({
+              success: true,
+              actual: 1,
+              expected: 1,
+            }),
+          ),
+        );
+    });
+
+    it(`GET forRoutes(/similar)`, () => {
+      return app
+        .inject({
+          method: 'GET',
+          url: '/similar',
+        })
+        .then(({ payload }) =>
+          expect(payload).toEqual(
+            JSON.stringify({
+              success: true,
+              actual: 1,
+              expected: 1,
+            }),
+          ),
+        );
+    });
+
+    it(`GET forRoutes(/similar/test)`, () => {
+      return app
+        .inject({
+          method: 'GET',
+          url: '/similar/test',
+        })
+        .then(({ payload }) =>
+          expect(payload).toEqual(
+            JSON.stringify({
+              success: true,
+              actual: 1,
+              expected: 1,
+            }),
+          ),
+        );
+    });
+
+    it(`GET forRoutes(/similar/arbitrary)`, () => {
+      return app
+        .inject({
+          method: 'GET',
+          url: '/similar/arbitrary',
+        })
+        .then(({ payload }) =>
+          expect(payload).toEqual(
+            JSON.stringify({
+              success: true,
+              actual: 1,
+              expected: 1,
+            }),
+          ),
+        );
+    });
+
+    afterEach(async () => {
+      await app.close();
+    });
+  });
+
+  describe('should have data attached in middleware', () => {
+    @Controller()
+    class DataController {
+      @Get('data')
+      async data(@Req() req: FastifyRequest['raw']) {
+        return {
+          success: true,
+          extras: req?.['raw']?.extras,
+          pong: req?.['raw']?.headers?.ping,
+        };
+      }
+      @Get('pong')
+      async pong(@Req() req: FastifyRequest['raw']) {
+        return { success: true, pong: req?.['raw']?.headers?.ping };
+      }
+
+      @Get('')
+      async rootPath(@Req() req: FastifyRequest['raw']) {
+        return { success: true, root: true };
+      }
+
+      @Get('record/:id')
+      async record(@Req() req: FastifyRequest['raw'], @Param('id') id: string) {
+        return { success: true, record: id };
+      }
+    }
+
+    @Module({
+      controllers: [DataController],
+    })
+    class DataModule implements NestModule {
+      configure(consumer: MiddlewareConsumer) {
+        consumer
+          .apply((req, res, next) => {
+            req.extras = { data: 'Data attached in middleware' };
+            req.headers['ping'] = 'pong';
+
+            // When global prefix is set and the route is the root path
+            if (req.originalUrl === '/api') {
+              return res.end(JSON.stringify({ success: true, pong: 'pong' }));
+            }
+            next();
+          })
+          .forRoutes('{*path}');
+      }
+    }
+
+    beforeEach(async () => {
+      app = (
+        await Test.createTestingModule({
+          imports: [DataModule],
+        }).compile()
+      ).createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+    });
+
+    it(`GET forRoutes('{*path}') with global prefix (route: /api/pong)`, async () => {
+      app.setGlobalPrefix('/api');
+      await listenOnLoopback(app);
+      await app.getHttpAdapter().getInstance().ready();
+      return app
+        .inject({
+          method: 'GET',
+          url: '/api/pong',
+        })
+        .then(({ payload }) =>
+          expect(payload).toEqual(
+            JSON.stringify({
+              success: true,
+              pong: 'pong',
+            }),
+          ),
+        );
+    });
+
+    it(`GET forRoutes('{*path}') with global prefix (route: /api)`, async () => {
+      app.setGlobalPrefix('/api');
+      await listenOnLoopback(app);
+      await app.getHttpAdapter().getInstance().ready();
+      return app
+        .inject({
+          method: 'GET',
+          url: '/api',
+        })
+        .then(({ payload }) =>
+          expect(payload).toEqual(
+            JSON.stringify({
+              success: true,
+              pong: 'pong',
+            }),
+          ),
+        );
+    });
+
+    it(`GET forRoutes('{*path}') without prefix config`, async () => {
+      await listenOnLoopback(app);
+      await app.getHttpAdapter().getInstance().ready();
+      return app
+        .inject({
+          method: 'GET',
+          url: '/pong',
+        })
+        .then(({ payload }) =>
+          expect(payload).toEqual(
+            JSON.stringify({
+              success: true,
+              pong: 'pong',
+            }),
+          ),
+        );
+    });
+
+    it(`GET forRoutes('{*path}') with global prefix and exclude patterns`, async () => {
+      app.setGlobalPrefix('/api', { exclude: ['/'] });
+      await listenOnLoopback(app);
+      await app.getHttpAdapter().getInstance().ready();
+
+      await request(app.getHttpServer())
+        .get('/')
+        .expect(200, { success: true, root: true });
+    });
+
+    it(`GET forRoutes('{*path}') with global prefix and exclude pattern with wildcard`, async () => {
+      app.setGlobalPrefix('/api', { exclude: ['/record/{*path}'] });
+      await listenOnLoopback(app);
+      await app.getHttpAdapter().getInstance().ready();
+
+      await request(app.getHttpServer())
+        .get('/api/pong')
+        .expect(200, { success: true, pong: 'pong' });
+      await request(app.getHttpServer())
+        .get('/record/abc123')
+        .expect(200, { success: true, record: 'abc123' });
+    });
+
+    it(`GET forRoutes('{*path}') with global prefix and exclude pattern with parameter`, async () => {
+      app.setGlobalPrefix('/api', { exclude: ['/record/:id'] });
+      await listenOnLoopback(app);
+      await app.getHttpAdapter().getInstance().ready();
+
+      await request(app.getHttpServer())
+        .get('/record/abc123')
+        .expect(200, { success: true, record: 'abc123' });
+      await request(app.getHttpServer())
+        .get('/api/pong')
+        .expect(200, { success: true, pong: 'pong' });
+    });
+
+    it(`GET forRoutes('{*path}') with global prefix and global prefix options`, async () => {
+      app.setGlobalPrefix('/api', { exclude: ['/'] });
+      await listenOnLoopback(app);
+      await app.getHttpAdapter().getInstance().ready();
+
+      await request(app.getHttpServer())
+        .get('/api/data')
+        .expect(200, {
+          success: true,
+          extras: { data: 'Data attached in middleware' },
+          pong: 'pong',
+        });
+      await request(app.getHttpServer())
+        .get('/')
+        .expect(200, { success: true, root: true });
+    });
+
+    it(`GET forRoutes('{*path}') with global prefix that not starts with /`, async () => {
+      app.setGlobalPrefix('api');
+      await listenOnLoopback(app);
+      await app.getHttpAdapter().getInstance().ready();
+
+      await request(app.getHttpServer())
+        .get('/api/data')
+        .expect(200, {
+          success: true,
+          extras: { data: 'Data attached in middleware' },
+          pong: 'pong',
+        });
+      await request(app.getHttpServer()).get('/').expect(404);
+    });
+
+    afterEach(async () => {
+      await app.close();
+    });
+  });
+
+  describe('should run middleware on routes excluded from the global prefix', () => {
+    @Controller()
+    class ExcludedRouteController {
+      @Get('graphql')
+      graphql(@Req() req: FastifyRequest['raw']) {
+        return { success: true, pong: req?.['raw']?.headers?.ping };
+      }
+
+      @Get('data')
+      data(@Req() req: FastifyRequest['raw']) {
+        return { success: true, pong: req?.['raw']?.headers?.ping };
+      }
+    }
+
+    @Module({
+      controllers: [ExcludedRouteController],
+    })
+    class ExcludedRouteModule implements NestModule {
+      configure(consumer: MiddlewareConsumer) {
+        consumer
+          .apply((req, res, next) => {
+            req.headers['ping'] = 'pong';
+            next();
+          })
+          .forRoutes('/{*path}');
+      }
+    }
+
+    beforeEach(async () => {
+      app = (
+        await Test.createTestingModule({
+          imports: [ExcludedRouteModule],
+        }).compile()
+      ).createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+    });
+
+    it(`GET forRoutes('/{*path}') with global prefix and excluded route`, async () => {
+      app.setGlobalPrefix('/api', { exclude: ['/graphql'] });
+      await listenOnLoopback(app);
+      await app.getHttpAdapter().getInstance().ready();
+
+      await request(app.getHttpServer())
+        .get('/graphql')
+        .expect(200, { success: true, pong: 'pong' });
+      await request(app.getHttpServer())
+        .get('/api/data')
+        .expect(200, { success: true, pong: 'pong' });
+    });
+
+    afterEach(async () => {
+      await app.close();
+    });
+  });
+
+  describe('should run middleware once on routes excluded from the global prefix with the root path', () => {
+    @Controller()
+    class CountingController {
+      @Get('metrics')
+      metrics(@Req() req: FastifyRequest) {
+        return { runs: req.raw['runs'] ?? 0 };
+      }
+
+      @Get('data')
+      data(@Req() req: FastifyRequest) {
+        return { runs: req.raw['runs'] ?? 0 };
+      }
+    }
+
+    @Module({
+      controllers: [CountingController],
+    })
+    class CountingModule implements NestModule {
+      configure(consumer: MiddlewareConsumer) {
+        consumer
+          .apply((req, res, next) => {
+            req.runs = (req.runs ?? 0) + 1;
+            next();
+          })
+          .forRoutes('{*path}');
+      }
+    }
+
+    beforeEach(async () => {
+      app = (
+        await Test.createTestingModule({
+          imports: [CountingModule],
+        }).compile()
+      ).createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+    });
+
+    it(`GET forRoutes('{*path}') with the root path and another route excluded from the global prefix`, async () => {
+      app.setGlobalPrefix('/api', { exclude: ['/', 'metrics'] });
+      await listenOnLoopback(app);
+      await app.getHttpAdapter().getInstance().ready();
+
+      await request(app.getHttpServer())
+        .get('/metrics')
+        .expect(200, { runs: 1 });
+      await request(app.getHttpServer())
+        .get('/api/data')
+        .expect(200, { runs: 1 });
+    });
+
+    afterEach(async () => {
+      await app.close();
+    });
+  });
+
+  describe('should respect fastify routing options', () => {
+    const MIDDLEWARE_RETURN_VALUE = 'middleware_return';
+
+    @Controller()
+    class TestController {
+      @Get('abc/def')
+      included() {
+        return 'whatnot';
+      }
+    }
+    @Module({
+      imports: [AppModule],
+      controllers: [TestController],
+    })
+    class TestModule {
+      configure(consumer: MiddlewareConsumer) {
+        consumer
+          .apply((req, res, next) => {
+            // A response to HEAD has no body, so the header tells that the
+            // middleware sent it
+            res.setHeader('x-middleware', 'called');
+            res.end(MIDDLEWARE_RETURN_VALUE);
+          })
+          .forRoutes({ path: 'abc/def', method: RequestMethod.GET });
+      }
+    }
+
+    describe('[ignoreTrailingSlash] attribute', () => {
+      beforeEach(async () => {
+        app = (
+          await Test.createTestingModule({
+            imports: [TestModule],
+          }).compile()
+        ).createNestApplication<NestFastifyApplication>(
+          new FastifyAdapter({
+            ignoreTrailingSlash: true,
+            // routerOptions: {
+            //   ignoreTrailingSlash: true,
+            // },
+          }),
+        );
+
+        await listenOnLoopback(app);
+      });
+
+      it(`GET forRoutes(GET /abc/def/)`, () => {
+        return app
+          .inject({
+            method: 'GET',
+            url: '/abc/def/', // trailing slash
+          })
+          .then(({ payload }) =>
+            expect(payload).toEqual(MIDDLEWARE_RETURN_VALUE),
+          );
+      });
+
+      afterEach(async () => {
+        await app.close();
+      });
+    });
+
+    describe('[ignoreDuplicateSlashes] attribute', () => {
+      beforeEach(async () => {
+        app = (
+          await Test.createTestingModule({
+            imports: [TestModule],
+          }).compile()
+        ).createNestApplication<NestFastifyApplication>(
+          new FastifyAdapter({
+            routerOptions: {
+              ignoreDuplicateSlashes: true,
+            },
+          }),
+        );
+
+        await listenOnLoopback(app);
+      });
+
+      it(`GET forRoutes(GET /abc//def)`, () => {
+        return app
+          .inject({
+            method: 'GET',
+            url: '/abc//def', // duplicate slashes
+          })
+          .then(({ payload }) =>
+            expect(payload).toEqual(MIDDLEWARE_RETURN_VALUE),
+          );
+      });
+
+      afterEach(async () => {
+        await app.close();
+      });
+    });
+
+    describe('[caseSensitive] attribute', () => {
+      beforeEach(async () => {
+        app = (
+          await Test.createTestingModule({
+            imports: [TestModule],
+          }).compile()
+        ).createNestApplication<NestFastifyApplication>(
+          new FastifyAdapter({
+            routerOptions: {
+              caseSensitive: true,
+            },
+          }),
+        );
+
+        await listenOnLoopback(app);
+      });
+
+      it(`GET forRoutes(GET /ABC/DEF)`, () => {
+        return app
+          .inject({
+            method: 'GET',
+            url: '/ABC/DEF', // different case
+          })
+          .then(({ payload }) =>
+            expect(payload).toEqual(MIDDLEWARE_RETURN_VALUE),
+          );
+      });
+
+      afterEach(async () => {
+        await app.close();
+      });
+    });
+
+    describe('[caseSensitive] attribute set to false', () => {
+      @Controller('tasks')
+      class TasksController {
+        @Get()
+        findAll() {
+          return 'tasks';
+        }
+      }
+
+      @Module({
+        controllers: [TasksController],
       })
-      .then(({ payload }) => expect(payload).to.be.eql(WILDCARD_VALUE));
+      class TasksModule {
+        configure(consumer: MiddlewareConsumer) {
+          consumer
+            .apply((req, res, next) => res.end(MIDDLEWARE_RETURN_VALUE))
+            .forRoutes(TasksController);
+        }
+      }
+
+      const createApp = async (adapter: FastifyAdapter) => {
+        app = (
+          await Test.createTestingModule({
+            imports: [TasksModule],
+          }).compile()
+        ).createNestApplication<NestFastifyApplication>(adapter);
+
+        await listenOnLoopback(app);
+      };
+
+      // "%E2%84%AA" (KELVIN SIGN) lower-cases to "k" once decoded, so the
+      // router serves "/tas%E2%84%AAs" with the "/tasks" route
+      it.each(['/TASKS', '/tas%E2%84%AAs'])(
+        'GET forRoutes(TasksController) (%s)',
+        async url => {
+          await createApp(
+            new FastifyAdapter({ routerOptions: { caseSensitive: false } }),
+          );
+
+          const { payload } = await app.inject({ method: 'GET', url });
+          expect(payload).toEqual(MIDDLEWARE_RETURN_VALUE);
+        },
+      );
+
+      it('GET forRoutes(TasksController) (/tas%E2%84%AAs, top-level option)', async () => {
+        await createApp(new FastifyAdapter({ caseSensitive: false }));
+
+        const { payload } = await app.inject({
+          method: 'GET',
+          url: '/tas%E2%84%AAs',
+        });
+        expect(payload).toEqual(MIDDLEWARE_RETURN_VALUE);
+      });
+
+      // The router lower-cases the paths of its routes with "toLowerCase()",
+      // which the "i" flag of a RegExp does not follow for every letter:
+      // "\u0130" lower-cases to "i\u0307" and "\u1E9E" to "\u00DF"
+      it.each([
+        ['\u0130adeler', '/%C4%B0adeler'],
+        ['\u0130adeler', '/i%CC%87adeler'],
+        ['stra\u1E9Ee', '/stra%E1%BA%9Ee'],
+        ['stra\u1E9Ee', '/stra%C3%9Fe'],
+      ])('GET forRoutes(%j) (%s)', async (path, url) => {
+        @Controller(path)
+        class LocalizedController {
+          @Get()
+          findAll() {
+            return 'localized';
+          }
+        }
+
+        @Module({
+          controllers: [LocalizedController],
+        })
+        class LocalizedModule {
+          configure(consumer: MiddlewareConsumer) {
+            consumer
+              .apply((req, res, next) => res.end(MIDDLEWARE_RETURN_VALUE))
+              .forRoutes(LocalizedController);
+          }
+        }
+
+        app = (
+          await Test.createTestingModule({
+            imports: [LocalizedModule],
+          }).compile()
+        ).createNestApplication<NestFastifyApplication>(
+          new FastifyAdapter({ routerOptions: { caseSensitive: false } }),
+        );
+        await listenOnLoopback(app);
+
+        const { payload } = await app.inject({ method: 'GET', url });
+        expect(payload).toEqual(MIDDLEWARE_RETURN_VALUE);
+      });
+
+      afterEach(async () => {
+        await app.close();
+      });
+    });
+
+    describe('[useSemicolonDelimiter] attribute', () => {
+      beforeEach(async () => {
+        app = (
+          await Test.createTestingModule({
+            imports: [TestModule],
+          }).compile()
+        ).createNestApplication<NestFastifyApplication>(
+          new FastifyAdapter({
+            routerOptions: { useSemicolonDelimiter: true } as any,
+          }),
+        );
+
+        await listenOnLoopback(app);
+      });
+
+      it(`GET forRoutes(GET /abc/def;foo=bar)`, () => {
+        return app
+          .inject({
+            method: 'GET',
+            url: '/abc/def;foo=bar', // semicolon delimiter
+          })
+          .then(({ payload }) =>
+            expect(payload).toEqual(MIDDLEWARE_RETURN_VALUE),
+          );
+      });
+
+      afterEach(async () => {
+        await app.close();
+      });
+    });
+
+    describe('HEAD auto-forwarding to GET', () => {
+      beforeEach(async () => {
+        app = (
+          await Test.createTestingModule({
+            imports: [TestModule],
+          }).compile()
+        ).createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+
+        await listenOnLoopback(app);
+      });
+
+      it(`GET forRoutes(HEAD /abc/def)`, () => {
+        return app
+          .inject({
+            method: 'HEAD',
+            url: '/abc/def',
+          })
+          .then(({ headers, payload }) => {
+            expect(headers['x-middleware']).toBe('called');
+            expect(payload).toBe('');
+          });
+      });
+
+      afterEach(async () => {
+        await app.close();
+      });
+    });
   });
 
-  afterEach(async () => {
-    await app.close();
+  describe('should handle exceptions thrown from a middleware', () => {
+    @Injectable()
+    class ThrowingMiddleware implements NestMiddleware {
+      use(
+        req: FastifyRequest['raw'] & { headers: Record<string, unknown> },
+        res,
+        next: () => void,
+      ) {
+        if (req.headers['x-throw'] === 'http-exception') {
+          throw new BadRequestException('middleware rejection');
+        }
+        if (req.headers['x-throw'] === 'unknown-error') {
+          throw new Error('middleware failure');
+        }
+        if (req.headers['x-throw'] === 'error-body') {
+          throw new UnauthorizedException(new Error('invalid signature'));
+        }
+        if (req.headers['x-throw'] === 'unserializable-body') {
+          throw new BadRequestException({ n: 10n });
+        }
+        next();
+      }
+    }
+
+    @Controller('protected')
+    class ProtectedController {
+      @Get()
+      findAll() {
+        return 'protected';
+      }
+    }
+
+    @Module({
+      controllers: [ProtectedController],
+    })
+    class ThrowingMiddlewareModule implements NestModule {
+      configure(consumer: MiddlewareConsumer) {
+        consumer.apply(ThrowingMiddleware).forRoutes(ProtectedController);
+      }
+    }
+
+    beforeEach(async () => {
+      app = (
+        await Test.createTestingModule({
+          imports: [ThrowingMiddlewareModule],
+        }).compile()
+      ).createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+
+      await listenOnLoopback(app);
+      await app.getHttpAdapter().getInstance().ready();
+    });
+
+    it('should send the HttpException response', () => {
+      return request(app.getHttpServer())
+        .get('/protected')
+        .set('x-throw', 'http-exception')
+        .expect(400, {
+          statusCode: 400,
+          message: 'middleware rejection',
+          error: 'Bad Request',
+        });
+    });
+
+    it('should send the internal server error response for unknown errors', () => {
+      return request(app.getHttpServer())
+        .get('/protected')
+        .set('x-throw', 'unknown-error')
+        .expect(500, {
+          statusCode: 500,
+          message: 'Internal server error',
+        });
+    });
+
+    it('should send the status of an HttpException whose body is an Error', () => {
+      return request(app.getHttpServer())
+        .get('/protected')
+        .set('x-throw', 'error-body')
+        .expect(401, {
+          statusCode: 401,
+          message: 'Unauthorized',
+        });
+    });
+
+    // The exception layer fails to serialize the body on the raw response
+    // middleware receives
+    it('should send the internal server error response when the exception layer fails', async () => {
+      await request(app.getHttpServer())
+        .get('/protected')
+        .set('x-throw', 'unserializable-body')
+        .expect(500, {
+          statusCode: 500,
+          message: 'Internal server error',
+        });
+      await request(app.getHttpServer()).get('/protected').expect(200);
+    });
+
+    afterEach(async () => {
+      await app.close();
+    });
+  });
+
+  describe('request target forms', () => {
+    const MIDDLEWARE_RETURN_VALUE = 'middleware_return';
+    const HANDLER_RETURN_VALUE = 'handler_return';
+
+    @Controller('users')
+    class UsersController {
+      @Get()
+      findAll() {
+        return HANDLER_RETURN_VALUE;
+      }
+    }
+
+    @Controller()
+    class RootController {
+      @Get()
+      root() {
+        return HANDLER_RETURN_VALUE;
+      }
+    }
+
+    @Module({
+      controllers: [UsersController, RootController],
+    })
+    class AbsoluteFormModule implements NestModule {
+      configure(consumer: MiddlewareConsumer) {
+        consumer
+          .apply((req, res, next) => res.end(MIDDLEWARE_RETURN_VALUE))
+          .forRoutes({ path: 'users', method: RequestMethod.GET });
+      }
+    }
+
+    let port: number;
+
+    /**
+     * "supertest" and "light-my-request" always send origin-form request
+     * targets, so the request has to be written to the socket manually.
+     */
+    const sendRawRequest = (requestTarget: string, method = 'GET') =>
+      new Promise<{ statusCode: number; body: string }>((resolve, reject) => {
+        let response = '';
+        const socket = connect(port, '127.0.0.1', () => {
+          socket.write(
+            `${method} ${requestTarget} HTTP/1.1\r\n` +
+              `Host: 127.0.0.1:${port}\r\n` +
+              `Connection: close\r\n\r\n`,
+          );
+        });
+        socket.setEncoding('utf8');
+        socket.on('data', chunk => (response += chunk));
+        socket.on('error', reject);
+        socket.on('end', () => {
+          const [head, body = ''] = response.split('\r\n\r\n');
+          resolve({ statusCode: Number(head.split(' ')[1]), body });
+        });
+      });
+
+    const createApp = async (adapter: FastifyAdapter) => {
+      app = (
+        await Test.createTestingModule({
+          imports: [AbsoluteFormModule],
+        }).compile()
+      ).createNestApplication<NestFastifyApplication>(adapter);
+
+      await listenOnLoopback(app);
+      port = (app.getHttpServer().address() as AddressInfo).port;
+    };
+
+    afterEach(async () => {
+      await app.close();
+    });
+
+    it('runs middleware for an origin-form request target', async () => {
+      await createApp(new FastifyAdapter());
+
+      const response = await sendRawRequest('/users');
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toBe(MIDDLEWARE_RETURN_VALUE);
+    });
+
+    it('does not bypass middleware with an absolute-form request target', async () => {
+      await createApp(new FastifyAdapter());
+
+      const response = await sendRawRequest(`http://127.0.0.1:${port}/users`);
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toBe(MIDDLEWARE_RETURN_VALUE);
+    });
+
+    it('does not bypass middleware with an absolute-form request target and router normalization options', async () => {
+      await createApp(
+        new FastifyAdapter({
+          ignoreDuplicateSlashes: true,
+          ignoreTrailingSlash: true,
+          caseSensitive: false,
+        }),
+      );
+
+      const response = await sendRawRequest(`HTTP://127.0.0.1:${port}//USERS/`);
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toBe(MIDDLEWARE_RETURN_VALUE);
+    });
+
+    it('answers an absolute-form request target whose query precedes a "/" with the not-found handler', async () => {
+      await createApp(new FastifyAdapter());
+
+      const response = await sendRawRequest(`http://127.0.0.1:${port}?a/users`);
+      expect(response.statusCode).toBe(404);
+      expect(JSON.parse(response.body)).toEqual({
+        message: `Cannot GET http://127.0.0.1:${port}?a/users`,
+        error: 'Not Found',
+        statusCode: 404,
+      });
+    });
+
+    it('does not run the route without its middleware for a request target starting with "*"', async () => {
+      await createApp(new FastifyAdapter());
+
+      const response = await sendRawRequest('*users');
+      expect(response.statusCode).toBe(400);
+      expect(JSON.parse(response.body)).toMatchObject({
+        code: 'FST_ERR_BAD_URL',
+        statusCode: 400,
+      });
+    });
+
+    it('answers "OPTIONS *" with the not-found handler', async () => {
+      await createApp(new FastifyAdapter());
+
+      const response = await sendRawRequest('*', 'OPTIONS');
+      expect(response.statusCode).toBe(404);
+      expect(JSON.parse(response.body)).toEqual({
+        message: 'Cannot OPTIONS *',
+        error: 'Not Found',
+        statusCode: 404,
+      });
+    });
+  });
+
+  /**
+   * The Fastify router matches an empty path segment for a route parameter
+   * ("/users//profile" -> { id: "" }), while middleware paths (like Express
+   * routes) need at least one character per parameter. For route and
+   * middleware matching to agree, such a request is answered with 404, as
+   * with the ExpressAdapter.
+   */
+  describe('empty route parameters', () => {
+    const MIDDLEWARE_RETURN_VALUE = 'middleware_return';
+    const handlerCalls: string[] = [];
+
+    @Controller('users')
+    class UsersController {
+      @Get(':id')
+      findOne(@Param('id') id: string) {
+        handlerCalls.push(`findOne:${id}`);
+        return `user:${id}`;
+      }
+
+      @Get(':id/profile')
+      profile(@Param('id') id: string) {
+        handlerCalls.push(`profile:${id}`);
+        return `profile:${id}`;
+      }
+    }
+
+    @Controller('ranges')
+    class RangesController {
+      @Get(':from-:to')
+      range(@Param('from') from: string, @Param('to') to: string) {
+        handlerCalls.push(`range:${from}-${to}`);
+        return `range:${from}-${to}`;
+      }
+    }
+
+    @Controller('actions')
+    class ActionsController {
+      @All(':id/run')
+      run(@Param('id') id: string) {
+        handlerCalls.push(`run:${id}`);
+        return `run:${id}`;
+      }
+    }
+
+    @Controller({ path: 'versioned', version: '1' })
+    class VersionedController {
+      @Get(':id/profile')
+      profile(@Param('id') id: string) {
+        handlerCalls.push(`versioned:${id}`);
+        return `versioned:${id}`;
+      }
+    }
+
+    @Controller('files')
+    class FilesController {
+      @Get('*')
+      findAll() {
+        handlerCalls.push('files');
+        return 'files';
+      }
+    }
+
+    // The router reads ":lat,:lng" as one parameter
+    @Controller('geo')
+    class GeoController {
+      @Get(':lat,:lng')
+      find() {
+        handlerCalls.push('geo');
+        return 'geo';
+      }
+    }
+
+    // Both parameters have the same name: the handler gets the last value
+    @Controller('projects/:id/tasks')
+    class TasksController {
+      @Get(':id')
+      findOne(@Param('id') id: string) {
+        handlerCalls.push(`task:${id}`);
+        return `task:${id}`;
+      }
+    }
+
+    @Module({
+      controllers: [
+        UsersController,
+        RangesController,
+        ActionsController,
+        VersionedController,
+        FilesController,
+        TasksController,
+        GeoController,
+      ],
+    })
+    class EmptyRouteParamsModule implements NestModule {
+      configure(consumer: MiddlewareConsumer) {
+        consumer
+          .apply((req, res, next) => res.end(MIDDLEWARE_RETURN_VALUE))
+          .forRoutes(
+            UsersController,
+            RangesController,
+            ActionsController,
+            VersionedController,
+            TasksController,
+            GeoController,
+          );
+      }
+    }
+
+    const createApp = async (
+      adapter = new FastifyAdapter(),
+      globalPrefix?: string,
+    ) => {
+      app = (
+        await Test.createTestingModule({
+          imports: [EmptyRouteParamsModule],
+        }).compile()
+      ).createNestApplication<NestFastifyApplication>(adapter);
+      if (globalPrefix) {
+        app.setGlobalPrefix(globalPrefix);
+      }
+      app.enableVersioning({
+        type: VersioningType.HEADER,
+        header: 'X-API-Version',
+      });
+      await listenOnLoopback(app);
+    };
+
+    const expectNotFound = async (
+      method: 'GET' | 'HEAD' | 'POST',
+      url: string,
+      headers: Record<string, string> = {},
+    ) => {
+      const response = await app.inject({ method, url, headers });
+      expect(response.statusCode).toBe(404);
+      expect(handlerCalls).toEqual([]);
+      return response;
+    };
+
+    beforeEach(() => {
+      handlerCalls.length = 0;
+    });
+
+    afterEach(async () => {
+      await app.close();
+    });
+
+    it('runs middleware for a non-empty route parameter', async () => {
+      await createApp();
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/users/1/profile',
+      });
+      expect(response.payload).toBe(MIDDLEWARE_RETURN_VALUE);
+      expect(handlerCalls).toEqual([]);
+    });
+
+    it('responds with 404 to an empty route parameter in the middle of the path', async () => {
+      await createApp();
+
+      const response = await expectNotFound('GET', '/users//profile');
+      expect(JSON.parse(response.payload)).toEqual({
+        statusCode: 404,
+        error: 'Not Found',
+        message: 'Cannot GET /users//profile',
+      });
+    });
+
+    it('responds with 404 to an empty route parameter at the end of the path', async () => {
+      await createApp();
+
+      await expectNotFound('GET', '/users/');
+    });
+
+    it('responds with 404 to an empty route parameter in the HEAD route generated for a GET route', async () => {
+      await createApp();
+
+      await expectNotFound('HEAD', '/users//profile');
+    });
+
+    it('responds with 404 to an empty route parameter in a multi-parameter segment', async () => {
+      await createApp();
+
+      const response = await app.inject({ method: 'GET', url: '/ranges/a-b' });
+      expect(response.payload).toBe(MIDDLEWARE_RETURN_VALUE);
+
+      await expectNotFound('GET', '/ranges/-b');
+      await expectNotFound('GET', '/ranges/a-');
+    });
+
+    it('responds with 404 to an empty value of a repeated route parameter name', async () => {
+      await createApp();
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/projects/1/tasks/5',
+      });
+      expect(response.payload).toBe(MIDDLEWARE_RETURN_VALUE);
+
+      await expectNotFound('GET', '/projects//tasks/5');
+      await expectNotFound('HEAD', '/projects//tasks/5');
+      await expectNotFound('GET', '/projects/1/tasks/');
+    });
+
+    it('responds with 404 to an empty value of a parameter name repeated by the global prefix', async () => {
+      await createApp(new FastifyAdapter(), 'tenants/:id');
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/tenants/1/users/5',
+      });
+      expect(response.payload).toBe(MIDDLEWARE_RETURN_VALUE);
+
+      await expectNotFound('GET', '/tenants//users/5');
+    });
+
+    it('responds with 404 to a request a route path read otherwise by the router does not match', async () => {
+      await createApp();
+
+      const response = await app.inject({ method: 'GET', url: '/geo/1,2' });
+      expect(response.payload).toBe(MIDDLEWARE_RETURN_VALUE);
+
+      await expectNotFound('GET', '/geo/12');
+    });
+
+    it('responds with 404 to an empty route parameter of an @All() route', async () => {
+      await createApp();
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/actions/1/run',
+      });
+      expect(response.payload).toBe(MIDDLEWARE_RETURN_VALUE);
+
+      await expectNotFound('GET', '/actions//run');
+      await expectNotFound('POST', '/actions//run');
+    });
+
+    it('responds with 404 to an empty route parameter of a versioned route', async () => {
+      await createApp();
+      const headers = { 'X-API-Version': '1' };
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/versioned/1/profile',
+        headers,
+      });
+      expect(response.payload).toBe(MIDDLEWARE_RETURN_VALUE);
+
+      await expectNotFound('GET', '/versioned//profile', headers);
+      await expectNotFound('HEAD', '/versioned//profile', headers);
+    });
+
+    it('matches an empty wildcard', async () => {
+      await createApp();
+
+      const response = await app.inject({ method: 'GET', url: '/files/' });
+      expect(response.statusCode).toBe(200);
+      expect(response.payload).toBe('files');
+    });
+
+    it('responds with 404 to an empty route parameter followed by an ignored trailing slash', async () => {
+      await createApp(
+        new FastifyAdapter({ routerOptions: { ignoreTrailingSlash: true } }),
+      );
+
+      const response = await app.inject({ method: 'GET', url: '/users/1/' });
+      expect(response.payload).toBe(MIDDLEWARE_RETURN_VALUE);
+
+      await expectNotFound('GET', '/users//');
+    });
   });
 });

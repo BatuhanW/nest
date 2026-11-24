@@ -1,0 +1,1006 @@
+import { inspect, InspectOptions } from 'util';
+import { Injectable, Optional } from '../decorators/core/index.js';
+import { clc, yellow, isColorAllowed } from '../utils/cli-colors.util.js';
+import {
+  isFunction,
+  isObject,
+  isPlainObject,
+  isString,
+  isUndefined,
+} from '../utils/shared.utils.js';
+import { LoggerService, LogLevel } from './logger.service.js';
+import {
+  getEnvLogLevels,
+  LOG_LEVEL_ENV_VAR,
+} from './utils/get-env-log-levels.util.js';
+import { isLogLevelEnabled } from './utils/is-log-level-enabled.util.js';
+import { createRedactor, Redactor } from './utils/redact.util.js';
+
+const DEFAULT_DEPTH = 5;
+/**
+ * How many levels of nested errors (`cause`, `AggregateError#errors`) are
+ * serialized in JSON mode.
+ */
+const MAX_ERROR_DEPTH = 5;
+/**
+ * The approximate number of characters up to which a record is serialized in
+ * JSON mode. An object is written out once per reference to it, so a small
+ * value can expand to a huge record; past this length, objects and strings
+ * are replaced with "[Truncated]".
+ */
+const MAX_JSON_LENGTH = 1_000_000;
+
+/**
+ * @publicApi
+ */
+export interface ConsoleLoggerOptions {
+  /**
+   * Enabled log levels.
+   * When not set, the levels are read from the `NEST_LOG_LEVEL` environment
+   * variable (e.g. `warn`, `>=debug` or `warn,error`) the first time the
+   * logger checks a level. Without it, every level is enabled.
+   */
+  logLevels?: LogLevel[];
+  /**
+   * If enabled, will print timestamp (time difference) between current and previous log message.
+   * Note: This option is not used when `json` is enabled.
+   */
+  timestamp?: boolean;
+  /**
+   * A prefix to be used for each log message.
+   * Note: This option is not used when `json` is enabled.
+   */
+  prefix?: string;
+  /**
+   * If enabled, will print the log message in JSON format.
+   * Unless `colors` are enabled or `compact` is not true, a record is cut short
+   * at about 1,000,000 characters: what comes past that point is replaced with
+   * "[Truncated]".
+   */
+  json?: boolean;
+  /**
+   * If enabled, will print the log message in color.
+   * Default true if json is disabled, false otherwise
+   */
+  colors?: boolean;
+  /**
+   * The context of the logger.
+   */
+  context?: string;
+  /**
+   * If enabled, will force the use of console.log/console.error instead of process.stdout/stderr.write.
+   * This is useful for test environments like Jest that can buffer console calls.
+   * @default false
+   */
+  forceConsole?: boolean;
+  /**
+   * If enabled, will print the log message in a single line, even if it is an object with multiple properties.
+   * If set to a number, the most n inner elements are united on a single line as long as all properties fit into breakLength. Short array elements are also grouped together.
+   * Default true when `json` is enabled, false otherwise.
+   */
+  compact?: boolean | number;
+  /**
+   * Specifies the maximum number of Array, TypedArray, Map, Set, WeakMap, and WeakSet elements to include when formatting.
+   * Set to null or Infinity to show all elements. Set to 0 or negative to show no elements.
+   * When `json` is enabled, colors are disabled, and `compact` is set to true, only applies to Map, Set and Error values, which are inspected; everything else is serialized as JSON.
+   * @default 100
+   */
+  maxArrayLength?: number;
+  /**
+   * Specifies the maximum number of characters to include when formatting.
+   * Set to null or Infinity to show all elements. Set to 0 or negative to show no characters.
+   * When `json` is enabled, colors are disabled, and `compact` is set to true, only applies to Map, Set and Error values, which are inspected; everything else is serialized as JSON.
+   * @default 10000.
+   */
+  maxStringLength?: number;
+  /**
+   * If enabled, will sort keys while formatting objects.
+   * Can also be a custom sorting function.
+   * When `json` is enabled, colors are disabled, and `compact` is set to true, only applies to Map, Set and Error values, which are inspected; everything else is serialized as JSON.
+   * @default false
+   */
+  sorted?: boolean | ((a: string, b: string) => number);
+  /**
+   * Specifies the number of times to recurse while formatting object.
+   * This is useful for inspecting large objects. To recurse up to the maximum call stack size pass Infinity or null.
+   * When `json` is enabled, colors are disabled, and `compact` is set to true, only applies to Map, Set and Error values, which are inspected; everything else is serialized as JSON.
+   * @default 5
+   */
+  depth?: number | null;
+  /**
+   * If true, object's non-enumerable symbols and properties are included in the formatted result.
+   * WeakMap and WeakSet entries are also included as well as user defined prototype properties
+   * @default false
+   */
+  showHidden?: boolean;
+  /**
+   * The length at which input values are split across multiple lines. Set to Infinity to format the input as a single line (in combination with "compact" set to true).
+   * Default Infinity when "compact" is enabled, or when colors are off and "compact" isn't explicitly false; 80 otherwise.
+   * When `json` is enabled, colors are disabled, and `compact` is set to true, only applies to Map, Set and Error values, which are inspected; everything else is serialized as JSON.
+   */
+  breakLength?: number;
+  /**
+   * If enabled, plain objects passed after the message are treated as structured
+   * metadata (params) attached to the log entry, instead of being logged as
+   * separate messages.
+   * @default true
+   */
+  structuredParams?: boolean;
+  /**
+   * When true and `json` mode is enabled, structured params are spread into the root JSON object
+   * instead of being nested under a `params` key.
+   * Requires `structuredParams` to be enabled.
+   * @default false
+   */
+  flattenParams?: boolean;
+  /**
+   * Properties to mask in logged values, as key names (`'password'`, matched
+   * at any depth) or dotted paths (`'user.password'`, matched by the last
+   * keys leading to the property, at any depth). Keys are compared
+   * case-insensitively, and array indices are skipped.
+   * Applies to structured params and to messages that are not strings
+   * (objects, arrays, errors), in text and JSON mode. String messages, the
+   * error message and the stack trace are printed as is.
+   * The logged values are not mutated: only the objects that contain a
+   * matching property are copied.
+   * Pass an object to replace the default censor (`"[REDACTED]"`).
+   */
+  redact?: string[] | { paths: string[]; censor?: string };
+}
+
+const DEFAULT_LOG_LEVELS: LogLevel[] = [
+  'log',
+  'error',
+  'warn',
+  'debug',
+  'verbose',
+  'fatal',
+];
+
+/**
+ * The last invalid `NEST_LOG_LEVEL` value that was reported, so that loggers
+ * sharing the environment warn about it once.
+ */
+let reportedInvalidEnvLogLevel: string | undefined;
+
+const dateTimeFormatter = new Intl.DateTimeFormat(undefined, {
+  year: 'numeric',
+  hour: 'numeric',
+  minute: 'numeric',
+  second: 'numeric',
+  day: '2-digit',
+  month: '2-digit',
+});
+
+/**
+ * @publicApi
+ */
+@Injectable()
+export class ConsoleLogger implements LoggerService {
+  /**
+   * The options of the logger.
+   */
+  protected options: ConsoleLoggerOptions;
+  /**
+   * The context of the logger (can be set manually or automatically inferred).
+   */
+  protected context?: string;
+  /**
+   * The original context of the logger (set in the constructor).
+   */
+  protected originalContext?: string;
+  /**
+   * The options used for the "inspect" method.
+   */
+  protected inspectOptions: InspectOptions;
+  /**
+   * The last timestamp at which the log message was printed.
+   */
+  protected static lastTimestampAt?: number;
+  /**
+   * Masks the properties set in the `redact` option.
+   */
+  private readonly redactor?: Redactor;
+
+  constructor();
+  constructor(context: string);
+  constructor(options: ConsoleLoggerOptions);
+  constructor(context: string, options: ConsoleLoggerOptions);
+  constructor(
+    @Optional()
+    contextOrOptions?: string | ConsoleLoggerOptions,
+    @Optional()
+    options?: ConsoleLoggerOptions,
+  ) {
+    // eslint-disable-next-line prefer-const
+    let [context, opts] = isString(contextOrOptions)
+      ? [contextOrOptions, options]
+      : options
+        ? [undefined, options]
+        : [contextOrOptions?.context, contextOrOptions];
+
+    opts = { ...opts };
+    opts.colors ??= opts.colors ?? (opts.json ? false : isColorAllowed());
+    opts.prefix ??= 'Nest';
+
+    this.options = opts;
+    this.inspectOptions = this.getInspectOptions();
+    if (opts.redact) {
+      this.redactor = Array.isArray(opts.redact)
+        ? createRedactor(opts.redact)
+        : createRedactor(opts.redact.paths, opts.redact.censor);
+    }
+
+    if (context) {
+      this.context = context;
+      this.originalContext = context;
+    }
+  }
+
+  /**
+   * Write a 'log' level log, if the configured level allows for it.
+   * Prints to `stdout` with newline.
+   */
+  log(message: any, context?: string): void;
+  log(message: any, ...optionalParams: [...any, string?]): void;
+  log(message: any, ...optionalParams: any[]) {
+    if (!this.isLevelEnabled('log')) {
+      return;
+    }
+    const { messages, context, params } = this.getContextAndMessagesToPrint([
+      message,
+      ...optionalParams,
+    ]);
+    this.printMessages(messages, context, 'log', 'stdout', undefined, params);
+  }
+
+  /**
+   * Write an 'error' level log, if the configured level allows for it.
+   * Prints to `stderr` with newline.
+   */
+  error(message: any, stackOrContext?: string): void;
+  error(message: any, stack?: string, context?: string): void;
+  error(message: any, ...optionalParams: [...any, string?, string?]): void;
+  error(message: any, ...optionalParams: any[]) {
+    if (!this.isLevelEnabled('error')) {
+      return;
+    }
+    const { messages, context, stack, params } =
+      this.getContextAndStackAndMessagesToPrint([message, ...optionalParams]);
+
+    this.printMessages(messages, context, 'error', 'stderr', stack, params);
+    this.printStackTrace(stack!);
+  }
+
+  /**
+   * Write a 'warn' level log, if the configured level allows for it.
+   * Prints to `stdout` with newline.
+   */
+  warn(message: any, context?: string): void;
+  warn(message: any, ...optionalParams: [...any, string?]): void;
+  warn(message: any, ...optionalParams: any[]) {
+    if (!this.isLevelEnabled('warn')) {
+      return;
+    }
+    const { messages, context, params } = this.getContextAndMessagesToPrint([
+      message,
+      ...optionalParams,
+    ]);
+    this.printMessages(messages, context, 'warn', 'stdout', undefined, params);
+  }
+
+  /**
+   * Write a 'debug' level log, if the configured level allows for it.
+   * Prints to `stdout` with newline.
+   */
+  debug(message: any, context?: string): void;
+  debug(message: any, ...optionalParams: [...any, string?]): void;
+  debug(message: any, ...optionalParams: any[]) {
+    if (!this.isLevelEnabled('debug')) {
+      return;
+    }
+    const { messages, context, params } = this.getContextAndMessagesToPrint([
+      message,
+      ...optionalParams,
+    ]);
+    this.printMessages(messages, context, 'debug', 'stdout', undefined, params);
+  }
+
+  /**
+   * Write a 'verbose' level log, if the configured level allows for it.
+   * Prints to `stdout` with newline.
+   */
+  verbose(message: any, context?: string): void;
+  verbose(message: any, ...optionalParams: [...any, string?]): void;
+  verbose(message: any, ...optionalParams: any[]) {
+    if (!this.isLevelEnabled('verbose')) {
+      return;
+    }
+    const { messages, context, params } = this.getContextAndMessagesToPrint([
+      message,
+      ...optionalParams,
+    ]);
+    this.printMessages(
+      messages,
+      context,
+      'verbose',
+      'stdout',
+      undefined,
+      params,
+    );
+  }
+
+  /**
+   * Write a 'fatal' level log, if the configured level allows for it.
+   * Prints to `stderr` with newline.
+   */
+  fatal(message: any, stackOrContext?: string): void;
+  fatal(message: any, stack?: string, context?: string): void;
+  fatal(message: any, ...optionalParams: [...any, string?, string?]): void;
+  fatal(message: any, ...optionalParams: any[]) {
+    if (!this.isLevelEnabled('fatal')) {
+      return;
+    }
+    const { messages, context, stack, params } =
+      this.getContextAndStackAndMessagesToPrint([message, ...optionalParams]);
+
+    this.printMessages(messages, context, 'fatal', 'stderr', stack, params);
+    this.printStackTrace(stack!);
+  }
+
+  /**
+   * Set log levels
+   * @param levels log levels
+   */
+  setLogLevels(levels: LogLevel[]) {
+    if (!this.options) {
+      this.options = {};
+    }
+    this.options.logLevels = levels;
+  }
+
+  /**
+   * Set logger context
+   * @param context context
+   */
+  setContext(context: string) {
+    this.context = context;
+  }
+
+  /**
+   * Resets the logger context to the value that was passed in the constructor.
+   */
+  resetContext() {
+    this.context = this.originalContext;
+  }
+
+  isLevelEnabled(level: LogLevel): boolean {
+    if (this.options && !this.options.logLevels) {
+      this.options.logLevels = this.getDefaultLogLevels();
+    }
+    const logLevels = this.options?.logLevels;
+    return isLogLevelEnabled(level, logLevels);
+  }
+
+  /**
+   * Returns the levels used when none were passed to the constructor: the
+   * `NEST_LOG_LEVEL` environment variable if it is set, every level otherwise.
+   * Called on the first level check rather than in the constructor, so that
+   * the default logger also sees variables loaded after "@nestjs/common" was
+   * imported (for example, from a `.env` file).
+   */
+  protected getDefaultLogLevels(): LogLevel[] {
+    const envLogLevels = getEnvLogLevels();
+    if (envLogLevels !== false) {
+      return envLogLevels ?? DEFAULT_LOG_LEVELS;
+    }
+    const value = process.env[LOG_LEVEL_ENV_VAR]!;
+    if (reportedInvalidEnvLogLevel !== value) {
+      reportedInvalidEnvLogLevel = value;
+      // The default levels must be in place before this call, as "warn"
+      // checks the level again.
+      this.options.logLevels = DEFAULT_LOG_LEVELS;
+      this.warn(
+        `Invalid ${LOG_LEVEL_ENV_VAR} value "${value}". Expected a log level ("warn"), a comma-separated list ("warn,error") or a threshold (">=warn"). Every log level is enabled instead.`,
+        'ConsoleLogger',
+      );
+    }
+    return DEFAULT_LOG_LEVELS;
+  }
+
+  protected getTimestamp(): string {
+    return dateTimeFormatter.format(Date.now());
+  }
+
+  protected printMessages(
+    messages: unknown[],
+    context = '',
+    logLevel: LogLevel = 'log',
+    writeStreamType?: 'stdout' | 'stderr',
+    errorStack?: unknown,
+    params?: Record<string, any>,
+  ) {
+    if (this.redactor) {
+      messages = messages.map(message =>
+        this.redact(this.resolveMessage(message)),
+      );
+      params = params && (this.redact(params) as Record<string, any>);
+    }
+    if (this.options.json) {
+      const { messages: jsonMessages, error } = this.extractJsonError(
+        messages.map(message => this.resolveMessage(message)),
+      );
+      jsonMessages.forEach((message, index) => {
+        this.printAsJson(message, {
+          context,
+          logLevel,
+          writeStreamType,
+          errorStack,
+          params,
+          // The error belongs to the first record (the log message).
+          error: index === 0 ? error : undefined,
+        });
+      });
+      return;
+    }
+    messages.forEach(message => {
+      const pidMessage = this.formatPid(process.pid);
+      const contextMessage = this.formatContext(context);
+      const timestampDiff = this.updateAndGetTimestampDiff();
+      const formattedLogLevel = logLevel.toUpperCase().padStart(7, ' ');
+      const formattedMessage = this.formatMessage(
+        logLevel,
+        message,
+        pidMessage,
+        formattedLogLevel,
+        contextMessage,
+        timestampDiff,
+        params,
+      );
+
+      if (this.options.forceConsole) {
+        if (writeStreamType === 'stderr') {
+          console.error(formattedMessage.trim());
+        } else {
+          console.log(formattedMessage.trim());
+        }
+      } else {
+        process[writeStreamType ?? 'stdout'].write(formattedMessage);
+      }
+    });
+  }
+
+  protected printAsJson(
+    message: unknown,
+    options: {
+      context: string;
+      logLevel: LogLevel;
+      writeStreamType?: 'stdout' | 'stderr';
+      errorStack?: unknown;
+      params?: Record<string, any>;
+      error?: Error;
+    },
+  ) {
+    const logObject = this.getJsonLogObject(message, options);
+    const formattedMessage =
+      !this.options.colors && this.inspectOptions.compact === true
+        ? this.stringifyJsonLogObject(logObject)
+        : inspect(logObject, this.inspectOptions);
+    if (this.options.forceConsole) {
+      if (options.writeStreamType === 'stderr') {
+        console.error(formattedMessage);
+      } else {
+        console.log(formattedMessage);
+      }
+    } else {
+      process[options.writeStreamType ?? 'stdout'].write(
+        `${formattedMessage}\n`,
+      );
+    }
+  }
+
+  protected getJsonLogObject(
+    message: unknown,
+    options: {
+      context: string;
+      logLevel: LogLevel;
+      writeStreamType?: 'stdout' | 'stderr';
+      errorStack?: unknown;
+      params?: Record<string, any>;
+      error?: Error;
+    },
+  ) {
+    type JsonLogObject = {
+      level: LogLevel;
+      pid: number;
+      timestamp: number;
+      message: unknown;
+      context?: string;
+      stack?: unknown;
+      error?: Record<string, unknown>;
+      params?: Record<string, any>;
+      [key: string]: unknown;
+    };
+
+    const logObject: JsonLogObject = {
+      level: options.logLevel,
+      pid: process.pid,
+      timestamp: Date.now(),
+      message,
+    };
+
+    if (options.context) {
+      logObject.context = options.context;
+    }
+
+    if (options.errorStack) {
+      logObject.stack = options.errorStack;
+    }
+
+    if (options.error) {
+      logObject.error = this.serializeError(options.error);
+    }
+
+    if (options.params) {
+      if (this.options.flattenParams && isPlainObject(options.params)) {
+        // Framework fields win on key collisions: a param named "message" or
+        // "level" must not clobber the actual log message or severity.
+        for (const [key, value] of Object.entries(options.params)) {
+          if (!Object.hasOwn(logObject, key)) {
+            logObject[key] = value;
+          }
+        }
+      } else {
+        logObject.params = options.params;
+      }
+    }
+
+    return logObject;
+  }
+
+  /**
+   * Pulls the first `Error` out of the messages so that it can be attached to
+   * the log record as a structured `error` field instead of being printed as
+   * a separate record. When the error is the message itself, the record's
+   * message becomes the error's message.
+   */
+  protected extractJsonError(messages: unknown[]): {
+    messages: unknown[];
+    error?: Error;
+  } {
+    const errorIndex = messages.findIndex(message => message instanceof Error);
+    if (errorIndex === -1) {
+      return { messages };
+    }
+    const error = messages[errorIndex] as Error;
+    const remainingMessages =
+      errorIndex === 0
+        ? [error.message, ...messages.slice(1)]
+        : messages.filter((_, index) => index !== errorIndex);
+    return { messages: remainingMessages, error };
+  }
+
+  /**
+   * Converts an error into a plain object: `name`, `message`, `stack`, own
+   * primitive properties (e.g. `code`), and, recursively, `cause` and the
+   * `errors` of an `AggregateError`, up to a fixed depth.
+   */
+  protected serializeError(
+    error: Error,
+    depth = 0,
+    ancestors = new Set<Error>(),
+  ): Record<string, unknown> {
+    const serialized: Record<string, unknown> = {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+    };
+    for (const [key, value] of Object.entries(error)) {
+      if (key in serialized || key === 'cause' || key === 'errors') {
+        continue;
+      }
+      const isPrimitive =
+        value === null ||
+        (typeof value !== 'object' && typeof value !== 'function');
+      if (isPrimitive) {
+        serialized[key] = value;
+      }
+    }
+
+    const serializeNested = (value: unknown) => {
+      if (!(value instanceof Error)) {
+        return value;
+      }
+      if (ancestors.has(value)) {
+        return '[Circular]';
+      }
+      if (depth + 1 > MAX_ERROR_DEPTH) {
+        return '[Truncated]';
+      }
+      return this.serializeError(value, depth + 1, ancestors);
+    };
+
+    ancestors.add(error);
+    if (error.cause !== undefined) {
+      serialized.cause = serializeNested(error.cause);
+    }
+    const errors = (error as Partial<AggregateError>).errors;
+    if (Array.isArray(errors)) {
+      serialized.errors = errors.map(serializeNested);
+    }
+    ancestors.delete(error);
+
+    return serialized;
+  }
+
+  /**
+   * Masks the properties set in the `redact` option. Returns the value itself
+   * when the option isn't set or nothing matched.
+   */
+  protected redact(value: unknown): unknown {
+    return this.redactor ? this.redactor(value) : value;
+  }
+
+  protected formatPid(pid: number) {
+    return `[${this.options.prefix}] ${pid}  - `;
+  }
+
+  protected formatContext(context: string): string {
+    if (!context) {
+      return '';
+    }
+
+    context = `[${context}] `;
+    return this.options.colors ? yellow(context) : context;
+  }
+
+  protected formatMessage(
+    logLevel: LogLevel,
+    message: unknown,
+    pidMessage: string,
+    formattedLogLevel: string,
+    contextMessage: string,
+    timestampDiff: string,
+    params?: Record<string, any>,
+  ) {
+    const output = this.stringifyMessage(message, logLevel);
+    pidMessage = this.colorize(pidMessage, logLevel);
+    formattedLogLevel = this.colorize(formattedLogLevel, logLevel);
+    const paramsOutput = params ? ` ${this.stringifyParams(params)}` : '';
+    return `${pidMessage}${this.getTimestamp()} ${formattedLogLevel} ${contextMessage}${output}${paramsOutput}${timestampDiff}\n`;
+  }
+
+  protected stringifyParams(params: Record<string, any>): string {
+    return inspect(params, {
+      ...this.inspectOptions,
+      compact: true,
+      breakLength: Infinity,
+    });
+  }
+
+  /**
+   * Resolves a message passed as a function: a class resolves to its name,
+   * any other function is called (lazy message) and its result re-resolved.
+   */
+  protected resolveMessage(message: unknown): unknown {
+    if (isFunction(message)) {
+      const messageAsStr = Function.prototype.toString.call(message);
+      const isClass = messageAsStr.startsWith('class ');
+      if (isClass) {
+        // If the message is a class, we will display the class name.
+        return message.name;
+      }
+      // If the message is a non-class function, call it and re-resolve its value.
+      return this.resolveMessage(message());
+    }
+    return message;
+  }
+
+  protected stringifyMessage(message: unknown, logLevel: LogLevel) {
+    message = this.resolveMessage(message);
+
+    if (typeof message === 'string') {
+      return this.colorize(message, logLevel);
+    }
+
+    const outputText = inspect(message, this.inspectOptions);
+    if (isPlainObject(message)) {
+      return `Object(${Object.keys(message).length}) ${outputText}`;
+    }
+    if (Array.isArray(message)) {
+      return `Array(${message.length}) ${outputText}`;
+    }
+    return outputText;
+  }
+
+  protected colorize(message: string, logLevel: LogLevel) {
+    if (!this.options.colors || this.options.json) {
+      return message;
+    }
+    const color = this.getColorByLogLevel(logLevel);
+    return color(message);
+  }
+
+  protected printStackTrace(stack: string) {
+    if (!stack || this.options.json) {
+      return;
+    }
+    if (this.options.forceConsole) {
+      console.error(stack);
+    } else {
+      process.stderr.write(`${stack}\n`);
+    }
+  }
+
+  protected updateAndGetTimestampDiff(): string {
+    const includeTimestamp =
+      ConsoleLogger.lastTimestampAt && this.options?.timestamp;
+    const result = includeTimestamp
+      ? this.formatTimestampDiff(Date.now() - ConsoleLogger.lastTimestampAt!)
+      : '';
+    ConsoleLogger.lastTimestampAt = Date.now();
+    return result;
+  }
+
+  protected formatTimestampDiff(timestampDiff: number) {
+    const formattedDiff = ` +${timestampDiff}ms`;
+    return this.options.colors ? yellow(formattedDiff) : formattedDiff;
+  }
+
+  protected getInspectOptions() {
+    let breakLength = this.options.breakLength;
+    if (typeof breakLength === 'undefined') {
+      breakLength = this.options.colors
+        ? this.options.compact
+          ? Infinity
+          : undefined
+        : this.options.compact === false
+          ? undefined
+          : Infinity; // default breakLength to Infinity if inline is not set and colors is false
+    }
+
+    const inspectOptions: InspectOptions = {
+      // `null` means no limit, as in `util.inspect`.
+      depth:
+        this.options.depth === undefined ? DEFAULT_DEPTH : this.options.depth,
+      sorted: this.options.sorted,
+      showHidden: this.options.showHidden,
+      compact: this.options.compact ?? (this.options.json ? true : false),
+      colors: this.options.colors,
+      breakLength,
+    };
+
+    if (typeof this.options.maxArrayLength !== 'undefined') {
+      inspectOptions.maxArrayLength = this.options.maxArrayLength;
+    }
+    if (typeof this.options.maxStringLength !== 'undefined') {
+      inspectOptions.maxStringLength = this.options.maxStringLength;
+    }
+
+    return inspectOptions;
+  }
+
+  /**
+   * Serializes a JSON log object without ever throwing: circular references
+   * are replaced with "[Circular]", whatever comes past `MAX_JSON_LENGTH`
+   * characters with "[Truncated]", and a value that cannot be serialized
+   * (e.g. a throwing `toJSON()`) makes the whole record fall back to `inspect`.
+   */
+  protected stringifyJsonLogObject(logObject: Record<string, unknown>) {
+    const replacer = this.stringifyReplacer.bind(this);
+    // Objects on the path from the root to the value being serialized, and
+    // what `JSON.stringify` was given in place of each of them.
+    const ancestors: unknown[] = [];
+    const holders: unknown[] = [];
+    // Approximate length of the output so far (array indices aren't written).
+    let length = 0;
+
+    // `JSON.stringify` calls the `toJSON()` of a value before the replacer,
+    // so past the limit the replacer could only drop its result: for a
+    // `Buffer`, an array of one number per byte, built again for every
+    // reference to it. Such values are handed over behind a `toJSON()` that
+    // checks the limit first, in a shallow copy of the object holding them.
+    const hasToJSON = (item: unknown) =>
+      isObject(item) && isFunction((item as { toJSON?: unknown }).toJSON);
+    const deferToJSON = (item: unknown) =>
+      hasToJSON(item)
+        ? {
+            toJSON: (key: string) =>
+              length > MAX_JSON_LENGTH
+                ? '[Truncated]'
+                : (item as { toJSON(key: string): unknown }).toJSON(key),
+          }
+        : item;
+    const toHolder = (value: object): object => {
+      if (Array.isArray(value)) {
+        return value.some(hasToJSON) ? value.map(deferToJSON) : value;
+      }
+      const record = value as Record<string, unknown>;
+      const keys = Object.keys(record);
+      return keys.some(key => hasToJSON(record[key]))
+        ? Object.fromEntries(keys.map(key => [key, deferToJSON(record[key])]))
+        : value;
+    };
+
+    try {
+      return JSON.stringify(
+        logObject,
+        function (this: unknown, key: string, value: unknown) {
+          value = replacer(key, value);
+          length +=
+            // The separator. It also makes every value count: an empty string
+            // in an array would otherwise add nothing.
+            1 +
+            (Array.isArray(this) ? 0 : key.length) +
+            (isString(value) || typeof value === 'number'
+              ? String(value).length
+              : 1);
+          if (length > MAX_JSON_LENGTH) {
+            // A primitive in place of an object is not descended into, so the
+            // walk stops here on every branch past the limit.
+            return isString(value) ||
+              (typeof value === 'object' && value !== null)
+              ? '[Truncated]'
+              : value;
+          }
+          if (typeof value !== 'object' || value === null) {
+            return value;
+          }
+          // `this` is the object holding `key`, so everything above it on the
+          // stack belongs to an already-finished sibling branch.
+          while (holders.length > 0 && holders[holders.length - 1] !== this) {
+            holders.pop();
+            ancestors.pop();
+          }
+          if (ancestors.includes(value)) {
+            return '[Circular]';
+          }
+          const holder = toHolder(value);
+          ancestors.push(value);
+          holders.push(holder);
+          return holder;
+        },
+      );
+    } catch {
+      return inspect(logObject, {
+        ...this.inspectOptions,
+        colors: false,
+        compact: true,
+        breakLength: Infinity,
+      });
+    }
+  }
+
+  protected stringifyReplacer(key: string, value: unknown) {
+    // Mimic util.inspect behavior for JSON logger with compact on and colors off
+    if (typeof value === 'bigint') {
+      return value.toString();
+    }
+    if (typeof value === 'symbol') {
+      return value.toString();
+    }
+
+    if (
+      value instanceof Map ||
+      value instanceof Set ||
+      value instanceof Error
+    ) {
+      return `${inspect(value, this.inspectOptions)}`;
+    }
+    return value;
+  }
+
+  protected getContextAndMessagesToPrint(args: unknown[]) {
+    if (args?.length <= 1) {
+      return { messages: args, context: this.context };
+    }
+    const lastElement = args[args.length - 1];
+    const isContext = isString(lastElement);
+
+    let context: string | undefined;
+    let remainingArgs: unknown[];
+
+    if (isContext) {
+      context = lastElement;
+      remainingArgs = args.slice(0, args.length - 1);
+    } else {
+      context = this.context;
+      remainingArgs = args;
+    }
+
+    if (this.options.structuredParams === false) {
+      return { messages: remainingArgs, context };
+    }
+
+    // Extract plain objects (excluding the first arg which is always the message) as params
+    const messages: unknown[] = [remainingArgs[0]];
+    const paramObjects: Record<string, any>[] = [];
+
+    for (let i = 1; i < remainingArgs.length; i++) {
+      if (isPlainObject(remainingArgs[i])) {
+        paramObjects.push(remainingArgs[i] as Record<string, any>);
+      } else {
+        messages.push(remainingArgs[i]);
+      }
+    }
+
+    const params =
+      paramObjects.length > 0 ? Object.assign({}, ...paramObjects) : undefined;
+
+    return { messages, context, params };
+  }
+
+  protected getContextAndStackAndMessagesToPrint(args: unknown[]) {
+    if (args.length === 1) {
+      return { ...this.getContextAndMessagesToPrint(args) };
+    }
+    if (args.length === 2) {
+      if (this.isStackFormat(args[1]) || isUndefined(args[1])) {
+        return {
+          messages: [args[0]],
+          stack: args[1] as string,
+          context: this.context,
+        };
+      }
+      return { ...this.getContextAndMessagesToPrint(args) };
+    }
+
+    const trailingArg = args[args.length - 1];
+    if (this.isStackFormat(trailingArg)) {
+      const { messages, context, params } = this.getContextAndMessagesToPrint(
+        args.slice(0, -1),
+      );
+      return {
+        messages,
+        context,
+        stack: trailingArg as string,
+        params,
+      };
+    }
+
+    const { messages, context, params } =
+      this.getContextAndMessagesToPrint(args);
+    if (messages?.length <= 1) {
+      return { messages, context, params };
+    }
+    const lastElement = messages[messages.length - 1];
+    const isStack = isString(lastElement);
+    // https://github.com/nestjs/nest/issues/11074#issuecomment-1421680060
+    if (!isStack && !isUndefined(lastElement)) {
+      return { messages, context, params };
+    }
+    return {
+      stack: lastElement,
+      messages: messages.slice(0, messages.length - 1),
+      context,
+      params,
+    };
+  }
+
+  protected isStackFormat(stack: unknown) {
+    if (!isString(stack) && !isUndefined(stack)) {
+      return false;
+    }
+
+    // `[ \t]+` rather than `\s+`, which also matches "\n" and would make this
+    // unanchored search backtrack quadratically on long runs of newlines.
+    return /\n[ \t]+at .+:\d+:\d+/.test(stack!);
+  }
+
+  protected getColorByLogLevel(level: LogLevel) {
+    switch (level) {
+      case 'debug':
+        return clc.magentaBright;
+      case 'warn':
+        return clc.yellow;
+      case 'error':
+        return clc.red;
+      case 'verbose':
+        return clc.cyanBright;
+      case 'fatal':
+        return clc.bold;
+      default:
+        return clc.green;
+    }
+  }
+}

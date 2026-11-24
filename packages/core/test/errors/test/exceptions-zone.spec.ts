@@ -1,6 +1,5 @@
-import { expect } from 'chai';
-import * as sinon from 'sinon';
-import { ExceptionsZone } from '../../../errors/exceptions-zone';
+import { Logger } from '@nestjs/common';
+import { ExceptionsZone } from '../../../errors/exceptions-zone.js';
 
 describe('ExceptionsZone', () => {
   const rethrow = err => {
@@ -8,56 +7,110 @@ describe('ExceptionsZone', () => {
   };
 
   describe('run', () => {
-    let callback: sinon.SinonSpy;
+    let callback: ReturnType<typeof vi.fn>;
     beforeEach(() => {
-      callback = sinon.spy();
+      callback = vi.fn();
     });
     it('should call callback', () => {
-      ExceptionsZone.run(callback as any, rethrow);
-      expect(callback.called).to.be.true;
+      ExceptionsZone.run(callback as any, rethrow, false);
+      expect(callback).toHaveBeenCalled();
     });
     describe('when callback throws exception', () => {
       const exceptionHandler = {
         handle: () => {},
       };
-      let handleSpy: sinon.SinonSpy;
-      before(() => {
+      let handleSpy: ReturnType<typeof vi.fn>;
+      let LoggerFlushSpy: ReturnType<typeof vi.fn>;
+      beforeAll(() => {
         (ExceptionsZone as any).exceptionHandler = exceptionHandler;
-        handleSpy = sinon.spy(exceptionHandler, 'handle');
+        handleSpy = vi.spyOn(exceptionHandler, 'handle');
+        LoggerFlushSpy = vi.spyOn(Logger, 'flush');
       });
-      it('should call "handle" method of exceptionHandler and rethrows', () => {
-        const throwsCallback = () => {
-          throw new Error('');
-        };
-        expect(() => ExceptionsZone.run(throwsCallback, rethrow)).to.throws();
-        expect(handleSpy.called).to.be.true;
+      afterAll(() => {
+        LoggerFlushSpy.mockRestore();
+      });
+      describe('when callback throws exception and autoFlushLogs is false', () => {
+        it('should call "handle" method of exceptionHandler and rethrows and not flush logs', () => {
+          const throwsCallback = () => {
+            throw new Error('');
+          };
+          expect(() =>
+            ExceptionsZone.run(throwsCallback, rethrow, false),
+          ).toThrow();
+
+          expect(handleSpy).toHaveBeenCalled();
+
+          expect(LoggerFlushSpy).not.toHaveBeenCalled();
+        });
+      });
+
+      describe('when callback throws exception and autoFlushLogs is true', () => {
+        it('should call "handle" method of exceptionHandler and rethrows and flush logs', () => {
+          const throwsCallback = () => {
+            throw new Error('');
+          };
+          expect(() =>
+            ExceptionsZone.run(throwsCallback, rethrow, true),
+          ).toThrow();
+
+          expect(handleSpy).toHaveBeenCalled();
+
+          expect(LoggerFlushSpy).toHaveBeenCalled();
+        });
       });
     });
   });
+
   describe('asyncRun', () => {
-    let callback: sinon.SinonSpy;
+    let callback: ReturnType<typeof vi.fn>;
     beforeEach(() => {
-      callback = sinon.spy();
+      callback = vi.fn();
     });
     it('should call callback', async () => {
-      await ExceptionsZone.asyncRun(callback as any, rethrow);
-      expect(callback.called).to.be.true;
+      await ExceptionsZone.asyncRun(callback as any, rethrow, false);
+      expect(callback).toHaveBeenCalled();
     });
     describe('when callback throws exception', () => {
       const exceptionHandler = {
         handle: () => {},
       };
-      let handleSpy: sinon.SinonSpy;
-      before(() => {
+      let handleSpy: ReturnType<typeof vi.fn>;
+      let LoggerFlushSpy: ReturnType<typeof vi.fn>;
+      beforeAll(() => {
         (ExceptionsZone as any).exceptionHandler = exceptionHandler;
-        handleSpy = sinon.spy(exceptionHandler, 'handle');
+        handleSpy = vi.spyOn(exceptionHandler, 'handle');
+        LoggerFlushSpy = vi.spyOn(Logger, 'flush');
       });
-      it('should call "handle" method of exceptionHandler and rethrows error', async () => {
-        const throwsCallback = () => {
-          throw new Error('');
-        };
-        expect(ExceptionsZone.asyncRun(throwsCallback, rethrow)).to.eventually
-          .be.rejected;
+      afterAll(() => {
+        LoggerFlushSpy.mockRestore();
+      });
+      describe('when callback throws exception and autoFlushLogs is false', () => {
+        it('should call "handle" method of exceptionHandler and rethrows error and not flush logs', async () => {
+          const throwsCallback = () => {
+            throw new Error('');
+          };
+          await expect(
+            ExceptionsZone.asyncRun(throwsCallback, rethrow, false),
+          ).rejects.toThrow();
+
+          expect(handleSpy).toHaveBeenCalled();
+
+          expect(LoggerFlushSpy).not.toHaveBeenCalled();
+        });
+      });
+      describe('when callback throws exception and autoFlushLogs is true', () => {
+        it('should call "handle" method of exceptionHandler and rethrows error and flush logs', async () => {
+          const throwsCallback = () => {
+            throw new Error('');
+          };
+          await expect(
+            ExceptionsZone.asyncRun(throwsCallback, rethrow, true),
+          ).rejects.toThrow();
+
+          expect(handleSpy).toHaveBeenCalled();
+
+          expect(LoggerFlushSpy).toHaveBeenCalled();
+        });
       });
     });
   });

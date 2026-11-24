@@ -1,17 +1,24 @@
-import { HttpServer } from '@nestjs/common';
-import { EXCEPTION_FILTERS_METADATA } from '@nestjs/common/constants';
-import { Controller } from '@nestjs/common/interfaces/controllers/controller.interface';
-import { isEmpty } from '@nestjs/common/utils/shared.utils';
-import { ApplicationConfig } from '../application-config';
-import { BaseExceptionFilterContext } from '../exceptions/base-exception-filter-context';
-import { ExceptionsHandler } from '../exceptions/exceptions-handler';
-import { STATIC_CONTEXT } from '../injector/constants';
-import { NestContainer } from '../injector/container';
-import { InstanceWrapper } from '../injector/instance-wrapper';
-import { RouterProxyCallback } from './router-proxy';
+import { type HttpServer, Logger } from '@nestjs/common';
 import { iterate } from 'iterare';
+import { ApplicationConfig } from '../application-config.js';
+import { BaseExceptionFilterContext } from '../exceptions/base-exception-filter-context.js';
+import { ExceptionsHandler } from '../exceptions/exceptions-handler.js';
+import { STATIC_CONTEXT } from '../injector/constants.js';
+import { NestContainer } from '../injector/container.js';
+import { InstanceWrapper } from '../injector/instance-wrapper.js';
+import { RouterProxyCallback } from './router-proxy.js';
+import {
+  EXCEPTION_FILTERS_METADATA,
+  type Controller,
+  isEmptyArray,
+} from '@nestjs/common/internal';
 
 export class RouterExceptionFilters extends BaseExceptionFilterContext {
+  private static readonly logger = new Logger(RouterExceptionFilters.name);
+  // Applications already warned about their request-scoped or transient
+  // global filters (see "getGlobalMetadata()")
+  private static readonly warnedConfigs = new WeakSet<ApplicationConfig>();
+
   constructor(
     container: NestContainer,
     private readonly config: ApplicationConfig,
@@ -23,11 +30,11 @@ export class RouterExceptionFilters extends BaseExceptionFilterContext {
   public create(
     instance: Controller,
     callback: RouterProxyCallback,
-    moduleKey: string,
+    moduleKey: string | undefined,
     contextId = STATIC_CONTEXT,
     inquirerId?: string,
   ): ExceptionsHandler {
-    this.moduleContext = moduleKey;
+    this.moduleContext = moduleKey!;
 
     const exceptionHandler = new ExceptionsHandler(this.applicationRef);
     const filters = this.createContext(
@@ -37,7 +44,7 @@ export class RouterExceptionFilters extends BaseExceptionFilterContext {
       contextId,
       inquirerId,
     );
-    if (isEmpty(filters)) {
+    if (isEmptyArray(filters)) {
       return exceptionHandler;
     }
     exceptionHandler.setCustomFilters(filters.reverse());
@@ -50,15 +57,44 @@ export class RouterExceptionFilters extends BaseExceptionFilterContext {
   ): T {
     const globalFilters = this.config.getGlobalFilters() as T;
     if (contextId === STATIC_CONTEXT && !inquirerId) {
+      this.warnAboutScopedGlobalFilters();
       return globalFilters;
     }
-    const scopedFilterWrappers = this.config.getGlobalRequestFilters() as InstanceWrapper[];
+    const scopedFilterWrappers =
+      this.config.getGlobalRequestFilters() as InstanceWrapper[];
     const scopedFilters = iterate(scopedFilterWrappers)
-      .map(wrapper => wrapper.getInstanceByContextId(contextId, inquirerId))
-      .filter(host => !!host)
-      .map(host => host.instance)
+      .map(wrapper => ({
+        wrapper,
+        host: wrapper.getInstanceByContextId(
+          this.getContextId(contextId, wrapper),
+          inquirerId,
+        ),
+      }))
+      // e.g. a request-scoped filter that the request did not instantiate
+      .filter(
+        ({ wrapper, host }) => !!host && this.isInstantiated(wrapper, host),
+      )
+      .map(({ host }) => host.instance)
       .toArray();
 
     return globalFilters.concat(scopedFilters) as T;
+  }
+
+  /**
+   * Handlers that are not built for a controller (middleware, the "not found"
+   * handler, the exception layer) have no request to resolve request-scoped
+   * or transient global filters for, so these filters are left out.
+   */
+  private warnAboutScopedGlobalFilters() {
+    if (
+      isEmptyArray(this.config.getGlobalRequestFilters()) ||
+      RouterExceptionFilters.warnedConfigs.has(this.config)
+    ) {
+      return;
+    }
+    RouterExceptionFilters.warnedConfigs.add(this.config);
+    RouterExceptionFilters.logger.warn(
+      'Global exception filters (APP_FILTER) with request or transient scope are not applied to exceptions thrown outside of controllers, e.g. in middleware, for unknown routes or while parsing the request body. Register a global filter without a scope as well to handle them.',
+    );
   }
 }

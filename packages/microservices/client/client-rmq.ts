@@ -1,173 +1,573 @@
-import { Logger } from '@nestjs/common/services/logger.service';
-import { loadPackage } from '@nestjs/common/utils/load-package.util';
-import { randomStringGenerator } from '@nestjs/common/utils/random-string-generator.util';
+/* eslint-disable @typescript-eslint/no-redundant-type-constituents */
+import { randomUUID } from 'crypto';
 import { EventEmitter } from 'events';
-import { fromEvent, merge, Observable } from 'rxjs';
-import { first, map, share, switchMap } from 'rxjs/operators';
 import {
+  EmptyError,
+  firstValueFrom,
+  fromEvent,
+  merge,
+  Observable,
+  ReplaySubject,
+} from 'rxjs';
+import { first, map, retryWhen, scan, skip, switchMap } from 'rxjs/operators';
+import {
+  BLOCKED_RMQ_MESSAGE,
+  CONSUMER_CANCELLED_RMQ_MESSAGE,
   DISCONNECTED_RMQ_MESSAGE,
-  DISCONNECT_EVENT,
-  ERROR_EVENT,
-  RQM_DEFAULT_IS_GLOBAL_PREFETCH_COUNT,
-  RQM_DEFAULT_NOACK,
-  RQM_DEFAULT_PERSISTENT,
-  RQM_DEFAULT_PREFETCH_COUNT,
-  RQM_DEFAULT_QUEUE,
-  RQM_DEFAULT_QUEUE_OPTIONS,
-  RQM_DEFAULT_URL,
-} from '../constants';
-import { RmqUrl } from '../external/rmq-url.interface';
-import { ReadPacket, RmqOptions, WritePacket } from '../interfaces';
-import { ClientProxy } from './client-proxy';
+  RMQ_DEFAULT_IS_GLOBAL_PREFETCH_COUNT,
+  RMQ_DEFAULT_MAX_MESSAGE_SIZE,
+  RMQ_DEFAULT_NO_ASSERT,
+  RMQ_DEFAULT_NOACK,
+  RMQ_DEFAULT_PERSISTENT,
+  RMQ_DEFAULT_PREFETCH_COUNT,
+  RMQ_DEFAULT_QUEUE,
+  RMQ_DEFAULT_QUEUE_OPTIONS,
+  RMQ_DEFAULT_URL,
+  RMQ_MAX_SHORT_STRING_LENGTH,
+  UNBLOCKED_RMQ_MESSAGE,
+} from '../constants.js';
+import { MaxPacketLengthExceededException } from '../errors/max-packet-length-exceeded.exception.js';
+import { MaxRmqShortStringLengthExceededException } from '../errors/max-rmq-short-string-length-exceeded.exception.js';
+import { RmqEvents, RmqEventsMap, RmqStatus } from '../events/rmq.events.js';
+import {
+  IncomingResponse,
+  PacketMetadata,
+  ReadPacket,
+  RmqOptions,
+  WritePacket,
+} from '../interfaces/index.js';
+import { RmqRecord } from '../record-builders/index.js';
+import { RmqRecordSerializer } from '../serializers/rmq-record.serializer.js';
+import { hasPacketMetadata } from '../utils/packet-metadata.utils.js';
+import { ClientProxy } from './client-proxy.js';
+import { Logger } from '@nestjs/common';
+import {
+  loadPackage,
+  loadPackageSync,
+  isFunction,
+  isNil,
+  isObject,
+  isString,
+} from '@nestjs/common/internal';
+import { createRequire } from 'module';
 
-let rqmPackage: any = {};
+// To enable type safety for RMQ. This cant be uncommented by default
+// because it would require the user to install the amqplib package even if they dont use RabbitMQ
+// Otherwise, TypeScript would fail to compile the code.
+//
+// type AmqpConnectionManager =
+//   import('amqp-connection-manager').AmqpConnectionManager;
+// type ChannelWrapper = import('amqp-connection-manager').ChannelWrapper;
+// type Channel = import('amqplib').Channel;
+// type ConsumeMessage = import('amqplib').ConsumeMessage;
+
+type Channel = any;
+type ChannelWrapper = any;
+type ConsumeMessage = any;
+type AmqpConnectionManager = any;
+
+let rmqPackage: any = null; // typeof import('amqp-connection-manager');
 
 const REPLY_QUEUE = 'amq.rabbitmq.reply-to';
+// The message properties that AMQP encodes as short strings
+const SHORT_STRING_PROPERTIES = [
+  'contentType',
+  'contentEncoding',
+  'correlationId',
+  'replyTo',
+  'expiration',
+  'messageId',
+  'type',
+  'userId',
+  'appId',
+];
 
-export class ClientRMQ extends ClientProxy {
+/**
+ * @publicApi
+ */
+export class ClientRMQ extends ClientProxy<RmqEvents, RmqStatus> {
   protected readonly logger = new Logger(ClientProxy.name);
-  protected connection: Promise<any>;
-  protected client: any = null;
-  protected channel: any = null;
-  protected urls: string[] | RmqUrl[];
-  protected queue: string;
-  protected queueOptions: any;
+  protected connection$: ReplaySubject<any>;
+  protected connectionPromise: Promise<void> | null;
+  protected client: AmqpConnectionManager | null = null;
+  private closeCount = 0;
+  protected channel: ChannelWrapper | null = null;
+  protected pendingEventListeners: Array<{
+    event: keyof RmqEvents;
+    callback: RmqEvents[keyof RmqEvents];
+  }> = [];
+  protected isInitialConnect = true;
   protected responseEmitter: EventEmitter;
+  protected queue: string;
+  protected queueOptions: Record<string, any>;
   protected replyQueue: string;
-  protected persistent: boolean;
+  protected noAssert: boolean;
+  protected maxMessageSize: number;
 
-  constructor(protected readonly options: RmqOptions['options']) {
+  constructor(protected readonly options: Required<RmqOptions>['options']) {
     super();
-    this.urls = this.getOptionsProp(this.options, 'urls') || [RQM_DEFAULT_URL];
-    this.queue =
-      this.getOptionsProp(this.options, 'queue') || RQM_DEFAULT_QUEUE;
-    this.queueOptions =
-      this.getOptionsProp(this.options, 'queueOptions') ||
-      RQM_DEFAULT_QUEUE_OPTIONS;
-    this.replyQueue =
-      this.getOptionsProp(this.options, 'replyQueue') || REPLY_QUEUE;
-    this.persistent =
-      this.getOptionsProp(this.options, 'persistent') || RQM_DEFAULT_PERSISTENT;
-    loadPackage('amqplib', ClientRMQ.name, () => require('amqplib'));
-    rqmPackage = loadPackage('amqp-connection-manager', ClientRMQ.name, () =>
-      require('amqp-connection-manager'),
+    this.queue = this.getOptionsProp(this.options, 'queue', RMQ_DEFAULT_QUEUE);
+    this.queueOptions = this.getOptionsProp(
+      this.options,
+      'queueOptions',
+      RMQ_DEFAULT_QUEUE_OPTIONS,
     );
+    this.replyQueue = this.getOptionsProp(
+      this.options,
+      'replyQueue',
+      REPLY_QUEUE,
+    );
+    this.noAssert =
+      this.getOptionsProp(this.options, 'noAssert') ??
+      this.queueOptions.noAssert ??
+      RMQ_DEFAULT_NO_ASSERT;
+    const maxMessageSize = this.getOptionsProp(this.options, 'maxMessageSize');
+    // A value that is not a number (such as NaN from an unset environment
+    // variable) gets the default: no size compares greater than NaN
+    this.maxMessageSize =
+      maxMessageSize == null || isNaN(maxMessageSize)
+        ? RMQ_DEFAULT_MAX_MESSAGE_SIZE
+        : maxMessageSize;
 
     this.initializeSerializer(options);
     this.initializeDeserializer(options);
   }
 
-  public close(): void {
-    this.channel && this.channel.close();
-    this.client && this.client.close();
+  public async close(): Promise<void> {
+    this.closeCount++;
+    this.handleClose();
+
+    // Reset first, so that an in-flight `connect()` stops at its next step,
+    // and a `connect()` issued while the channel and connection close starts
+    // a new attempt that this close leaves alone. It also keeps a later
+    // `connect()` from reusing stale channel or connection references.
+    const channel = this.channel;
+    const client = this.client;
     this.channel = null;
     this.client = null;
-  }
+    this.connectionPromise = null;
+    this.isInitialConnect = true;
+    this.pendingEventListeners = [];
 
-  public consumeChannel() {
-    const noAck = this.getOptionsProp(this.options, 'noAck', RQM_DEFAULT_NOACK);
-    this.channel.addSetup((channel: any) =>
-      channel.consume(
-        this.replyQueue,
-        (msg: any) =>
-          this.responseEmitter.emit(msg.properties.correlationId, msg),
-        {
-          noAck,
-        },
-      ),
+    // The channel goes first, as amqplib settles its close on the broker's
+    // reply, which never arrives once the connection is closed. The
+    // connection is still closed when the channel close fails, otherwise it
+    // stays open after close() reported the error.
+    const results = [
+      ...(await Promise.allSettled([channel?.close()])),
+      ...(await Promise.allSettled([client?.close()])),
+    ];
+    const [failure, ...otherFailures] = results.filter(
+      (result): result is PromiseRejectedResult => result.status === 'rejected',
     );
+    otherFailures.forEach(({ reason }) => this.logger.error(reason));
+    if (failure) {
+      throw failure.reason;
+    }
   }
 
-  public connect(): Promise<any> {
+  public handleClose() {
+    if (this.routingMap.size > 0) {
+      const err = new Error('Connection closed');
+      const callbacks = [...this.routingMap.values()];
+      this.routingMap.clear();
+
+      for (const callback of callbacks) {
+        try {
+          callback({ err });
+        } catch (callbackErr) {
+          // A failing callback must not keep the remaining requests pending
+          // nor prevent the connection from being closed.
+          this.logger.error(callbackErr);
+        }
+      }
+    }
+    // The listeners expect a message to parse, so they cannot carry the error.
+    this.responseEmitter?.removeAllListeners();
+  }
+
+  public async connect(): Promise<any> {
     if (this.client) {
-      return this.connection;
+      return this.connectionPromise;
+    }
+    const closeCount = this.closeCount;
+    if (!rmqPackage) {
+      // Only the first connection waits for the packages. Another connect()
+      // or a close() call may run in the meantime, so the state is checked
+      // again once they are loaded.
+      await this.loadRmqPackage();
+      if (this.client) {
+        return this.connectionPromise;
+      }
+      if (this.closeCount !== closeCount) {
+        throw new Error('Connection closed');
+      }
     }
     this.client = this.createClient();
-    this.handleError(this.client);
-    this.handleDisconnectError(this.client);
+    const client = this.client;
 
-    const connect$ = this.connect$(this.client);
-    this.connection = this.mergeDisconnectEvent(this.client, connect$)
-      .pipe(
-        switchMap(() => this.createChannel()),
-        share(),
-      )
-      .toPromise();
+    this.registerErrorListener(client);
+    this.registerDisconnectListener(client);
+    this.registerConnectListener(client);
+    this.registerBlockedListener(client);
+    this.registerUnblockedListener(client);
+    this.pendingEventListeners.forEach(({ event, callback }) =>
+      client.on(event, callback),
+    );
 
-    return this.connection;
+    this.responseEmitter = new EventEmitter();
+    this.responseEmitter.setMaxListeners(0);
+
+    const connect$ = this.connect$(client);
+    const withDisconnect$ = this.mergeDisconnectEvent(client, connect$).pipe(
+      switchMap(() => {
+        // A manager closed during its handshake still emits "connect": by
+        // then the client may be a newer attempt's manager, not this one.
+        if (this.client !== client) {
+          throw new Error('Connection closed');
+        }
+        return this.createChannel();
+      }),
+    );
+
+    const withReconnect$ = fromEvent(client, RmqEventsMap.CONNECT).pipe(
+      skip(1),
+    );
+    const source$ = merge(withDisconnect$, withReconnect$);
+
+    this.connection$ = new ReplaySubject(1);
+    source$.subscribe(this.connection$);
+    const connectionPromise = this.convertConnectionToPromise()
+      .then(result => {
+        if (this.closeCount !== closeCount) {
+          throw new Error('Connection closed');
+        }
+        return result;
+      })
+      .catch(async err => {
+        // A rejected attempt must not be cached: the next `connect()` call
+        // has to try again once the broker is reachable, instead of failing
+        // forever with the error of the first attempt.
+        await this.discardPartialConnection(client);
+        throw err;
+      });
+    this.connectionPromise = connectionPromise;
+
+    return connectionPromise;
+  }
+
+  /**
+   * Tears down whatever a failed connection attempt managed to create, so the
+   * connection manager it spawned does not keep retrying in the background
+   * while the next attempt creates a new one. The client's state is only reset
+   * if no newer attempt has replaced it in the meantime (e.g., `close()`
+   * followed by `connect()` while the failed attempt was still pending).
+   */
+  private async discardPartialConnection(
+    client: AmqpConnectionManager,
+  ): Promise<void> {
+    let channel: ChannelWrapper | null = null;
+    // Compared by client, not by promise: the disconnect listener replaces
+    // "connectionPromise" when the broker drops the connection during the setup.
+    if (this.client === client) {
+      channel = this.channel;
+      this.client = null;
+      this.channel = null;
+      this.connectionPromise = null;
+      this.isInitialConnect = true;
+    }
+    // The channel is closed first, for the same reason as in close().
+    await channel?.close().catch(() => {});
+    await client.close().catch(() => {});
   }
 
   public createChannel(): Promise<void> {
-    return new Promise(resolve => {
+    return new Promise((resolve, reject) => {
+      if (!this.client) {
+        return reject(new Error('Connection closed'));
+      }
       this.channel = this.client.createChannel({
         json: false,
-        setup: (channel: any) => this.setupChannel(channel, resolve),
+        setup: (channel: Channel) => this.setupChannel(channel, resolve),
+      });
+      // The wrapper emits "error" when the setup throws, and an emitter with
+      // no listener throws, which crashes the process. Rejecting is a no-op
+      // once the channel is set up, so later errors are only logged.
+      this.channel.on(RmqEventsMap.ERROR, (err: unknown) => {
+        this.logger.error(err);
+        reject(err);
       });
     });
   }
 
-  public createClient<T = any>(): T {
+  private async loadRmqPackage() {
+    // amqp-connection-manager imports amqplib, so amqplib is checked first to
+    // name the package that is actually missing.
+    await loadPackage('amqplib', ClientRMQ.name, () => import('amqplib'));
+    rmqPackage = await loadPackage(
+      'amqp-connection-manager',
+      ClientRMQ.name,
+      () => import('amqp-connection-manager'),
+    );
+  }
+
+  public createClient(): AmqpConnectionManager {
     const socketOptions = this.getOptionsProp(this.options, 'socketOptions');
-    return rqmPackage.connect(this.urls, {
-      connectionOptions: socketOptions,
-    }) as T;
+    const urls = this.getOptionsProp(this.options, 'urls') || [RMQ_DEFAULT_URL];
+    // connect() loads the package first; this keeps a direct call working
+    rmqPackage ??= loadPackageSync(
+      'amqp-connection-manager',
+      ClientRMQ.name,
+      () => createRequire(import.meta.url)('amqp-connection-manager'),
+    );
+    return rmqPackage.connect(urls, socketOptions);
   }
 
   public mergeDisconnectEvent<T = any>(
     instance: any,
     source$: Observable<T>,
   ): Observable<T> {
-    const close$ = fromEvent(instance, DISCONNECT_EVENT).pipe(
-      map((err: any) => {
-        throw err;
-      }),
+    const eventToError = (eventType: string) =>
+      fromEvent(instance, eventType).pipe(
+        map((err: unknown) => {
+          throw err;
+        }),
+      );
+    const disconnect$ = eventToError(RmqEventsMap.DISCONNECT);
+
+    const urls = this.getOptionsProp(this.options, 'urls', []);
+    const connectFailedEventKey = 'connectFailed';
+    const connectFailed$ = eventToError(connectFailedEventKey).pipe(
+      retryWhen(e =>
+        e.pipe(
+          scan((errorCount, error: any) => {
+            if (urls.indexOf(error.url) >= urls.length - 1) {
+              throw error;
+            }
+            return errorCount + 1;
+          }, 0),
+        ),
+      ),
     );
-    return merge(source$, close$).pipe(first());
+    // If we ever decide to propagate all disconnect errors & re-emit them through
+    // the "connection" stream then comment out "first()" operator.
+    return merge(source$, disconnect$, connectFailed$).pipe(first());
   }
 
-  public async setupChannel(channel: any, resolve: Function) {
+  public async convertConnectionToPromise() {
+    try {
+      return await firstValueFrom(this.connection$);
+    } catch (err) {
+      if (err instanceof EmptyError) {
+        return;
+      }
+      throw err;
+    }
+  }
+
+  public async setupChannel(channel: Channel, resolve: Function) {
     const prefetchCount =
       this.getOptionsProp(this.options, 'prefetchCount') ||
-      RQM_DEFAULT_PREFETCH_COUNT;
+      RMQ_DEFAULT_PREFETCH_COUNT;
     const isGlobalPrefetchCount =
       this.getOptionsProp(this.options, 'isGlobalPrefetchCount') ||
-      RQM_DEFAULT_IS_GLOBAL_PREFETCH_COUNT;
+      RMQ_DEFAULT_IS_GLOBAL_PREFETCH_COUNT;
 
-    await channel.assertQueue(this.queue, this.queueOptions);
+    if (!this.options.wildcards && this.options.exchangeType !== 'fanout') {
+      if (!this.noAssert) {
+        await channel.assertQueue(this.queue, this.queueOptions);
+      }
+
+      if (this.options.exchange && this.options.routingKey) {
+        await channel.bindQueue(
+          this.queue,
+          this.options.exchange,
+          this.options.exchangeType === 'fanout' ? '' : this.options.routingKey,
+        );
+      }
+    } else {
+      const exchange = this.getOptionsProp(
+        this.options,
+        'exchange',
+        this.options.queue,
+      );
+      const exchangeType = this.getOptionsProp(
+        this.options,
+        'exchangeType',
+        'topic',
+      );
+      await channel.assertExchange(exchange, exchangeType, {
+        durable: true,
+        arguments: this.getOptionsProp(this.options, 'exchangeArguments', {}),
+      });
+    }
+
     await channel.prefetch(prefetchCount, isGlobalPrefetchCount);
-
-    this.responseEmitter = new EventEmitter();
-    this.responseEmitter.setMaxListeners(0);
-    this.consumeChannel();
+    await this.consumeChannel(channel);
     resolve();
   }
 
-  public handleError(client: any): void {
-    client.addListener(ERROR_EVENT, (err: any) => this.logger.error(err));
+  public async consumeChannel(channel: Channel) {
+    const noAck = this.getOptionsProp(this.options, 'noAck', RMQ_DEFAULT_NOACK);
+    await channel.consume(
+      this.replyQueue,
+      (msg: ConsumeMessage | null) => {
+        if (isNil(msg)) {
+          // amqplib calls the consumer with "null" once the broker has
+          // cancelled it (e.g., its queue was deleted). Reading from it would
+          // throw inside amqplib's dispatch and close the connection.
+          this.logger.error(CONSUMER_CANCELLED_RMQ_MESSAGE);
+          if (this.replyQueue === REPLY_QUEUE) {
+            // Direct reply-to consumers cannot recover in-flight replies from
+            // the cancelled consumer tag, so fail pending callers immediately.
+            this.handleClose();
+          }
+          this.consumeChannel(channel).catch(err => this.logger.error(err));
+          return;
+        }
+        // Whoever publishes to the reply queue chooses the correlation id, so
+        // only the ids of pending requests become event names: an "error"
+        // event nobody listens to throws inside amqplib's dispatch, which
+        // closes the channel and the connection.
+        const correlationId = msg.properties.correlationId;
+        if (this.responseEmitter.listenerCount(correlationId) > 0) {
+          this.responseEmitter.emit(correlationId, msg);
+        }
+      },
+      {
+        noAck,
+      },
+    );
   }
 
-  public handleDisconnectError(client: any): void {
-    client.addListener(DISCONNECT_EVENT, (err: any) => {
+  public registerErrorListener(client: AmqpConnectionManager): void {
+    client.addListener(RmqEventsMap.ERROR, (err: any) =>
+      this.logger.error(err),
+    );
+  }
+
+  public registerDisconnectListener(client: AmqpConnectionManager): void {
+    client.addListener(RmqEventsMap.DISCONNECT, (err: any) => {
+      // The state belongs to the current client: a manager that `close()` or
+      // a newer attempt has replaced must not touch it.
+      if (client !== this.client) {
+        return;
+      }
+      this._status$.next(RmqStatus.DISCONNECTED);
+
+      if (!this.isInitialConnect) {
+        this.connectionPromise = Promise.reject(
+          'Error: Connection lost. Trying to reconnect...',
+        );
+
+        // Prevent unhandled promise rejection
+        this.connectionPromise.catch(() => {});
+      }
+
+      // A reply to the direct reply-to queue goes only to the channel that
+      // sent the request, and that channel is gone with the connection: the
+      // pending requests would wait forever.
+      if (this.replyQueue === REPLY_QUEUE) {
+        this.handleClose();
+      }
+
       this.logger.error(DISCONNECTED_RMQ_MESSAGE);
       this.logger.error(err);
-
-      this.close();
     });
   }
 
-  public handleMessage(
+  private registerConnectListener(client: AmqpConnectionManager): void {
+    client.addListener(RmqEventsMap.CONNECT, () => {
+      // A manager closed during its handshake still emits "connect", which
+      // would turn the first "connect" of the next attempt into a reconnect.
+      if (client !== this.client) {
+        return;
+      }
+      this._status$.next(RmqStatus.CONNECTED);
+      this.logger.log('Successfully connected to RMQ broker');
+
+      if (this.isInitialConnect) {
+        this.isInitialConnect = false;
+      } else {
+        this.connectionPromise = Promise.resolve();
+      }
+    });
+  }
+
+  public registerBlockedListener(client: AmqpConnectionManager): void {
+    client.addListener(
+      RmqEventsMap.BLOCKED,
+      ({ reason }: { reason: string }) => {
+        this._status$.next(RmqStatus.BLOCKED);
+        this.logger.warn(BLOCKED_RMQ_MESSAGE(reason));
+      },
+    );
+  }
+
+  public registerUnblockedListener(client: AmqpConnectionManager): void {
+    client.addListener(RmqEventsMap.UNBLOCKED, () => {
+      this._status$.next(RmqStatus.UNBLOCKED);
+      this.logger.log(UNBLOCKED_RMQ_MESSAGE);
+    });
+  }
+
+  public on<
+    EventKey extends keyof RmqEvents = keyof RmqEvents,
+    EventCallback extends RmqEvents[EventKey] = RmqEvents[EventKey],
+  >(event: EventKey, callback: EventCallback) {
+    // Kept until `close()`, so the clients created later (e.g., after a
+    // failed connect) get it as well
+    this.pendingEventListeners.push({ event, callback });
+    if (this.client) {
+      this.client.addListener(event, callback);
+    }
+  }
+
+  public unwrap<T>(): T {
+    if (!this.client) {
+      throw new Error(
+        'Not initialized. Please call the "connect" method first.',
+      );
+    }
+    return this.client as T;
+  }
+
+  public async handleMessage(
     packet: unknown,
     callback: (packet: WritePacket) => any,
-  ) {
-    const { err, response, isDisposed } = this.deserializer.deserialize(packet);
+  ): Promise<void>;
+  public async handleMessage(
+    packet: unknown,
+    options: Record<string, unknown>,
+    callback: (packet: WritePacket) => any,
+  ): Promise<void>;
+  public async handleMessage(
+    packet: unknown,
+    options:
+      Record<string, unknown> | ((packet: WritePacket) => any) | undefined,
+    callback?: (packet: WritePacket) => any,
+  ): Promise<void> {
+    if (isFunction(options)) {
+      callback = options as (packet: WritePacket) => any;
+      options = undefined;
+    }
+
+    let incomingResponse: IncomingResponse;
+    try {
+      incomingResponse = await this.deserializer.deserialize(packet, options);
+    } catch (error) {
+      // Nobody awaits this listener, so a rejection would crash the process.
+      return callback?.({ err: error, isDisposed: true });
+    }
+    const { err, response, isDisposed } = incomingResponse;
     if (isDisposed || err) {
-      callback({
+      return callback?.({
         err,
         response,
         isDisposed: true,
       });
     }
-    callback({
+    callback?.({
       err,
       response,
     });
@@ -176,43 +576,203 @@ export class ClientRMQ extends ClientProxy {
   protected publish(
     message: ReadPacket,
     callback: (packet: WritePacket) => any,
-  ): Function {
+  ): () => void {
+    let cleanup = () => {};
     try {
-      const correlationId = randomStringGenerator();
-      const listener = ({ content }: { content: any }) =>
-        this.handleMessage(JSON.parse(content.toString()), callback);
+      // Replies are matched by the correlation id alone, as in assignPacketId()
+      const correlationId = randomUUID();
+      const listener = ({
+        content,
+        options,
+      }: {
+        content: Buffer;
+        options: Record<string, unknown>;
+      }) => {
+        if (content.length > this.maxMessageSize) {
+          // Decoding it could exhaust the heap, which ends the process
+          return callback({
+            err: new MaxPacketLengthExceededException(content.length),
+            isDisposed: true,
+          });
+        }
+        return this.handleMessage(
+          this.parseMessageContent(content),
+          options,
+          callback,
+        );
+      };
 
       Object.assign(message, { id: correlationId });
-      const serializedPacket = this.serializer.serialize(message);
+      // The metadata travels as headers, not in the payload
+      const { metadata, ...outgoingMessage } = message;
+      const serializedPacket: ReadPacket & Partial<RmqRecord> =
+        this.serializer.serialize(outgoingMessage);
+
+      const options = serializedPacket.options;
+      delete serializedPacket.options;
 
       this.responseEmitter.on(correlationId, listener);
-      this.channel.sendToQueue(
-        this.queue,
-        Buffer.from(JSON.stringify(serializedPacket)),
-        {
-          replyTo: this.replyQueue,
-          correlationId,
-          persistent: this.persistent,
-        },
-      );
-      return () => this.responseEmitter.removeListener(correlationId, listener);
+      this.routingMap.set(correlationId, callback);
+      cleanup = () => {
+        this.routingMap.delete(correlationId);
+        this.responseEmitter.removeListener(correlationId, listener);
+      };
+
+      const content = Buffer.from(JSON.stringify(serializedPacket));
+      const sendOptions = {
+        replyTo: this.replyQueue,
+        persistent: this.getOptionsProp(
+          this.options,
+          'persistent',
+          RMQ_DEFAULT_PERSISTENT,
+        ),
+        ...options,
+        headers: this.mergeHeaders(options?.headers, metadata),
+        correlationId,
+      };
+
+      if (this.options.wildcards || this.options.exchangeType === 'fanout') {
+        const stringifiedPattern = this.normalizePattern(message.pattern);
+
+        // The exchange is the same as the queue when wildcards are enabled
+        // and the exchange is not explicitly set
+        const exchange = this.getOptionsProp(
+          this.options,
+          'exchange',
+          this.queue,
+        );
+        this.assertShortStrings(sendOptions, stringifiedPattern);
+
+        this.channel!.publish(
+          exchange,
+          stringifiedPattern,
+          content,
+          sendOptions,
+        ).catch(err => callback({ err }));
+      } else {
+        this.assertShortStrings(sendOptions);
+        this.channel!.sendToQueue(this.queue, content, sendOptions).catch(err =>
+          callback({ err }),
+        );
+      }
+      return cleanup;
     } catch (err) {
+      cleanup();
       callback({ err });
+      return () => {};
     }
   }
 
   protected dispatchEvent(packet: ReadPacket): Promise<any> {
-    const serializedPacket = this.serializer.serialize(packet);
+    const { metadata, ...outgoingPacket } = packet;
+    const serializedPacket: ReadPacket & Partial<RmqRecord> =
+      this.serializer.serialize(outgoingPacket);
 
-    return new Promise<void>((resolve, reject) =>
-      this.channel.sendToQueue(
+    const options = serializedPacket.options;
+    delete serializedPacket.options;
+
+    return new Promise<void>((resolve, reject) => {
+      const content = Buffer.from(JSON.stringify(serializedPacket));
+      const sendOptions = {
+        persistent: this.getOptionsProp(
+          this.options,
+          'persistent',
+          RMQ_DEFAULT_PERSISTENT,
+        ),
+        ...options,
+        headers: this.mergeHeaders(options?.headers, metadata),
+      };
+      const errorCallback = (err: unknown) =>
+        err ? reject(err as Error) : resolve();
+
+      if (this.options.wildcards || this.options.exchangeType === 'fanout') {
+        const routingKey = this.normalizePattern(packet.pattern);
+        this.assertShortStrings(sendOptions, routingKey);
+        return this.channel!.publish(
+          // The exchange is the same as the queue when wildcards are enabled
+          // and the exchange is not explicitly set
+          this.getOptionsProp(this.options, 'exchange', this.queue),
+          routingKey,
+          content,
+          sendOptions,
+          errorCallback,
+        );
+      }
+      this.assertShortStrings(sendOptions);
+      return this.channel!.sendToQueue(
         this.queue,
-        Buffer.from(JSON.stringify(serializedPacket)),
-        {
-          persistent: this.persistent,
-        },
-        (err: unknown) => (err ? reject(err) : resolve()),
-      ),
-    );
+        content,
+        sendOptions,
+        errorCallback,
+      );
+    });
+  }
+
+  /**
+   * The routing key, the names of the headers and some of the message
+   * properties are AMQP short strings. amqplib only throws on a longer one
+   * once the channel wrapper has queued the message as unconfirmed, and the
+   * wrapper then neither settles the publish nor releases the message.
+   */
+  protected assertShortStrings(
+    sendOptions: Record<string, any>,
+    routingKey?: string,
+  ) {
+    const assertLength = (field: string, value: unknown) => {
+      const length = isString(value) ? Buffer.byteLength(value) : 0;
+      if (length > RMQ_MAX_SHORT_STRING_LENGTH) {
+        throw new MaxRmqShortStringLengthExceededException(
+          field,
+          length,
+          RMQ_MAX_SHORT_STRING_LENGTH,
+        );
+      }
+    };
+    assertLength('routing key', routingKey);
+    for (const property of SHORT_STRING_PROPERTIES) {
+      assertLength(`"${property}"`, sendOptions[property]);
+    }
+    if (isObject(sendOptions.headers)) {
+      for (const name in sendOptions.headers) {
+        // amqplib leaves out the headers whose value is undefined
+        if (sendOptions.headers[name] !== undefined) {
+          assertLength('header name', name);
+        }
+      }
+    }
+  }
+
+  protected initializeSerializer(options: RmqOptions['options']) {
+    this.serializer = options?.serializer ?? new RmqRecordSerializer();
+  }
+
+  protected mergeHeaders(
+    requestHeaders?: Record<string, string>,
+    metadata?: PacketMetadata,
+  ): Record<string, string> | undefined {
+    if (
+      !requestHeaders &&
+      !this.options?.headers &&
+      !hasPacketMetadata(metadata)
+    ) {
+      return undefined;
+    }
+
+    // The packet metadata only fills in what neither the record nor the
+    // client options set
+    return {
+      ...metadata,
+      ...this.options?.headers,
+      ...requestHeaders,
+    };
+  }
+
+  protected parseMessageContent(content: Buffer) {
+    const rawContent = content.toString();
+    try {
+      return JSON.parse(rawContent);
+    } catch {
+      return rawContent;
+    }
   }
 }

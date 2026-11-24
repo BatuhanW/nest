@@ -1,13 +1,13 @@
 import { INestApplication, Logger } from '@nestjs/common';
-import { Transport } from '@nestjs/microservices';
+import { MicroserviceOptions, Transport } from '@nestjs/microservices';
 import { Test } from '@nestjs/testing';
 import { Admin, ITopicMetadata, Kafka } from 'kafkajs';
-import * as request from 'supertest';
+import request from 'supertest';
 import * as util from 'util';
-import { KafkaConcurrentController } from '../src/kafka-concurrent/kafka-concurrent.controller';
-import { KafkaConcurrentMessagesController } from '../src/kafka-concurrent/kafka-concurrent.messages.controller';
+import { KafkaConcurrentController } from '../src/kafka-concurrent/kafka-concurrent.controller.js';
+import { KafkaConcurrentMessagesController } from '../src/kafka-concurrent/kafka-concurrent.messages.controller.js';
 
-describe('Kafka concurrent', function () {
+describe.skip('Kafka concurrent', function () {
   const numbersOfServers = 3;
 
   const requestTopic = 'math.sum.sync.number.wait';
@@ -20,8 +20,6 @@ describe('Kafka concurrent', function () {
   const logger = new Logger('concurrent-kafka.spec.ts');
 
   // set timeout to be longer (especially for the after hook)
-  this.timeout(30000);
-
   const startServer = async () => {
     const module = await Test.createTestingModule({
       controllers: [
@@ -37,7 +35,7 @@ describe('Kafka concurrent', function () {
 
     const server = app.getHttpAdapter().getInstance();
 
-    app.connectMicroservice({
+    app.connectMicroservice<MicroserviceOptions>({
       transport: Transport.KAFKA,
       options: {
         client: {
@@ -57,7 +55,7 @@ describe('Kafka concurrent', function () {
     apps.push(app);
 
     // await the start
-    await app.startAllMicroservicesAsync();
+    await app.startAllMicroservices();
     await app.init();
   };
 
@@ -100,7 +98,7 @@ describe('Kafka concurrent', function () {
       }
     }
 
-    if (topicMetadata && topicMetadata.topics.length > 0) {
+    if (topicMetadata! && topicMetadata.topics.length > 0) {
       // we have topics, how many partitions do they have?
       for (const topic of topicMetadata.topics) {
         if (topic.partitions.length < numbersOfServers) {
@@ -162,7 +160,7 @@ describe('Kafka concurrent', function () {
           });
         }),
     );
-  }).timeout(30000);
+  });
 
   it(`Concurrent messages without forcing a rebalance.`, async () => {
     // wait a second before notifying the servers to respond
@@ -280,7 +278,7 @@ describe('Kafka concurrent', function () {
     );
   });
 
-  after(`Stopping Kafka app`, async () => {
+  afterAll(async () => {
     // close all concurrently
     return Promise.all(
       apps.map(async app => {

@@ -12,8 +12,10 @@ import {
   NestFastifyApplication,
 } from '@nestjs/platform-fastify';
 import { Test } from '@nestjs/testing';
-import * as request from 'supertest';
-import { ApplicationModule } from '../src/app.module';
+import { AddressInfo, connect } from 'net';
+import request from 'supertest';
+import { AppModule } from '../src/app.module.js';
+import { listenOnLoopback } from '../../_support/listen-on-loopback.js';
 
 const RETURN_VALUE = 'test';
 const MIDDLEWARE_VALUE = 'middleware';
@@ -22,6 +24,11 @@ const MIDDLEWARE_VALUE = 'middleware';
 class TestController {
   @Get('test')
   test() {
+    return RETURN_VALUE;
+  }
+
+  @Get('test/test')
+  testTest() {
     return RETURN_VALUE;
   }
 
@@ -45,6 +52,16 @@ class TestController {
     return RETURN_VALUE;
   }
 
+  @Get('legacy-wildcard/overview')
+  testLegacyWildcard() {
+    return RETURN_VALUE;
+  }
+
+  @Get('splat-wildcard/overview')
+  testSplatWildcard() {
+    return RETURN_VALUE;
+  }
+
   @Get('overview/:id')
   overviewById() {
     return RETURN_VALUE;
@@ -52,20 +69,366 @@ class TestController {
 }
 
 @Module({
-  imports: [ApplicationModule],
+  imports: [AppModule],
   controllers: [TestController],
 })
 class TestModule {
   configure(consumer: MiddlewareConsumer) {
     consumer
       .apply((req, res, next) => res.end(MIDDLEWARE_VALUE))
-      .exclude('test', 'overview/:id', 'wildcard/(.*)', {
-        path: 'middleware',
-        method: RequestMethod.POST,
-      })
+      .exclude(
+        'test',
+        'overview/:id',
+        'wildcard/*',
+        'legacy-wildcard/(.*)',
+        'splat-wildcard/*splat',
+        {
+          path: 'middleware',
+          method: RequestMethod.POST,
+        },
+      )
       .forRoutes('*');
   }
 }
+
+@Controller('users')
+class UsersController {
+  @Get('login')
+  login() {
+    return RETURN_VALUE;
+  }
+
+  @Get(':id')
+  findOne() {
+    return RETURN_VALUE;
+  }
+}
+
+@Controller('files')
+class FilesController {
+  @Get('public')
+  public() {
+    return RETURN_VALUE;
+  }
+
+  @Get('*')
+  findAll() {
+    return RETURN_VALUE;
+  }
+}
+
+@Controller('reports')
+class ReportsController {
+  @Get('*')
+  read() {
+    return 'read';
+  }
+
+  @Get()
+  about() {
+    return RETURN_VALUE;
+  }
+}
+
+@Controller('thumbnails')
+class ThumbnailsController {
+  @Get(':id.png')
+  thumbnail() {
+    return RETURN_VALUE;
+  }
+
+  @Get(':id')
+  findOne() {
+    return RETURN_VALUE;
+  }
+}
+
+@Controller('docs')
+class DocsController {
+  @Get(':page')
+  findOne() {
+    return RETURN_VALUE;
+  }
+
+  @Get('*')
+  findAll() {
+    return RETURN_VALUE;
+  }
+}
+
+@Module({
+  controllers: [
+    UsersController,
+    FilesController,
+    ReportsController,
+    DocsController,
+    ThumbnailsController,
+  ],
+})
+class RouteMatchingModule {
+  configure(consumer: MiddlewareConsumer) {
+    consumer
+      .apply((req, res, next) => res.end(MIDDLEWARE_VALUE))
+      .exclude(
+        'users/login',
+        'files/public',
+        'reports',
+        'docs/:page',
+        'thumbnails/:id.png',
+      )
+      .forRoutes(
+        UsersController,
+        FilesController,
+        ReportsController,
+        DocsController,
+        ThumbnailsController,
+      );
+  }
+}
+
+@Controller('profiles')
+class ProfilesController {
+  @Get(':id')
+  findOne() {
+    return RETURN_VALUE;
+  }
+
+  @Get(':id/avatar')
+  avatar() {
+    return RETURN_VALUE;
+  }
+}
+
+@Module({
+  controllers: [ProfilesController],
+})
+class RequestTargetModule {
+  configure(consumer: MiddlewareConsumer) {
+    consumer
+      .apply((req, res, next) => res.end(MIDDLEWARE_VALUE))
+      .exclude('profiles/:id/avatar')
+      .forRoutes(ProfilesController);
+  }
+}
+
+describe('Exclude middleware (fastify) - request targets', () => {
+  let app: INestApplication;
+  let port: number;
+
+  /**
+   * "supertest" never sends a "#" in the request target, so the request has
+   * to be written to the socket manually.
+   */
+  const sendRawRequest = (requestTarget: string) =>
+    new Promise<{ statusCode: number; body: string }>((resolve, reject) => {
+      let response = '';
+      const socket = connect(port, '127.0.0.1', () => {
+        socket.write(
+          `GET ${requestTarget} HTTP/1.1\r\n` +
+            `Host: 127.0.0.1:${port}\r\n` +
+            `Connection: close\r\n\r\n`,
+        );
+      });
+      socket.setEncoding('utf8');
+      socket.on('data', chunk => (response += chunk));
+      socket.on('error', reject);
+      socket.on('end', () => {
+        const [head, body = ''] = response.split('\r\n\r\n');
+        resolve({ statusCode: Number(head.split(' ')[1]), body });
+      });
+    });
+
+  beforeEach(async () => {
+    app = (
+      await Test.createTestingModule({
+        imports: [RequestTargetModule],
+      }).compile()
+    ).createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+
+    await listenOnLoopback(app);
+    await app.getHttpAdapter().getInstance().ready();
+    port = (app.getHttpServer().address() as AddressInfo).port;
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  it(`should exclude "/profiles/1/avatar" endpoint`, async () => {
+    const response = await sendRawRequest('/profiles/1/avatar');
+    expect(response.body).toBe(RETURN_VALUE);
+  });
+
+  it(`should not exclude "/profiles/1#/avatar", which the router serves with "/profiles/:id"`, async () => {
+    const response = await sendRawRequest('/profiles/1#/avatar');
+    expect(response.body).toBe(MIDDLEWARE_VALUE);
+  });
+});
+
+describe.each([
+  ['"routerOptions"', { routerOptions: { useSemicolonDelimiter: true } }],
+  ['the top-level option', { useSemicolonDelimiter: true }],
+])(
+  'Exclude middleware (fastify) - path ending at a semicolon (%s)',
+  (_, options) => {
+    let app: INestApplication;
+
+    beforeEach(async () => {
+      app = (
+        await Test.createTestingModule({
+          imports: [RequestTargetModule],
+        }).compile()
+      ).createNestApplication<NestFastifyApplication>(
+        new FastifyAdapter(options),
+      );
+
+      await listenOnLoopback(app);
+      await app.getHttpAdapter().getInstance().ready();
+    });
+
+    afterEach(async () => {
+      await app.close();
+    });
+
+    it(`should not exclude "/profiles/1;/avatar", which the router serves with "/profiles/:id"`, () => {
+      return request(app.getHttpServer())
+        .get('/profiles/1;/avatar')
+        .expect(200, MIDDLEWARE_VALUE);
+    });
+
+    it(`should exclude "/profiles/1/avatar;size=1", which the router serves with "/profiles/:id/avatar"`, () => {
+      return request(app.getHttpServer())
+        .get('/profiles/1/avatar;size=1')
+        .expect(200, RETURN_VALUE);
+    });
+  },
+);
+
+describe('Exclude middleware (fastify) - route matching', () => {
+  let app: INestApplication;
+
+  const createApp = async (adapter: FastifyAdapter) => {
+    app = (
+      await Test.createTestingModule({
+        imports: [RouteMatchingModule],
+      }).compile()
+    ).createNestApplication<NestFastifyApplication>(adapter);
+
+    await listenOnLoopback(app);
+    await app.getHttpAdapter().getInstance().ready();
+  };
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  describe('by default', () => {
+    beforeEach(() => createApp(new FastifyAdapter()));
+
+    it(`should exclude "/users/login" endpoint`, () => {
+      return request(app.getHttpServer())
+        .get('/users/login')
+        .expect(200, RETURN_VALUE);
+    });
+
+    it(`should not exclude "/users/LOGIN", which the router serves with "/users/:id"`, () => {
+      return request(app.getHttpServer())
+        .get('/users/LOGIN')
+        .expect(200, MIDDLEWARE_VALUE);
+    });
+
+    it(`should not exclude "/reports/", which the router serves with "/reports/*"`, () => {
+      return request(app.getHttpServer())
+        .get('/reports/')
+        .expect(200, MIDDLEWARE_VALUE);
+    });
+
+    it(`should exclude "/docs/:page" endpoint for a parameter of 100 characters`, () => {
+      return request(app.getHttpServer())
+        .get(`/docs/${'a'.repeat(100)}`)
+        .expect(200, RETURN_VALUE);
+    });
+
+    it(`should not exclude a longer "/docs/:page" parameter, which the router serves with "/docs/*"`, async () => {
+      await request(app.getHttpServer())
+        .get(`/docs/${'a'.repeat(101)}`)
+        .expect(200, MIDDLEWARE_VALUE);
+      await request(app.getHttpServer())
+        .get(`/docs/internal${'%2F.'.repeat(50)}`)
+        .expect(200, MIDDLEWARE_VALUE);
+    });
+
+    it(`should not exclude "/files/public/", which the router serves with "/files/*"`, () => {
+      return request(app.getHttpServer())
+        .get('/files/public/')
+        .expect(200, MIDDLEWARE_VALUE);
+    });
+  });
+
+  describe('when the router is case-insensitive', () => {
+    beforeEach(() =>
+      createApp(
+        new FastifyAdapter({ routerOptions: { caseSensitive: false } }),
+      ),
+    );
+
+    it(`should exclude "/users/LOGIN", which the router serves with "/users/login"`, () => {
+      return request(app.getHttpServer())
+        .get('/users/LOGIN')
+        .expect(200, RETURN_VALUE);
+    });
+
+    it(`should exclude "/thumbnails/7.png" endpoint`, () => {
+      return request(app.getHttpServer())
+        .get('/thumbnails/7.png')
+        .expect(200, RETURN_VALUE);
+    });
+
+    it(`should not exclude "/thumbnails/7.PNG", which the router serves with "/thumbnails/:id"`, () => {
+      return request(app.getHttpServer())
+        .get('/thumbnails/7.PNG')
+        .expect(200, MIDDLEWARE_VALUE);
+    });
+  });
+
+  describe('when the router matches longer parameters', () => {
+    beforeEach(() =>
+      createApp(new FastifyAdapter({ routerOptions: { maxParamLength: 200 } })),
+    );
+
+    it(`should exclude "/docs/:page" endpoint for a parameter of 200 characters`, () => {
+      return request(app.getHttpServer())
+        .get(`/docs/${'a'.repeat(200)}`)
+        .expect(200, RETURN_VALUE);
+    });
+
+    it(`should not exclude a longer "/docs/:page" parameter, which the router serves with "/docs/*"`, () => {
+      return request(app.getHttpServer())
+        .get(`/docs/${'a'.repeat(201)}`)
+        .expect(200, MIDDLEWARE_VALUE);
+    });
+  });
+
+  describe('when the router ignores a trailing slash', () => {
+    beforeEach(() =>
+      createApp(
+        new FastifyAdapter({ routerOptions: { ignoreTrailingSlash: true } }),
+      ),
+    );
+
+    it(`should exclude "/files/public/", which the router serves with "/files/public"`, () => {
+      return request(app.getHttpServer())
+        .get('/files/public/')
+        .expect(200, RETURN_VALUE);
+    });
+
+    it(`should exclude "/reports/", which the router serves with "/reports" rather than "/reports/*"`, () => {
+      return request(app.getHttpServer())
+        .get('/reports/')
+        .expect(200, RETURN_VALUE);
+    });
+  });
+});
 
 describe('Exclude middleware (fastify)', () => {
   let app: INestApplication;
@@ -77,12 +440,18 @@ describe('Exclude middleware (fastify)', () => {
       }).compile()
     ).createNestApplication<NestFastifyApplication>(new FastifyAdapter());
 
-    await app.init();
+    await listenOnLoopback(app);
     await app.getHttpAdapter().getInstance().ready();
   });
 
   it(`should exclude "/test" endpoint`, () => {
     return request(app.getHttpServer()).get('/test').expect(200, RETURN_VALUE);
+  });
+
+  it(`should not exclude "/test/test" endpoint`, () => {
+    return request(app.getHttpServer())
+      .get('/test/test')
+      .expect(200, MIDDLEWARE_VALUE);
   });
 
   it(`should not exclude "/test2" endpoint`, () => {
@@ -112,6 +481,18 @@ describe('Exclude middleware (fastify)', () => {
   it(`should exclude "/wildcard/overview" endpoint (by wildcard)`, () => {
     return request(app.getHttpServer())
       .get('/wildcard/overview')
+      .expect(200, RETURN_VALUE);
+  });
+
+  it(`should exclude "/legacy-wildcard/overview" endpoint (by wildcard, legacy syntax)`, () => {
+    return request(app.getHttpServer())
+      .get('/legacy-wildcard/overview')
+      .expect(200, RETURN_VALUE);
+  });
+
+  it(`should exclude "/splat-wildcard/overview" endpoint (by wildcard, new syntax)`, () => {
+    return request(app.getHttpServer())
+      .get('/splat-wildcard/overview')
       .expect(200, RETURN_VALUE);
   });
 

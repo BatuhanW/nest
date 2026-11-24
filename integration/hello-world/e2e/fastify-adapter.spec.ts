@@ -3,15 +3,14 @@ import {
   NestFastifyApplication,
 } from '@nestjs/platform-fastify';
 import { Test } from '@nestjs/testing';
-import { expect } from 'chai';
-import { ApplicationModule } from '../src/app.module';
+import { AppModule } from '../src/app.module.js';
 
 describe('Hello world (fastify adapter)', () => {
   let app: NestFastifyApplication;
 
   beforeEach(async () => {
     const module = await Test.createTestingModule({
-      imports: [ApplicationModule],
+      imports: [AppModule],
     }).compile();
 
     app = module.createNestApplication<NestFastifyApplication>(
@@ -26,7 +25,10 @@ describe('Hello world (fastify adapter)', () => {
         method: 'GET',
         url: '/hello',
       })
-      .then(({ payload }) => expect(payload).to.be.eql('Hello world!'));
+      .then(({ payload, statusCode }) => {
+        expect(statusCode).toBe(200);
+        expect(payload).toEqual('Hello world!');
+      });
   });
 
   it(`/GET (Promise/async)`, () => {
@@ -35,7 +37,10 @@ describe('Hello world (fastify adapter)', () => {
         method: 'GET',
         url: '/hello/async',
       })
-      .then(({ payload }) => expect(payload).to.be.eql('Hello world!'));
+      .then(({ payload, statusCode }) => {
+        expect(statusCode).toBe(200);
+        expect(payload).toEqual('Hello world!');
+      });
   });
 
   it(`/GET (Observable stream)`, () => {
@@ -44,7 +49,10 @@ describe('Hello world (fastify adapter)', () => {
         method: 'GET',
         url: '/hello/stream',
       })
-      .then(({ payload }) => expect(payload).to.be.eql('Hello world!'));
+      .then(({ payload, statusCode }) => {
+        expect(statusCode).toBe(200);
+        expect(payload).toEqual('Hello world!');
+      });
   });
 
   it(`/GET { host: ":tenant.example.com" } not matched`, () => {
@@ -53,12 +61,12 @@ describe('Hello world (fastify adapter)', () => {
         method: 'GET',
         url: '/host',
       })
-      .then(({ payload }) => {
-        expect(JSON.parse(payload)).to.be.eql({
-          error: 'Internal Server Error',
-          message:
-            'HTTP adapter does not support filtering on host: ":tenant.example.com"',
-          statusCode: 500,
+      .then(({ payload, statusCode }) => {
+        expect(statusCode).toBe(404);
+        expect(JSON.parse(payload)).toEqual({
+          error: 'Not Found',
+          message: 'Cannot GET /host',
+          statusCode: 404,
         });
       });
   });
@@ -69,12 +77,12 @@ describe('Hello world (fastify adapter)', () => {
         method: 'GET',
         url: '/host-array',
       })
-      .then(({ payload }) => {
-        expect(JSON.parse(payload)).to.be.eql({
-          error: 'Internal Server Error',
-          message:
-            'HTTP adapter does not support filtering on hosts: [":tenant.example1.com", ":tenant.example2.com"]',
-          statusCode: 500,
+      .then(({ payload, statusCode }) => {
+        expect(statusCode).toBe(404);
+        expect(JSON.parse(payload)).toEqual({
+          error: 'Not Found',
+          message: 'Cannot GET /host-array',
+          statusCode: 404,
         });
       });
   });
@@ -84,7 +92,19 @@ describe('Hello world (fastify adapter)', () => {
       .inject()
       .get('/hello')
       .end()
-      .then(({ payload }) => expect(payload).to.be.eql('Hello world!'));
+      .then(({ payload, statusCode }) => {
+        expect(statusCode).toBe(200);
+        expect(payload).toEqual('Hello world!');
+      });
+  });
+
+  it('/HEAD should respond to with a 200', () => {
+    return app
+      .inject({
+        method: 'HEAD',
+        url: '/hello',
+      })
+      .then(({ statusCode }) => expect(statusCode).toBe(200));
   });
 
   afterEach(async () => {

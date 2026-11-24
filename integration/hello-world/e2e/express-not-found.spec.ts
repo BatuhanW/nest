@@ -1,0 +1,197 @@
+import {
+  ArgumentsHost,
+  HttpException,
+  INestApplication,
+  RequestMethod,
+  VersioningType,
+} from '@nestjs/common';
+import { Test } from '@nestjs/testing';
+import request from 'supertest';
+import { AppModule } from '../src/app.module.js';
+import { listenOnLoopback } from '../../_support/listen-on-loopback.js';
+
+const jsonFilter = {
+  catch(exception: HttpException, host: ArgumentsHost) {
+    host
+      .switchToHttp()
+      .getResponse()
+      .status(exception.getStatus())
+      .json({ handledBy: 'nest' });
+  },
+};
+
+describe('Hello world (express not-found handling)', () => {
+  let app: INestApplication;
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  async function createApp(
+    configure: (app: INestApplication) => void,
+  ): Promise<INestApplication> {
+    const module = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+    app = module.createNestApplication();
+    configure(app);
+    app.useGlobalFilters(jsonFilter);
+    await listenOnLoopback(app);
+    return app;
+  }
+
+  it.each([
+    { prefix: 'api', path: '/api/missing' },
+    { prefix: '/api', path: '/api/missing' },
+    { prefix: 'api', path: '/api' },
+    { prefix: '/api', path: '/api/' },
+    { prefix: 'api/', path: '/api/missing' },
+    { prefix: '/api/', path: '/api/missing' },
+    { prefix: 'api/', path: '/api' },
+    { prefix: '/api/', path: '/api/' },
+    { prefix: 'api/v1', path: '/api/v1/missing' },
+    { prefix: 'api/v1/', path: '/api/v1/missing' },
+    { prefix: undefined, path: '/missing' },
+    { prefix: '', path: '/missing' },
+    { prefix: '/', path: '/missing' },
+    { prefix: '/', path: '/' },
+  ])(
+    'uses the global exception filter for $path with prefix $prefix',
+    async ({ prefix, path }) => {
+      await createApp(app => {
+        if (prefix !== undefined) {
+          app.setGlobalPrefix(prefix);
+        }
+      });
+
+      await request(app.getHttpServer())
+        .get(path)
+        .expect(404)
+        .expect({ handledBy: 'nest' });
+    },
+  );
+
+  // A path taken out of the global prefix is still a path Nest owns, so a
+  // request it declares no handler for is an unmatched request rather than
+  // something for the framework to answer. The controller declares only GET
+  // methods on "hello", which makes POST the miss.
+  describe('a method miss on an excluded route', () => {
+    it('is answered by the exception filter', async () => {
+      await createApp(app =>
+        app.setGlobalPrefix('api', { exclude: ['hello'] }),
+      );
+
+      await request(app.getHttpServer())
+        .post('/hello')
+        .expect(404)
+        .expect({ handledBy: 'nest' });
+    });
+
+    it('is answered when the exclusion names a method', async () => {
+      // The exclusion names GET, and GET is the one method that is NOT a miss
+      // here. Mounting by the named method would leave every other one to
+      // express, which is why the adapter mounts for all of them.
+      await createApp(app =>
+        app.setGlobalPrefix('api', {
+          exclude: [{ path: 'hello', method: RequestMethod.GET }],
+        }),
+      );
+
+      await request(app.getHttpServer())
+        .post('/hello')
+        .expect(404)
+        .expect({ handledBy: 'nest' });
+    });
+
+    it('is answered under a wildcard exclusion', async () => {
+      await createApp(app =>
+        app.setGlobalPrefix('api', { exclude: ['hello/{*splat}'] }),
+      );
+
+      await request(app.getHttpServer())
+        .post('/hello/async')
+        .expect(404)
+        .expect({ handledBy: 'nest' });
+    });
+
+    it('still serves the excluded route itself', async () => {
+      await createApp(app =>
+        app.setGlobalPrefix('api', { exclude: ['hello'] }),
+      );
+
+      await request(app.getHttpServer()).get('/hello').expect(200);
+    });
+  });
+
+  // URI versioning puts the version in front of the excluded route, so the
+  // route lives at "/v1/hello" while the exclusion still reads "hello".
+  describe('a method miss on an excluded route under URI versioning', () => {
+    function createVersionedApp(exclude: string[]) {
+      return createApp(app => {
+        app.enableVersioning({ type: VersioningType.URI, defaultVersion: '1' });
+        app.setGlobalPrefix('api', { exclude });
+      });
+    }
+
+    it('is answered by the exception filter', async () => {
+      await createVersionedApp(['hello']);
+
+      await request(app.getHttpServer())
+        .post('/v1/hello')
+        .expect(404)
+        .expect({ handledBy: 'nest' });
+    });
+
+    it('is answered under a wildcard exclusion', async () => {
+      await createVersionedApp(['hello/{*splat}']);
+
+      await request(app.getHttpServer())
+        .post('/v1/hello/async')
+        .expect(404)
+        .expect({ handledBy: 'nest' });
+    });
+
+    it('is answered for an undeclared path under a wildcard exclusion', async () => {
+      await createVersionedApp(['hello/{*splat}']);
+
+      await request(app.getHttpServer())
+        .post('/v1/hello/other')
+        .expect(404)
+        .expect({ handledBy: 'nest' });
+    });
+
+    it('still serves the excluded route itself', async () => {
+      await createVersionedApp(['hello']);
+
+      await request(app.getHttpServer()).get('/v1/hello').expect(200);
+    });
+
+    it('leaves an undeclared version to express', async () => {
+      await createVersionedApp(['hello']);
+
+      await request(app.getHttpServer())
+        .post('/v2/hello')
+        .expect(404)
+        .expect('Content-Type', /text\/html/);
+    });
+
+    it('leaves the unversioned path to express', async () => {
+      await createVersionedApp(['hello']);
+
+      await request(app.getHttpServer())
+        .post('/hello')
+        .expect(404)
+        .expect('Content-Type', /text\/html/);
+    });
+
+    it('does not shadow a raw route on the unversioned path', async () => {
+      await createVersionedApp(['hello']);
+      app
+        .getHttpAdapter()
+        .getInstance()
+        .get('/hello', (req, res) => res.send('raw'));
+
+      await request(app.getHttpServer()).get('/hello').expect(200, 'raw');
+    });
+  });
+});

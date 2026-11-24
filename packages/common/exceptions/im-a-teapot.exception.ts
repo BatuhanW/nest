@@ -1,5 +1,5 @@
-import { HttpStatus } from '../enums/http-status.enum';
-import { HttpException } from './http.exception';
+import { HttpStatus } from '../enums/http-status.enum.js';
+import { HttpException, HttpExceptionOptions } from './http.exception.js';
 
 /**
  * Defines an HTTP exception for *ImATeapotException* type errors.
@@ -7,7 +7,7 @@ import { HttpException } from './http.exception';
  * Any attempt to brew coffee with a teapot should result in the error code
  * "418 I'm a teapot". The resulting entity body MAY be short and stout.
  *
- * @see [Base Exceptions](https://docs.nestjs.com/exception-filters#base-exceptions)
+ * @see [Built-in HTTP exceptions](https://docs.nestjs.com/exception-filters#built-in-http-exceptions)
  *
  * @publicApi
  */
@@ -16,12 +16,12 @@ export class ImATeapotException extends HttpException {
    * Instantiate an `ImATeapotException` Exception.
    *
    * @example
-   * `throw new BadGatewayException()`
+   * `throw new ImATeapotException()`
    *
    * @usageNotes
    * The HTTP response status code will be 418.
    * - The `objectOrError` argument defines the JSON response body or the message string.
-   * - The `description` argument contains a short description of the HTTP error.
+   * - The `descriptionOrOptions` argument contains either a short description of the HTTP error or an options object used to provide an underlying error cause.
    *
    * By default, the JSON response body contains two properties:
    * - `statusCode`: this will be the value 418.
@@ -34,19 +34,24 @@ export class ImATeapotException extends HttpException {
    * and return it as the JSON response body.
    *
    * @param objectOrError string or object describing the error condition.
-   * @param description a short description of the HTTP error.
+   * @param descriptionOrOptions either a short description of the HTTP error or an options object used to provide an underlying error cause
    */
   constructor(
-    objectOrError?: string | object | any,
-    description = `I'm a teapot`,
+    objectOrError?: any,
+    descriptionOrOptions: string | HttpExceptionOptions = `I'm a teapot`,
   ) {
+    const { description = `I'm a teapot`, httpExceptionOptions } =
+      HttpException.extractDescriptionAndOptionsFrom(descriptionOrOptions);
+
     super(
       HttpException.createBody(
         objectOrError,
         description,
         HttpStatus.I_AM_A_TEAPOT,
+        httpExceptionOptions?.errorCode,
       ),
       HttpStatus.I_AM_A_TEAPOT,
+      httpExceptionOptions,
     );
   }
 }

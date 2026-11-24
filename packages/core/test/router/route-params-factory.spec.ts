@@ -1,18 +1,24 @@
-import { expect } from 'chai';
-import { RouteParamtypes } from '../../../common/enums/route-paramtypes.enum';
-import { RouteParamsFactory } from '../../router/route-params-factory';
+import { RouteParamtypes } from '../../../common/enums/route-paramtypes.enum.js';
+import { ApplicationConfig } from '../../application-config.js';
+import { CookieSigner } from '../../helpers/cookies/cookie-signer.js';
+import { RouteParamsFactory } from '../../router/route-params-factory.js';
 
 describe('RouteParamsFactory', () => {
   let factory: RouteParamsFactory;
+  let untypedFactory: any;
+
   beforeEach(() => {
     factory = new RouteParamsFactory();
+    untypedFactory = factory as any;
   });
+
   describe('exchangeKeyForValue', () => {
     const res = {};
     const next = () => ({});
     const req = {
       ip: 'ip',
       session: null,
+      rawBody: Buffer.from('{"foo":"bar"}'),
       body: {
         foo: 'bar',
       },
@@ -36,113 +42,226 @@ describe('RouteParamsFactory', () => {
       describe(`RouteParamtypes.NEXT`, () => {
         it('should return next object', () => {
           expect(
-            (factory as any).exchangeKeyForValue(RouteParamtypes.NEXT, ...args),
-          ).to.be.eql(next);
+            untypedFactory.exchangeKeyForValue(RouteParamtypes.NEXT, ...args),
+          ).toEqual(next);
         });
       });
       describe(`RouteParamtypes.RESPONSE`, () => {
         it('should return response object', () => {
           expect(
-            (factory as any).exchangeKeyForValue(
+            untypedFactory.exchangeKeyForValue(
               RouteParamtypes.RESPONSE,
               ...args,
             ),
-          ).to.be.eql(res);
+          ).toEqual(res);
         });
       });
       describe(`RouteParamtypes.REQUEST`, () => {
         it('should return request object', () => {
           expect(
-            (factory as any).exchangeKeyForValue(
+            untypedFactory.exchangeKeyForValue(
               RouteParamtypes.REQUEST,
               ...args,
             ),
-          ).to.be.eql(req);
+          ).toEqual(req);
         });
       });
       describe(`RouteParamtypes.BODY`, () => {
         it('should return body object', () => {
           expect(
-            (factory as any).exchangeKeyForValue(RouteParamtypes.BODY, ...args),
-          ).to.be.eql(req.body);
+            untypedFactory.exchangeKeyForValue(RouteParamtypes.BODY, ...args),
+          ).toEqual(req.body);
+        });
+        describe('with a key', () => {
+          const extract = (body: unknown, key: string) =>
+            factory.exchangeKeyForValue(RouteParamtypes.BODY, key, {
+              req: { body },
+              res,
+              next,
+            });
+
+          it('should return a property of the body object', () => {
+            expect(extract(req.body, 'foo')).toBe('bar');
+          });
+          it('should not resolve the key against the prototype of an array, a Buffer or a primitive', () => {
+            expect(extract(Buffer.from('x'), 'parent')).toBeUndefined();
+            expect(extract([], 'values')).toBeUndefined();
+            expect(extract('text', 'search')).toBeUndefined();
+          });
+          it('should still resolve their own properties', () => {
+            expect(extract(['a'], '0')).toBe('a');
+            expect(extract('text', 'length')).toBe(4);
+          });
+        });
+      });
+      describe(`RouteParamtypes.RAW_BODY`, () => {
+        it('should return rawBody buffer', () => {
+          expect(
+            untypedFactory.exchangeKeyForValue(
+              RouteParamtypes.RAW_BODY,
+              ...args,
+            ),
+          ).toEqual(req.rawBody);
         });
       });
       describe(`RouteParamtypes.HEADERS`, () => {
         it('should return headers object', () => {
           expect(
-            (factory as any).exchangeKeyForValue(
+            untypedFactory.exchangeKeyForValue(
               RouteParamtypes.HEADERS,
               ...args,
             ),
-          ).to.be.eql(req.headers);
+          ).toEqual(req.headers);
         });
       });
       describe(`RouteParamtypes.IP`, () => {
         it('should return ip property', () => {
           expect(
-            (factory as any).exchangeKeyForValue(RouteParamtypes.IP, ...args),
-          ).to.be.equal(req.ip);
+            untypedFactory.exchangeKeyForValue(RouteParamtypes.IP, ...args),
+          ).toBe(req.ip);
         });
       });
       describe(`RouteParamtypes.SESSION`, () => {
         it('should return session object', () => {
           expect(
-            (factory as any).exchangeKeyForValue(
+            untypedFactory.exchangeKeyForValue(
               RouteParamtypes.SESSION,
               ...args,
             ),
-          ).to.be.eql(req.session);
+          ).toEqual(req.session);
         });
       });
       describe(`RouteParamtypes.QUERY`, () => {
         it('should return query object', () => {
           expect(
-            (factory as any).exchangeKeyForValue(
-              RouteParamtypes.QUERY,
-              ...args,
-            ),
-          ).to.be.eql(req.query);
+            untypedFactory.exchangeKeyForValue(RouteParamtypes.QUERY, ...args),
+          ).toEqual(req.query);
         });
       });
       describe(`RouteParamtypes.PARAM`, () => {
         it('should return params object', () => {
           expect(
-            (factory as any).exchangeKeyForValue(
-              RouteParamtypes.PARAM,
-              ...args,
-            ),
-          ).to.be.eql(req.params);
+            untypedFactory.exchangeKeyForValue(RouteParamtypes.PARAM, ...args),
+          ).toEqual(req.params);
         });
       });
       describe(`RouteParamtypes.HOST`, () => {
-        it('should returns hosts object', () => {
+        it('should return hosts object', () => {
           expect(
-            (factory as any).exchangeKeyForValue(RouteParamtypes.HOST, ...args),
-          ).to.be.eql(req.hosts);
+            untypedFactory.exchangeKeyForValue(RouteParamtypes.HOST, ...args),
+          ).toEqual(req.hosts);
         });
       });
       describe(`RouteParamtypes.FILE`, () => {
         it('should return file object', () => {
           expect(
-            (factory as any).exchangeKeyForValue(RouteParamtypes.FILE, ...args),
-          ).to.be.eql(req.file);
+            untypedFactory.exchangeKeyForValue(RouteParamtypes.FILE, ...args),
+          ).toEqual(req.file);
         });
       });
       describe(`RouteParamtypes.FILES`, () => {
         it('should return files object', () => {
           expect(
-            (factory as any).exchangeKeyForValue(
-              RouteParamtypes.FILES,
-              ...args,
+            untypedFactory.exchangeKeyForValue(RouteParamtypes.FILES, ...args),
+          ).toEqual(req.files);
+        });
+      });
+      describe(`RouteParamtypes.COOKIES`, () => {
+        const cookieReq = () => ({
+          headers: { cookie: 'theme=dark; lang=en' },
+        });
+
+        it('should return all cookies', () => {
+          expect({
+            ...untypedFactory.exchangeKeyForValue(
+              RouteParamtypes.COOKIES,
+              null,
+              {
+                req: cookieReq(),
+                res,
+                next,
+              },
             ),
-          ).to.be.eql(req.files);
+          }).toEqual({ theme: 'dark', lang: 'en' });
+        });
+        it('should return a single cookie', () => {
+          expect(
+            untypedFactory.exchangeKeyForValue(
+              RouteParamtypes.COOKIES,
+              'theme',
+              {
+                req: cookieReq(),
+                res,
+                next,
+              },
+            ),
+          ).toEqual('dark');
+        });
+        it('should use req.cookies when a middleware populated it', () => {
+          const cookies = { theme: 'light' };
+          expect(
+            untypedFactory.exchangeKeyForValue(RouteParamtypes.COOKIES, null, {
+              req: { ...cookieReq(), cookies },
+              res,
+              next,
+            }),
+          ).toBe(cookies);
+        });
+      });
+      describe(`RouteParamtypes.SIGNED_COOKIES`, () => {
+        const signer = new CookieSigner('secret');
+        const signedReq = () => ({
+          headers: {
+            cookie: `uid=${encodeURIComponent(signer.sign('42'))}; forged=s%3A1.x`,
+          },
+        });
+        let signedFactory: any;
+
+        beforeEach(() => {
+          const config = new ApplicationConfig();
+          config.setCookieSigner(signer);
+          signedFactory = new RouteParamsFactory(config);
+        });
+
+        it('should return the verified signed cookies', () => {
+          expect({
+            ...signedFactory.exchangeKeyForValue(
+              RouteParamtypes.SIGNED_COOKIES,
+              null,
+              { req: signedReq(), res, next },
+            ),
+          }).toEqual({ uid: '42' });
+        });
+        it('should return a single signed cookie, undefined when forged', () => {
+          const req = signedReq();
+          expect(
+            signedFactory.exchangeKeyForValue(
+              RouteParamtypes.SIGNED_COOKIES,
+              'uid',
+              { req, res, next },
+            ),
+          ).toEqual('42');
+          expect(
+            signedFactory.exchangeKeyForValue(
+              RouteParamtypes.SIGNED_COOKIES,
+              'forged',
+              { req, res, next },
+            ),
+          ).toBeUndefined();
+        });
+        it('should throw when no secret is configured', () => {
+          expect(() =>
+            untypedFactory.exchangeKeyForValue(
+              RouteParamtypes.SIGNED_COOKIES,
+              'uid',
+              { req: signedReq(), res, next },
+            ),
+          ).toThrow(/no cookie secret is configured/);
         });
       });
       describe('not available', () => {
         it('should return null', () => {
-          expect((factory as any).exchangeKeyForValue(-1, ...args)).to.be.eql(
-            null,
-          );
+          expect(untypedFactory.exchangeKeyForValue(-1, ...args)).toEqual(null);
         });
       });
     });

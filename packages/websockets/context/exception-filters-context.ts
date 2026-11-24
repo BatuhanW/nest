@@ -1,9 +1,17 @@
-import { EXCEPTION_FILTERS_METADATA } from '@nestjs/common/constants';
-import { isEmpty } from '@nestjs/common/utils/shared.utils';
-import { BaseExceptionFilterContext } from '@nestjs/core/exceptions/base-exception-filter-context';
-import { NestContainer } from '@nestjs/core/injector/container';
-import { WsExceptionsHandler } from '../exceptions/ws-exceptions-handler';
+import { WsExceptionsHandler } from '../exceptions/ws-exceptions-handler.js';
+import {
+  EXCEPTION_FILTERS_METADATA,
+  isEmptyArray,
+} from '@nestjs/common/internal';
+import {
+  BaseExceptionFilterContext,
+  STATIC_CONTEXT,
+} from '@nestjs/core/internal';
+import type { NestContainer } from '@nestjs/core';
 
+/**
+ * @publicApi
+ */
 export class ExceptionFiltersContext extends BaseExceptionFilterContext {
   constructor(container: NestContainer) {
     super(container);
@@ -13,6 +21,8 @@ export class ExceptionFiltersContext extends BaseExceptionFilterContext {
     instance: object,
     callback: <TClient>(client: TClient, data: any) => any,
     moduleKey: string,
+    contextId = STATIC_CONTEXT,
+    inquirerId?: string,
   ): WsExceptionsHandler {
     this.moduleContext = moduleKey;
 
@@ -21,8 +31,10 @@ export class ExceptionFiltersContext extends BaseExceptionFilterContext {
       instance,
       callback,
       EXCEPTION_FILTERS_METADATA,
+      contextId,
+      inquirerId,
     );
-    if (isEmpty(filters)) {
+    if (isEmptyArray(filters)) {
       return exceptionHandler;
     }
     exceptionHandler.setCustomFilters(filters.reverse());
@@ -30,6 +42,6 @@ export class ExceptionFiltersContext extends BaseExceptionFilterContext {
   }
 
   public getGlobalMetadata<T extends any[]>(): T {
-    return [] as T;
+    return [] as any[] as T;
   }
 }

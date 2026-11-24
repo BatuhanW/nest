@@ -1,11 +1,12 @@
+import { ApolloDriver } from '@nestjs/apollo';
 import { INestApplication } from '@nestjs/common';
 import { GraphQLModule } from '@nestjs/graphql';
 import { Test } from '@nestjs/testing';
-import { expect } from 'chai';
 import { join } from 'path';
-import * as request from 'supertest';
-import { CatsRequestScopedService } from '../src/cats/cats-request-scoped.service';
-import { CatsModule } from '../src/cats/cats.module';
+import request from 'supertest';
+import { CatsRequestScopedService } from '../src/cats/cats-request-scoped.service.js';
+import { CatsModule } from '../src/cats/cats.module.js';
+import { listenOnLoopback } from '../../_support/listen-on-loopback.js';
 
 describe('GraphQL request scoped', () => {
   let app: INestApplication;
@@ -15,13 +16,16 @@ describe('GraphQL request scoped', () => {
       imports: [
         CatsModule.enableRequestScope(),
         GraphQLModule.forRoot({
-          typePaths: [join(__dirname, '..', 'src', '**', '*.graphql')],
+          driver: ApolloDriver,
+          typePaths: [
+            join(import.meta.dirname, '..', 'src', '**', '*.graphql'),
+          ],
         }),
       ],
     }).compile();
 
     app = module.createNestApplication();
-    await app.init();
+    await listenOnLoopback(app);
 
     const performHttpCall = end =>
       request(app.getHttpServer())
@@ -40,7 +44,7 @@ describe('GraphQL request scoped', () => {
             ],
           },
         })
-        .end((err, res) => {
+        .end(err => {
           if (err) return end(err);
           end();
         });
@@ -51,7 +55,7 @@ describe('GraphQL request scoped', () => {
   });
 
   it(`should create resolver for each incoming request`, () => {
-    expect(CatsRequestScopedService.COUNTER).to.be.eql(3);
+    expect(CatsRequestScopedService.COUNTER).toEqual(3);
   });
 
   afterEach(async () => {

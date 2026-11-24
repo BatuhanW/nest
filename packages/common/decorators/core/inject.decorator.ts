@@ -1,8 +1,10 @@
 import {
+  PARAMTYPES_METADATA,
   PROPERTY_DEPS_METADATA,
   SELF_DECLARED_DEPS_METADATA,
-} from '../../constants';
-import { isFunction, isUndefined } from '../../utils/shared.utils';
+} from '../../constants.js';
+import { ForwardReference, InjectionToken } from '../../interfaces/index.js';
+import { isUndefined } from '../../utils/shared.utils.js';
 
 /**
  * Decorator that marks a constructor parameter as a target for
@@ -33,11 +35,17 @@ import { isFunction, isUndefined } from '../../utils/shared.utils';
  *
  * @publicApi
  */
-export function Inject<T = any>(token?: T) {
-  return (target: object, key: string | symbol, index?: number) => {
-    token = token || Reflect.getMetadata('design:type', target, key);
-    const type =
-      token && isFunction(token) ? ((token as any) as Function).name : token;
+export function Inject(
+  token?: InjectionToken | ForwardReference,
+): PropertyDecorator & ParameterDecorator {
+  const injectCallHasArguments = arguments.length > 0;
+
+  return (target: object, key: string | symbol | undefined, index?: number) => {
+    let type = token || Reflect.getMetadata('design:type', target, key!);
+    // Try to infer the token in a constructor-based injection
+    if (!type && !injectCallHasArguments) {
+      type = Reflect.getMetadata(PARAMTYPES_METADATA, target, key!)?.[index!];
+    }
 
     if (!isUndefined(index)) {
       let dependencies =
@@ -50,7 +58,10 @@ export function Inject<T = any>(token?: T) {
     let properties =
       Reflect.getMetadata(PROPERTY_DEPS_METADATA, target.constructor) || [];
 
-    properties = [...properties, { key, type }];
+    properties = [
+      ...properties.filter(property => property.key !== key),
+      { key, type },
+    ];
     Reflect.defineMetadata(
       PROPERTY_DEPS_METADATA,
       properties,

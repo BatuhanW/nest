@@ -1,36 +1,39 @@
-import { isFunction, isUndefined } from '@nestjs/common/utils/shared.utils';
-import { MetadataScanner } from '@nestjs/core/metadata-scanner';
 import { Observable } from 'rxjs';
 import {
   GATEWAY_SERVER_METADATA,
   MESSAGE_MAPPING_METADATA,
   MESSAGE_METADATA,
-} from './constants';
-import { NestGateway } from './interfaces/nest-gateway.interface';
+  PARAM_ARGS_METADATA,
+} from './constants.js';
+import { NestGateway } from './interfaces/nest-gateway.interface.js';
+import { WsParamtype } from './enums/ws-paramtype.enum.js';
+import { isFunction, isUndefined } from '@nestjs/common/internal';
+import type { MetadataScanner } from '@nestjs/core';
+import { type ParamsMetadata, ContextUtils } from '@nestjs/core/internal';
 
 export interface MessageMappingProperties {
   message: any;
   methodName: string;
-  callback: (...args: any[]) => Observable<any> | Promise<any> | any;
+  callback: (...args: any[]) => Observable<any> | Promise<any>;
+  isAckHandledManually: boolean;
 }
 
 export class GatewayMetadataExplorer {
+  private readonly contextUtils = new ContextUtils();
   constructor(private readonly metadataScanner: MetadataScanner) {}
 
   public explore(instance: NestGateway): MessageMappingProperties[] {
     const instancePrototype = Object.getPrototypeOf(instance);
-    return this.metadataScanner.scanFromPrototype<
-      NestGateway,
-      MessageMappingProperties
-    >(instance, instancePrototype, method =>
-      this.exploreMethodMetadata(instancePrototype, method),
-    );
+    return this.metadataScanner
+      .getAllMethodNames(instancePrototype)
+      .map(method => this.exploreMethodMetadata(instancePrototype, method)!)
+      .filter(metadata => metadata);
   }
 
   public exploreMethodMetadata(
     instancePrototype: object,
     methodName: string,
-  ): MessageMappingProperties {
+  ): MessageMappingProperties | null {
     const callback = instancePrototype[methodName];
     const isMessageMapping = Reflect.getMetadata(
       MESSAGE_MAPPING_METADATA,
@@ -40,16 +43,45 @@ export class GatewayMetadataExplorer {
       return null;
     }
     const message = Reflect.getMetadata(MESSAGE_METADATA, callback);
+    const isAckHandledManually = this.hasAckDecorator(
+      instancePrototype,
+      methodName,
+    );
+
     return {
       callback,
       message,
       methodName,
+      isAckHandledManually,
     };
+  }
+
+  private hasAckDecorator(
+    instancePrototype: object,
+    methodName: string,
+  ): boolean {
+    // Read the way the execution context reads the parameters of the handler
+    const paramsMetadata =
+      this.contextUtils.reflectCallbackMetadata<ParamsMetadata>(
+        Object.create(instancePrototype),
+        methodName,
+        PARAM_ARGS_METADATA,
+      );
+
+    if (!paramsMetadata) {
+      return false;
+    }
+    const metadataKeys = Object.keys(paramsMetadata);
+    return metadataKeys.some(key => {
+      const type = this.contextUtils.mapParamType(key);
+
+      return (Number(type) as WsParamtype) === WsParamtype.ACK;
+    });
   }
 
   public *scanForServerHooks(instance: NestGateway): IterableIterator<string> {
     for (const propertyKey in instance) {
-      if (isFunction(propertyKey)) {
+      if (isFunction(instance[propertyKey])) {
         continue;
       }
       const property = String(propertyKey);

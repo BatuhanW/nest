@@ -9,8 +9,9 @@ import { APP_INTERCEPTOR } from '@nestjs/core';
 import { Test } from '@nestjs/testing';
 import { of } from 'rxjs';
 import { map } from 'rxjs/operators';
-import * as request from 'supertest';
-import { ApplicationModule } from '../src/app.module';
+import request from 'supertest';
+import { AppModule } from '../src/app.module.js';
+import { listenOnLoopback } from '../../_support/listen-on-loopback.js';
 
 const RETURN_VALUE = 'test';
 
@@ -48,7 +49,7 @@ export class HeaderInterceptor {
     const ctx = context.switchToHttp();
     const res = ctx.getResponse();
     for (const key in this.headers) {
-      if (this.headers.hasOwnProperty(key)) {
+      if (Object.hasOwn(this.headers, key)) {
         res.header(key, this.headers[key]);
       }
     }
@@ -58,7 +59,7 @@ export class HeaderInterceptor {
 
 function createTestModule(interceptor) {
   return Test.createTestingModule({
-    imports: [ApplicationModule],
+    imports: [AppModule],
     providers: [
       {
         provide: APP_INTERCEPTOR,
@@ -76,7 +77,7 @@ describe('Interceptors', () => {
       await createTestModule(new OverrideInterceptor())
     ).createNestApplication();
 
-    await app.init();
+    await listenOnLoopback(app);
     return request(app.getHttpServer()).get('/hello').expect(200, RETURN_VALUE);
   });
 
@@ -85,7 +86,7 @@ describe('Interceptors', () => {
       await createTestModule(new TransformInterceptor())
     ).createNestApplication();
 
-    await app.init();
+    await listenOnLoopback(app);
     return request(app.getHttpServer())
       .get('/hello')
       .expect(200, { data: 'Hello world!' });
@@ -96,7 +97,7 @@ describe('Interceptors', () => {
       await createTestModule(new TransformInterceptor())
     ).createNestApplication();
 
-    await app.init();
+    await listenOnLoopback(app);
     return request(app.getHttpServer())
       .get('/hello/stream')
       .expect(200, { data: 'Hello world!' });
@@ -107,7 +108,7 @@ describe('Interceptors', () => {
       await createTestModule(new TransformInterceptor())
     ).createNestApplication();
 
-    await app.init();
+    await listenOnLoopback(app);
     return request(app.getHttpServer())
       .get('/hello/async')
       .expect(200, { data: 'Hello world!' });
@@ -118,7 +119,7 @@ describe('Interceptors', () => {
       await createTestModule(new StatusInterceptor(400))
     ).createNestApplication();
 
-    await app.init();
+    await listenOnLoopback(app);
     return request(app.getHttpServer())
       .get('/hello')
       .expect(400, { data: 'Hello world!' });
@@ -133,7 +134,7 @@ describe('Interceptors', () => {
       await createTestModule(new HeaderInterceptor(customHeaders))
     ).createNestApplication();
 
-    await app.init();
+    await listenOnLoopback(app);
     return request(app.getHttpServer())
       .get('/hello')
       .expect(200)

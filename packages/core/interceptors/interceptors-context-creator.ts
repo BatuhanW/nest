@@ -1,12 +1,20 @@
-import { INTERCEPTORS_METADATA } from '@nestjs/common/constants';
-import { Controller, NestInterceptor } from '@nestjs/common/interfaces';
-import { isEmpty, isFunction } from '@nestjs/common/utils/shared.utils';
 import { iterate } from 'iterare';
-import { ApplicationConfig } from '../application-config';
-import { ContextCreator } from '../helpers/context-creator';
-import { STATIC_CONTEXT } from '../injector/constants';
-import { NestContainer } from '../injector/container';
-import { InstanceWrapper } from '../injector/instance-wrapper';
+import { ApplicationConfig } from '../application-config.js';
+import {
+  assertEnhancer,
+  describeEnhancer,
+} from '../helpers/assert-enhancer.js';
+import { ContextCreator } from '../helpers/context-creator.js';
+import { STATIC_CONTEXT } from '../injector/constants.js';
+import { NestContainer } from '../injector/container.js';
+import { InstanceWrapper } from '../injector/instance-wrapper.js';
+import {
+  INTERCEPTORS_METADATA,
+  type Controller,
+  isEmpty,
+  isFunction,
+} from '@nestjs/common/internal';
+import type { NestInterceptor, Type } from '@nestjs/common';
 
 export class InterceptorsContextCreator extends ContextCreator {
   private moduleContext: string;
@@ -41,45 +49,59 @@ export class InterceptorsContextCreator extends ContextCreator {
     inquirerId?: string,
   ): R {
     if (isEmpty(metadata)) {
-      return [] as R;
+      return [] as any[] as R;
     }
     return iterate(metadata)
       .filter(
         interceptor =>
-          interceptor && (interceptor.name || interceptor.intercept),
+          interceptor &&
+          (isFunction(interceptor) || isFunction(interceptor.intercept)),
       )
       .map(interceptor =>
-        this.getInterceptorInstance(interceptor, contextId, inquirerId),
+        this.getInterceptorInstance(interceptor, contextId, inquirerId)!,
       )
-      .filter(
-        (interceptor: NestInterceptor) =>
-          interceptor && isFunction(interceptor.intercept),
+      .filter((interceptor: NestInterceptor) =>
+        interceptor ? isFunction(interceptor.intercept) : false,
       )
       .toArray() as R;
   }
 
   public getInterceptorInstance(
-    interceptor: Function | NestInterceptor,
+    metatype: Function | NestInterceptor,
     contextId = STATIC_CONTEXT,
     inquirerId?: string,
   ): NestInterceptor | null {
-    const isObject = (interceptor as NestInterceptor).intercept;
-    if (isObject) {
-      return interceptor as NestInterceptor;
+    if (!isFunction(metatype)) {
+      return metatype;
     }
-    const instanceWrapper = this.getInstanceByMetatype(interceptor);
+    const instanceWrapper = this.getInstanceByMetatype(
+      metatype as Type<unknown>,
+    );
     if (!instanceWrapper) {
-      return null;
+      return this.pickEnhancer<NestInterceptor>(metatype, null, 'intercept');
     }
     const instanceHost = instanceWrapper.getInstanceByContextId(
-      contextId,
+      this.getContextId(contextId, instanceWrapper),
       inquirerId,
     );
-    return instanceHost && instanceHost.instance;
+    const enhancer = this.pickEnhancer<NestInterceptor>(
+      metatype,
+      instanceHost && instanceHost.instance,
+      'intercept',
+    );
+    // Nest constructed the bound class, and neither the instance nor the
+    // class can run as a interceptor. A request-scoped or transient interceptor outside of
+    // its context is only a placeholder whose constructor never ran, and a
+    // class that resolves to no provider (a host outside of every module)
+    // is skipped as before.
+    if (instanceHost?.isConstructorCalled) {
+      assertEnhancer(enhancer, 'interceptor', describeEnhancer(metatype));
+    }
+    return enhancer;
   }
 
-  public getInstanceByMetatype<T extends Record<string, any> = any>(
-    metatype: T,
+  public getInstanceByMetatype(
+    metatype: Type<unknown>,
   ): InstanceWrapper | undefined {
     if (!this.moduleContext) {
       return;
@@ -89,7 +111,7 @@ export class InterceptorsContextCreator extends ContextCreator {
     if (!moduleRef) {
       return;
     }
-    return moduleRef.injectables.get(metatype.name as string);
+    return moduleRef.injectables.get(metatype);
   }
 
   public getGlobalMetadata<T extends unknown[]>(
@@ -97,17 +119,29 @@ export class InterceptorsContextCreator extends ContextCreator {
     inquirerId?: string,
   ): T {
     if (!this.config) {
-      return [] as T;
+      return [] as unknown[] as T;
     }
     const globalInterceptors = this.config.getGlobalInterceptors() as T;
     if (contextId === STATIC_CONTEXT && !inquirerId) {
       return globalInterceptors;
     }
-    const scopedInterceptorWrappers = this.config.getGlobalRequestInterceptors() as InstanceWrapper[];
+    const scopedInterceptorWrappers =
+      this.config.getGlobalRequestInterceptors() as InstanceWrapper[];
     const scopedInterceptors = iterate(scopedInterceptorWrappers)
-      .map(wrapper => wrapper.getInstanceByContextId(contextId, inquirerId))
+      .map(wrapper =>
+        wrapper.getInstanceByContextId(
+          this.getContextId(contextId, wrapper),
+          inquirerId,
+        ),
+      )
       .filter(host => !!host)
-      .map(host => host.instance)
+      .map(host => {
+        // A scoped instance only exists here, once per context
+        if (host.isConstructorCalled) {
+          assertEnhancer(host.instance, 'interceptor');
+        }
+        return host.instance;
+      })
       .toArray();
 
     return globalInterceptors.concat(scopedInterceptors) as T;

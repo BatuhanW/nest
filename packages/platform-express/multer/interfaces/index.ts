@@ -1,1 +1,1 @@
-export * from './files-upload-module.interface';
+export type * from './files-upload-module.interface.js';

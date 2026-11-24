@@ -1,7 +1,11 @@
-import { v4 as uuid } from 'uuid';
-import { SCOPE_OPTIONS_METADATA } from '../../constants';
-import { ScopeOptions } from '../../interfaces/scope-options.interface';
-import { Type } from '../../interfaces/type.interface';
+import { uid } from 'uid';
+import {
+  INJECTABLE_WATERMARK,
+  PARAMTYPES_METADATA,
+  SCOPE_OPTIONS_METADATA,
+} from '../../constants.js';
+import { ScopeOptions } from '../../interfaces/scope-options.interface.js';
+import { Type } from '../../interfaces/type.interface.js';
 
 /**
  * Defines the injection scope.
@@ -42,14 +46,28 @@ export type InjectableOptions = ScopeOptions;
  */
 export function Injectable(options?: InjectableOptions): ClassDecorator {
   return (target: object) => {
+    Reflect.defineMetadata(INJECTABLE_WATERMARK, true, target);
     Reflect.defineMetadata(SCOPE_OPTIONS_METADATA, options, target);
   };
 }
 
-export function mixin(mixinClass: Type<any>) {
+/**
+ * @publicApi
+ */
+export function mixin<T>(mixinClass: Type<T>) {
   Object.defineProperty(mixinClass, 'name', {
-    value: uuid(),
+    value: uid(21),
   });
-  Injectable()(mixinClass);
+  // The class may declare a scope, on itself or on a class it extends, and
+  // `@Injectable()` with no options would replace it with none
+  Injectable(Reflect.getMetadata(SCOPE_OPTIONS_METADATA, mixinClass))(
+    mixinClass,
+  );
+  // Decorated here, at runtime, so a compiler that emits decorator metadata may
+  // have had no decorator to emit parameter types for. The injector can't take
+  // that for a compiler that emits none.
+  if (!Reflect.hasMetadata(PARAMTYPES_METADATA, mixinClass)) {
+    Reflect.defineMetadata(PARAMTYPES_METADATA, [], mixinClass);
+  }
   return mixinClass;
 }

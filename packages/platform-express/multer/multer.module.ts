@@ -1,20 +1,23 @@
-import { DynamicModule, Module, Provider } from '@nestjs/common';
-import { randomStringGenerator } from '@nestjs/common/utils/random-string-generator.util';
-import { MULTER_MODULE_OPTIONS } from './files.constants';
+import { type DynamicModule, Module, type Provider } from '@nestjs/common';
+import { MULTER_MODULE_OPTIONS } from './files.constants.js';
 import {
   MulterModuleAsyncOptions,
   MulterModuleOptions,
   MulterOptionsFactory,
-} from './interfaces/files-upload-module.interface';
-import { MULTER_MODULE_ID } from './multer.constants';
+} from './interfaces/files-upload-module.interface.js';
+import { MULTER_MODULE_ID } from './multer.constants.js';
+import { randomStringGenerator } from '@nestjs/common/internal';
 
+/**
+ * @publicApi
+ */
 @Module({})
 export class MulterModule {
   static register(options: MulterModuleOptions = {}): DynamicModule {
     return {
       module: MulterModule,
       providers: [
-        { provide: MULTER_MODULE_OPTIONS, useValue: options },
+        { provide: MULTER_MODULE_OPTIONS, useFactory: () => options },
         {
           provide: MULTER_MODULE_ID,
           useValue: randomStringGenerator(),
@@ -48,8 +51,8 @@ export class MulterModule {
     return [
       this.createAsyncOptionsProvider(options),
       {
-        provide: options.useClass,
-        useClass: options.useClass,
+        provide: options.useClass!,
+        useClass: options.useClass!,
       },
     ];
   }
@@ -68,7 +71,7 @@ export class MulterModule {
       provide: MULTER_MODULE_OPTIONS,
       useFactory: async (optionsFactory: MulterOptionsFactory) =>
         optionsFactory.createMulterOptions(),
-      inject: [options.useExisting || options.useClass],
+      inject: [options.useExisting || options.useClass!],
     };
   }
 }

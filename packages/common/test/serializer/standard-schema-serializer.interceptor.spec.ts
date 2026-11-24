@@ -1,0 +1,656 @@
+import type { StandardSchemaV1 } from '@standard-schema/spec';
+import { from, lastValueFrom, of, Subject, toArray } from 'rxjs';
+import { Readable } from 'stream';
+import { StreamableFile } from '../../file-stream/index.js';
+import { CallHandler, ExecutionContext } from '../../interfaces/index.js';
+import { StandardSchemaSerializerInterceptor } from '../../serializer/standard-schema-serializer.interceptor.js';
+
+function createSchema(
+  validateFn: (
+    value: unknown,
+    options?: StandardSchemaV1.Options,
+  ) => StandardSchemaV1.Result<any> | Promise<StandardSchemaV1.Result<any>>,
+): StandardSchemaV1 {
+  return {
+    '~standard': {
+      version: 1,
+      vendor: 'test',
+      validate: validateFn,
+    },
+  };
+}
+
+describe('StandardSchemaSerializerInterceptor', () => {
+  let interceptor: StandardSchemaSerializerInterceptor;
+  let mockReflector: any;
+  let mockExecutionContext: ExecutionContext;
+  let mockCallHandler: CallHandler;
+
+  beforeEach(() => {
+    mockReflector = {
+      getAll: vi.fn().mockReturnValue([undefined, undefined]),
+    };
+
+    mockExecutionContext = {
+      getHandler: vi.fn(),
+      getClass: vi.fn(),
+    } as any;
+
+    mockCallHandler = {
+      handle: vi.fn(),
+    } as any;
+  });
+
+  describe('intercept', () => {
+    describe('when no schema is provided', () => {
+      it('should return the response unchanged', async () => {
+        interceptor = new StandardSchemaSerializerInterceptor(mockReflector);
+        const response = { id: 1, name: 'Test' };
+        (mockCallHandler.handle as ReturnType<typeof vi.fn>).mockReturnValue(
+          of(response),
+        );
+
+        const result$ = interceptor.intercept(
+          mockExecutionContext,
+          mockCallHandler,
+        );
+        const result = await lastValueFrom(result$);
+        expect(result).toBe(response);
+      });
+    });
+
+    describe('when schema is provided via default options', () => {
+      it('should serialize the response through the schema', async () => {
+        const schema = createSchema(value => ({
+          value: { ...(value as any), serialized: true },
+        }));
+        interceptor = new StandardSchemaSerializerInterceptor(mockReflector, {
+          schema,
+        });
+        const response = { id: 1, name: 'Test' };
+        (mockCallHandler.handle as ReturnType<typeof vi.fn>).mockReturnValue(
+          of(response),
+        );
+
+        const result$ = interceptor.intercept(
+          mockExecutionContext,
+          mockCallHandler,
+        );
+        const result = await lastValueFrom(result$);
+        expect(result).toEqual({ id: 1, name: 'Test', serialized: true });
+      });
+    });
+
+    describe('when schema is provided via @SerializeOptions()', () => {
+      it('should use the context schema over the default', async () => {
+        const defaultSchema = createSchema(value => ({
+          value: { ...(value as any), fromDefault: true },
+        }));
+        const contextSchema = createSchema(value => ({
+          value: { ...(value as any), fromContext: true },
+        }));
+        interceptor = new StandardSchemaSerializerInterceptor(mockReflector, {
+          schema: defaultSchema,
+        });
+        mockReflector.getAll.mockReturnValue([
+          {
+            schema: contextSchema,
+          },
+          undefined,
+        ]);
+        const response = { id: 1 };
+        (mockCallHandler.handle as ReturnType<typeof vi.fn>).mockReturnValue(
+          of(response),
+        );
+
+        const result$ = interceptor.intercept(
+          mockExecutionContext,
+          mockCallHandler,
+        );
+        const result = await lastValueFrom(result$);
+        expect(result).toEqual({ id: 1, fromContext: true });
+      });
+
+      it('should keep the class schema when the handler only sets validateOptions', async () => {
+        const validateSpy = vi.fn((value: any) => ({
+          value: { id: value.id },
+        }));
+        const classSchema = createSchema(validateSpy);
+        const handlerOpts: StandardSchemaV1.Options = {
+          libraryOptions: { from: 'handler' },
+        };
+        interceptor = new StandardSchemaSerializerInterceptor(mockReflector);
+        mockReflector.getAll.mockReturnValue([
+          { validateOptions: handlerOpts },
+          { schema: classSchema },
+        ]);
+        const response = { id: 1, password: 'secret' };
+        (mockCallHandler.handle as ReturnType<typeof vi.fn>).mockReturnValue(
+          of(response),
+        );
+
+        const result$ = interceptor.intercept(
+          mockExecutionContext,
+          mockCallHandler,
+        );
+        expect(await lastValueFrom(result$)).toEqual({ id: 1 });
+        expect(validateSpy).toHaveBeenCalledWith(response, handlerOpts);
+      });
+
+      it('should use the handler schema with the class validateOptions', async () => {
+        const classSchema = createSchema(value => ({
+          value: { ...(value as any), fromClass: true },
+        }));
+        const validateSpy = vi.fn((value: any) => ({
+          value: { ...value, fromHandler: true },
+        }));
+        const classOpts: StandardSchemaV1.Options = {
+          libraryOptions: { from: 'class' },
+        };
+        interceptor = new StandardSchemaSerializerInterceptor(mockReflector);
+        mockReflector.getAll.mockReturnValue([
+          { schema: createSchema(validateSpy) },
+          { schema: classSchema, validateOptions: classOpts },
+        ]);
+        const response = { id: 1 };
+        (mockCallHandler.handle as ReturnType<typeof vi.fn>).mockReturnValue(
+          of(response),
+        );
+
+        const result$ = interceptor.intercept(
+          mockExecutionContext,
+          mockCallHandler,
+        );
+        expect(await lastValueFrom(result$)).toEqual({
+          id: 1,
+          fromHandler: true,
+        });
+        expect(validateSpy).toHaveBeenCalledWith(response, classOpts);
+      });
+    });
+
+    describe('when response is an array', () => {
+      it('should serialize each item through the schema', async () => {
+        const schema = createSchema(value => ({
+          value: { ...(value as any), serialized: true },
+        }));
+        interceptor = new StandardSchemaSerializerInterceptor(mockReflector, {
+          schema,
+        });
+        const response = [{ id: 1 }, { id: 2 }];
+        (mockCallHandler.handle as ReturnType<typeof vi.fn>).mockReturnValue(
+          of(response),
+        );
+
+        const result$ = interceptor.intercept(
+          mockExecutionContext,
+          mockCallHandler,
+        );
+        const result = await lastValueFrom(result$);
+        expect(result).toEqual([
+          { id: 1, serialized: true },
+          { id: 2, serialized: true },
+        ]);
+      });
+    });
+
+    describe('when response is not an object', () => {
+      it('should return primitive values unchanged', async () => {
+        const schema = createSchema(() => ({
+          issues: [{ message: 'should not be called' }],
+        }));
+        interceptor = new StandardSchemaSerializerInterceptor(mockReflector, {
+          schema,
+        });
+        (mockCallHandler.handle as ReturnType<typeof vi.fn>).mockReturnValue(
+          of('plain string'),
+        );
+
+        const result$ = interceptor.intercept(
+          mockExecutionContext,
+          mockCallHandler,
+        );
+        const result = await lastValueFrom(result$);
+        expect(result).toBe('plain string');
+      });
+    });
+
+    describe('when response is a stream', () => {
+      it.each<[string, () => unknown]>([
+        ['a Response', () => new Response('test')],
+        ['a ReadableStream', () => new ReadableStream()],
+        ['an async generator', () => (async function* () {})()],
+      ])('should return %s unchanged', async (_, create) => {
+        const schema = createSchema(() => ({
+          issues: [{ message: 'should not be called' }],
+        }));
+        interceptor = new StandardSchemaSerializerInterceptor(mockReflector, {
+          schema,
+        });
+        const stream = create();
+        (mockCallHandler.handle as ReturnType<typeof vi.fn>).mockReturnValue(
+          of(stream),
+        );
+
+        const result$ = interceptor.intercept(
+          mockExecutionContext,
+          mockCallHandler,
+        );
+
+        expect(await lastValueFrom(result$)).toBe(stream);
+      });
+    });
+
+    describe('when the handler streams over HTTP', () => {
+      const collect = async (stream: unknown) => {
+        const chunks: unknown[] = [];
+        for await (const chunk of stream as AsyncIterable<unknown>) {
+          chunks.push(chunk);
+        }
+        return chunks;
+      };
+
+      beforeEach(() => {
+        (mockExecutionContext as any).getType = () => 'http';
+      });
+
+      it.each<[string, (chunks: unknown[]) => unknown]>([
+        ['a Readable in object mode', chunks => Readable.from(chunks)],
+        ['a ReadableStream', chunks => ReadableStream.from(chunks)],
+        [
+          'an async generator',
+          chunks =>
+            (async function* () {
+              yield* chunks;
+            })(),
+        ],
+      ])('should serialize the objects %s yields', async (_, create) => {
+        const validateOptions = { libraryOptions: { strip: true } };
+        const validate = vi.fn((value: any) => ({ value: { id: value.id } }));
+        interceptor = new StandardSchemaSerializerInterceptor(mockReflector, {
+          schema: createSchema(validate),
+          validateOptions,
+        });
+        const entity = { id: 1, password: 'secret' };
+        const bytes = Buffer.from('bytes');
+        (mockCallHandler.handle as ReturnType<typeof vi.fn>).mockReturnValue(
+          of(create([entity, [entity], 'text', bytes])),
+        );
+
+        const result = await lastValueFrom(
+          interceptor.intercept(mockExecutionContext, mockCallHandler),
+        );
+
+        expect(await collect(result)).toEqual([
+          { id: 1 },
+          [{ id: 1 }],
+          'text',
+          bytes,
+        ]);
+        expect(validate).toHaveBeenCalledWith(entity, validateOptions);
+      });
+
+      it('should fail the stream with the issues of an object it yields', async () => {
+        interceptor = new StandardSchemaSerializerInterceptor(mockReflector, {
+          schema: createSchema(() => ({
+            issues: [{ message: 'id is required' }],
+          })),
+        });
+        (mockCallHandler.handle as ReturnType<typeof vi.fn>).mockReturnValue(
+          of(
+            (async function* () {
+              yield { password: 'secret' };
+            })(),
+          ),
+        );
+
+        const result = await lastValueFrom(
+          interceptor.intercept(mockExecutionContext, mockCallHandler),
+        );
+
+        await expect((result as AsyncIterator<unknown>).next()).rejects.toThrow(
+          'Serialization failed: id is required',
+        );
+      });
+
+      it('should leave a stream alone without a schema', async () => {
+        interceptor = new StandardSchemaSerializerInterceptor(mockReflector);
+        const stream = Readable.from([{ id: 1 }]);
+        (mockCallHandler.handle as ReturnType<typeof vi.fn>).mockReturnValue(
+          of(stream),
+        );
+
+        const result = await lastValueFrom(
+          interceptor.intercept(mockExecutionContext, mockCallHandler),
+        );
+
+        expect(result).toBe(stream);
+      });
+    });
+
+    describe('when response is a StreamableFile', () => {
+      it('should return the streamable file unchanged', async () => {
+        const schema = createSchema(() => ({
+          issues: [{ message: 'should not be called' }],
+        }));
+        interceptor = new StandardSchemaSerializerInterceptor(mockReflector, {
+          schema,
+        });
+        const file = new StreamableFile(Buffer.from('test'));
+        (mockCallHandler.handle as ReturnType<typeof vi.fn>).mockReturnValue(
+          of(file),
+        );
+
+        const result$ = interceptor.intercept(
+          mockExecutionContext,
+          mockCallHandler,
+        );
+        const result = await lastValueFrom(result$);
+        expect(result).toBe(file);
+      });
+    });
+
+    describe('when schema validation fails', () => {
+      it('should throw an error with issue messages', async () => {
+        const schema = createSchema(() => ({
+          issues: [
+            { message: 'field is required' },
+            { message: 'must be a number' },
+          ],
+        }));
+        interceptor = new StandardSchemaSerializerInterceptor(mockReflector, {
+          schema,
+        });
+        const response = { id: 1 };
+        (mockCallHandler.handle as ReturnType<typeof vi.fn>).mockReturnValue(
+          of(response),
+        );
+
+        const result$ = interceptor.intercept(
+          mockExecutionContext,
+          mockCallHandler,
+        );
+        await expect(lastValueFrom(result$)).rejects.toThrow(
+          'Serialization failed: field is required, must be a number',
+        );
+      });
+    });
+
+    describe('when async schema is used', () => {
+      it('should resolve the async validation result', async () => {
+        const schema = createSchema(async value => ({
+          value: { ...(value as any), async: true },
+        }));
+        interceptor = new StandardSchemaSerializerInterceptor(mockReflector, {
+          schema,
+        });
+        const response = { id: 1 };
+        (mockCallHandler.handle as ReturnType<typeof vi.fn>).mockReturnValue(
+          of(response),
+        );
+
+        const result$ = interceptor.intercept(
+          mockExecutionContext,
+          mockCallHandler,
+        );
+        const result = await lastValueFrom(result$);
+        expect(result).toEqual({ id: 1, async: true });
+      });
+    });
+  });
+
+  describe('when the handler emits many values', () => {
+    const schema = createSchema(value => ({
+      value: { id: (value as { id: number }).id },
+    }));
+
+    beforeEach(() => {
+      interceptor = new StandardSchemaSerializerInterceptor(mockReflector, {
+        schema,
+      });
+    });
+
+    it('should serialize them in order, without shifting each off a queue', async () => {
+      // Each shift() moves the values queued behind the one it removes, so
+      // serializing n values that way takes time quadratic in n.
+      // Patched by hand, as vi.spyOn() calls shift() itself
+      const values = Array.from({ length: 3 }, (_, id) => ({
+        id,
+        secret: 'x',
+      }));
+      (mockCallHandler.handle as ReturnType<typeof vi.fn>).mockReturnValue(
+        from(values),
+      );
+      const shift = Array.prototype.shift;
+      const shifted: unknown[] = [];
+      Array.prototype.shift = function (this: unknown[]) {
+        const item = shift.call(this);
+        shifted.push(item);
+        return item;
+      };
+      let results: unknown[];
+      try {
+        results = await lastValueFrom(
+          interceptor
+            .intercept(mockExecutionContext, mockCallHandler)
+            .pipe(toArray()),
+        );
+      } finally {
+        Array.prototype.shift = shift;
+      }
+
+      expect(results).toEqual([{ id: 0 }, { id: 1 }, { id: 2 }]);
+      expect(shifted.filter(item => values.includes(item as any))).toEqual([]);
+    });
+
+    it('should serialize one value at a time', async () => {
+      const pending: Array<() => void> = [];
+      const validate = vi.fn(
+        (value: unknown) =>
+          new Promise<StandardSchemaV1.Result<any>>(resolve =>
+            pending.push(() => resolve({ value })),
+          ),
+      );
+      interceptor = new StandardSchemaSerializerInterceptor(mockReflector, {
+        schema: createSchema(validate),
+      });
+      const source = new Subject<{ id: number }>();
+      (mockCallHandler.handle as ReturnType<typeof vi.fn>).mockReturnValue(
+        source,
+      );
+      const results: unknown[] = [];
+      let isComplete = false;
+      interceptor.intercept(mockExecutionContext, mockCallHandler).subscribe({
+        next: value => results.push(value),
+        complete: () => (isComplete = true),
+      });
+
+      source.next({ id: 1 });
+      source.next({ id: 2 });
+      source.complete();
+      await new Promise(resolve => setImmediate(resolve));
+      expect(validate).toHaveBeenCalledTimes(1);
+
+      pending.shift()!();
+      await new Promise(resolve => setImmediate(resolve));
+      expect(results).toEqual([{ id: 1 }]);
+      expect(validate).toHaveBeenCalledTimes(2);
+      expect(isComplete).toBe(false);
+
+      pending.shift()!();
+      await new Promise(resolve => setImmediate(resolve));
+      expect(results).toEqual([{ id: 1 }, { id: 2 }]);
+      expect(isComplete).toBe(true);
+    });
+
+    it('should fail with the first value that fails, and serialize no other', async () => {
+      const validate = vi.fn((value: unknown) =>
+        (value as { id: number }).id === 1
+          ? { issues: [{ message: 'Invalid' }] }
+          : { value },
+      );
+      interceptor = new StandardSchemaSerializerInterceptor(mockReflector, {
+        schema: createSchema(validate),
+      });
+      (mockCallHandler.handle as ReturnType<typeof vi.fn>).mockReturnValue(
+        from([{ id: 0 }, { id: 1 }, { id: 2 }]),
+      );
+
+      await expect(
+        lastValueFrom(
+          interceptor.intercept(mockExecutionContext, mockCallHandler),
+        ),
+      ).rejects.toThrow('Serialization failed: Invalid');
+      expect(validate).toHaveBeenCalledTimes(2);
+    });
+
+    it('should stop serializing once unsubscribed', async () => {
+      const validate = vi.fn((value: unknown) => ({ value }));
+      interceptor = new StandardSchemaSerializerInterceptor(mockReflector, {
+        schema: createSchema(validate),
+      });
+      const source = new Subject<{ id: number }>();
+      (mockCallHandler.handle as ReturnType<typeof vi.fn>).mockReturnValue(
+        source,
+      );
+
+      const subscription = interceptor
+        .intercept(mockExecutionContext, mockCallHandler)
+        .subscribe();
+      source.next({ id: 1 });
+      source.next({ id: 2 });
+      subscription.unsubscribe();
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(source.observed).toBe(false);
+      expect(validate).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('transformToPlain', () => {
+    it('should return falsy values as-is', async () => {
+      interceptor = new StandardSchemaSerializerInterceptor(mockReflector);
+      const schema = createSchema(() => ({
+        issues: [{ message: 'should not be called' }],
+      }));
+      expect(await interceptor.transformToPlain(null, schema)).toBeNull();
+      expect(
+        await interceptor.transformToPlain(undefined, schema),
+      ).toBeUndefined();
+      expect(await interceptor.transformToPlain(0, schema)).toBe(0);
+      expect(await interceptor.transformToPlain('', schema)).toBe('');
+    });
+  });
+
+  describe('validateOptions', () => {
+    it('should forward default validateOptions to the schema', async () => {
+      const validateSpy = vi.fn((_value, _options) => ({
+        value: { ok: true },
+      }));
+      const schema = createSchema(validateSpy);
+      const opts: StandardSchemaV1.Options = {
+        libraryOptions: { strip: true },
+      };
+      interceptor = new StandardSchemaSerializerInterceptor(mockReflector, {
+        schema,
+        validateOptions: opts,
+      });
+      const response = { id: 1 };
+      (mockCallHandler.handle as ReturnType<typeof vi.fn>).mockReturnValue(
+        of(response),
+      );
+
+      const result$ = interceptor.intercept(
+        mockExecutionContext,
+        mockCallHandler,
+      );
+      await lastValueFrom(result$);
+      expect(validateSpy).toHaveBeenCalledWith(response, opts);
+    });
+
+    it('should forward context validateOptions from @SerializeOptions()', async () => {
+      const validateSpy = vi.fn((_value, _options) => ({
+        value: { ok: true },
+      }));
+      const schema = createSchema(validateSpy);
+      const contextOpts: StandardSchemaV1.Options = {
+        libraryOptions: { mode: 'strict' },
+      };
+      interceptor = new StandardSchemaSerializerInterceptor(mockReflector, {
+        schema,
+      });
+      mockReflector.getAll.mockReturnValue([
+        {
+          validateOptions: contextOpts,
+        },
+        undefined,
+      ]);
+      const response = { id: 1 };
+      (mockCallHandler.handle as ReturnType<typeof vi.fn>).mockReturnValue(
+        of(response),
+      );
+
+      const result$ = interceptor.intercept(
+        mockExecutionContext,
+        mockCallHandler,
+      );
+      await lastValueFrom(result$);
+      expect(validateSpy).toHaveBeenCalledWith(response, contextOpts);
+    });
+
+    it('should let context validateOptions override default', async () => {
+      const validateSpy = vi.fn((_value, _options) => ({
+        value: { ok: true },
+      }));
+      const schema = createSchema(validateSpy);
+      const defaultOpts: StandardSchemaV1.Options = {
+        libraryOptions: { from: 'default' },
+      };
+      const contextOpts: StandardSchemaV1.Options = {
+        libraryOptions: { from: 'context' },
+      };
+      interceptor = new StandardSchemaSerializerInterceptor(mockReflector, {
+        schema,
+        validateOptions: defaultOpts,
+      });
+      mockReflector.getAll.mockReturnValue([
+        {
+          validateOptions: contextOpts,
+        },
+        undefined,
+      ]);
+      const response = { id: 1 };
+      (mockCallHandler.handle as ReturnType<typeof vi.fn>).mockReturnValue(
+        of(response),
+      );
+
+      const result$ = interceptor.intercept(
+        mockExecutionContext,
+        mockCallHandler,
+      );
+      await lastValueFrom(result$);
+      expect(validateSpy).toHaveBeenCalledWith(response, contextOpts);
+    });
+
+    it('should pass undefined when no validateOptions are set', async () => {
+      const validateSpy = vi.fn((_value, _options) => ({
+        value: { ok: true },
+      }));
+      const schema = createSchema(validateSpy);
+      interceptor = new StandardSchemaSerializerInterceptor(mockReflector, {
+        schema,
+      });
+      const response = { id: 1 };
+      (mockCallHandler.handle as ReturnType<typeof vi.fn>).mockReturnValue(
+        of(response),
+      );
+
+      const result$ = interceptor.intercept(
+        mockExecutionContext,
+        mockCallHandler,
+      );
+      await lastValueFrom(result$);
+      expect(validateSpy).toHaveBeenCalledWith(response, undefined);
+    });
+  });
+});

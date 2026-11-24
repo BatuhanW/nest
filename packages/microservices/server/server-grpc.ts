@@ -1,27 +1,61 @@
+import { createRequire } from 'module';
 import {
+  EMPTY,
+  Observable,
+  ReplaySubject,
+  Subject,
+  Subscription,
+  defaultIfEmpty,
+  fromEvent,
+  lastValueFrom,
+} from 'rxjs';
+import {
+  catchError,
+  finalize,
+  takeUntil,
+  tap,
+  throwIfEmpty,
+} from 'rxjs/operators';
+import { GRPC_DEFAULT_PROTO_LOADER, GRPC_DEFAULT_URL } from '../constants.js';
+import { GrpcMethodStreamingType } from '../decorators/index.js';
+import { GrpcStatus, Transport } from '../enums/index.js';
+import { InvalidGrpcPackageException } from '../errors/invalid-grpc-package.exception.js';
+import { InvalidProtoDefinitionException } from '../errors/invalid-proto-definition.exception.js';
+import { ChannelOptions } from '../external/grpc-options.interface.js';
+import { getGrpcPackageDefinition } from '../helpers/index.js';
+import { MessageHandler, PacketMetadata } from '../interfaces/index.js';
+import {
+  GrpcOptions,
+  TransportId,
+} from '../interfaces/microservice-configuration.interface.js';
+import { toPacketMetadata } from '../utils/packet-metadata.utils.js';
+import { Server } from './server.js';
+import {
+  isFunction,
+  isNil,
   isObject,
   isString,
   isUndefined,
-} from '@nestjs/common/utils/shared.utils';
-import { EMPTY, fromEvent, Subject } from 'rxjs';
-import { catchError, takeUntil } from 'rxjs/operators';
-import {
-  CANCEL_EVENT,
-  GRPC_DEFAULT_MAX_RECEIVE_MESSAGE_LENGTH,
-  GRPC_DEFAULT_MAX_SEND_MESSAGE_LENGTH,
-  GRPC_DEFAULT_PROTO_LOADER,
-  GRPC_DEFAULT_URL,
-} from '../constants';
-import { GrpcMethodStreamingType } from '../decorators';
-import { Transport } from '../enums';
-import { InvalidGrpcPackageException } from '../errors/invalid-grpc-package.exception';
-import { InvalidProtoDefinitionException } from '../errors/invalid-proto-definition.exception';
-import { CustomTransportStrategy, MessageHandler } from '../interfaces';
-import { GrpcOptions } from '../interfaces/microservice-configuration.interface';
-import { Server } from './server';
+} from '@nestjs/common/internal';
+import { MESSAGES } from '@nestjs/core/internal';
 
-let grpcPackage: any = {};
-let grpcProtoLoaderPackage: any = {};
+const CANCELLED_EVENT = 'cancelled';
+const DEFAULT_MAX_PENDING_RESPONSES = 1000;
+// Half of a surrogate pair without the other half
+const LONE_SURROGATE =
+  /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
+
+// To enable type safety for gRPC. This cant be uncommented by default
+// because it would require the user to install the @grpc/grpc-js package even if they dont use gRPC
+// Otherwise, TypeScript would fail to compile the code.
+//
+// type GrpcServer = import('@grpc/grpc-js').Server;
+// let grpcPackage = {} as typeof import('@grpc/grpc-js');
+// let grpcProtoLoaderPackage = {} as typeof import('@grpc/proto-loader');
+
+type GrpcServer = any;
+let grpcPackage = {} as any;
+let grpcProtoLoaderPackage = {} as any;
 
 interface GrpcCall<TRequest = any, TMetadata = any> {
   request: TRequest;
@@ -30,40 +64,144 @@ interface GrpcCall<TRequest = any, TMetadata = any> {
   end: Function;
   write: Function;
   on: Function;
+  off: Function;
   emit: Function;
+  // Of the request stream, which only a call that streams requests has
+  pause?: Function;
+  resume?: Function;
+  writableHighWaterMark?: number;
+  cancelled?: boolean;
 }
 
-export class ServerGrpc extends Server implements CustomTransportStrategy {
-  public readonly transportId = Transport.GRPC;
+// Holds the place of a promise emitted on a response stream until it settles
+class PendingResponse {
+  settled?: { value: unknown } | { error: unknown };
+}
 
-  private readonly url: string;
-  private grpcClient: any;
+// Calls on which the server is emitting a response error. The call is also
+// the emitter of the request stream's errors, so the listener on the request
+// side uses this to tell the two apart.
+const callsEmittingResponseError = new WeakSet<GrpcCall>();
 
-  constructor(private readonly options: GrpcOptions['options']) {
+function emitResponseError(call: GrpcCall, err: unknown) {
+  callsEmittingResponseError.add(call);
+  try {
+    call.emit('error', toSendableError(err));
+  } finally {
+    callsEmittingResponseError.delete(call);
+  }
+}
+
+function toWellFormed(text: unknown) {
+  return isString(text) ? text.replace(LONE_SURROGATE, '\ufffd') : text;
+}
+
+// grpc-js takes the status message from a "message" of any type, and only
+// converts it to a string where it encodes it. A message that is not a string
+// (a list of messages, an Error) is converted here instead, so that its text
+// is made well-formed as well.
+function toStatusMessage(message: unknown) {
+  if (isUndefined(message) || isString(message)) {
+    return toWellFormed(message);
+  }
+  try {
+    return toWellFormed(String(message));
+  } catch {
+    // It has no text at all, such as an object without a prototype
+    return MESSAGES.UNKNOWN_EXCEPTION_MESSAGE;
+  }
+}
+
+// grpc-js throws on an error that is not an object, and on a status message
+// with a lone surrogate, which it cannot encode into the "grpc-message"
+// trailer. It does so from the subscriber that hands it the error, or from
+// the stream's "wantTrailers" listener, where nothing catches the throw and
+// the process exits.
+function toSendableError(err: unknown) {
+  if (!isObject(err) && !isFunction(err)) {
+    return { code: GrpcStatus.UNKNOWN, message: toWellFormed(String(err)) };
+  }
+  const { code, message, details, metadata } = err as Record<string, unknown>;
+  const statusMessage = toStatusMessage(message);
+  if (statusMessage === message && toWellFormed(details) === details) {
+    return err;
+  }
+  return {
+    code,
+    message: statusMessage,
+    details: toWellFormed(details),
+    metadata,
+  };
+}
+
+/**
+ * @publicApi
+ */
+export class ServerGrpc extends Server<never, never> {
+  public transportId: TransportId = Transport.GRPC;
+  protected readonly url: string;
+  protected readonly maxPendingResponses: number;
+  protected grpcClient: GrpcServer;
+  private pendingClose: Promise<void> | null = null;
+  private closeCount = 0;
+
+  get status(): never {
+    throw new Error(
+      'The "status" attribute is not supported by the gRPC transport',
+    );
+  }
+
+  constructor(private readonly options: Readonly<GrpcOptions>['options']) {
     super();
     this.url = this.getOptionsProp(options, 'url') || GRPC_DEFAULT_URL;
+    const maxPendingResponses = this.getOptionsProp(
+      options,
+      'maxPendingResponses',
+    );
+    // A value that is not a number (NaN, "16mb") gets the default limit
+    // rather than none
+    this.maxPendingResponses =
+      isNil(maxPendingResponses) || isNaN(maxPendingResponses)
+        ? DEFAULT_MAX_PENDING_RESPONSES
+        : maxPendingResponses;
 
     const protoLoader =
       this.getOptionsProp(options, 'protoLoader') || GRPC_DEFAULT_PROTO_LOADER;
 
-    grpcPackage = this.loadPackage('grpc', ServerGrpc.name, () =>
-      require('grpc'),
+    grpcProtoLoaderPackage = this.loadPackageSynchronously(
+      protoLoader,
+      ServerGrpc.name,
+      () => createRequire(import.meta.url)(protoLoader),
     );
-    grpcProtoLoaderPackage = this.loadPackage(protoLoader, ServerGrpc.name);
   }
 
-  public async listen(callback: () => void) {
-    this.grpcClient = this.createClient();
-    await this.start(callback);
+  public async listen(
+    callback: (err?: unknown, ...optionalParams: unknown[]) => void,
+  ) {
+    const closeCount = this.closeCount;
+    try {
+      const grpcClient = await this.createClient();
+      // The server is bound to its port by now, and close() found nothing to
+      // shut down
+      if (this.closeCount !== closeCount) {
+        grpcClient.forceShutdown();
+        callback(new Error('Connection closed'));
+        return;
+      }
+      this.grpcClient = grpcClient;
+      await this.start(callback);
+    } catch (err) {
+      callback(err);
+    }
   }
 
   public async start(callback?: () => void) {
     await this.bindEvents();
-    this.grpcClient.start();
-    callback();
+    callback?.();
   }
 
   public async bindEvents() {
+    await this.loadGrpcPackage();
     const grpcContext = this.loadProto();
     const packageOption = this.getOptionsProp(this.options, 'package');
     const packageNames = Array.isArray(packageOption)
@@ -72,7 +210,7 @@ export class ServerGrpc extends Server implements CustomTransportStrategy {
 
     for (const packageName of packageNames) {
       const grpcPkg = this.lookupPackage(grpcContext, packageName);
-      await this.createServices(grpcPkg);
+      await this.createServices(grpcPkg, packageName);
     }
   }
 
@@ -89,6 +227,34 @@ export class ServerGrpc extends Server implements CustomTransportStrategy {
     return services;
   }
 
+  public getKeepaliveOptions() {
+    if (!isObject(this.options.keepalive)) {
+      return {};
+    }
+    const keepaliveKeys: Record<string, string> = {
+      keepaliveTimeMs: 'grpc.keepalive_time_ms',
+      keepaliveTimeoutMs: 'grpc.keepalive_timeout_ms',
+      keepalivePermitWithoutCalls: 'grpc.keepalive_permit_without_calls',
+      http2MaxPingsWithoutData: 'grpc.http2.max_pings_without_data',
+      http2MinTimeBetweenPingsMs: 'grpc.http2.min_time_between_pings_ms',
+      http2MinPingIntervalWithoutDataMs:
+        'grpc.http2.min_ping_interval_without_data_ms',
+      http2MaxPingStrikes: 'grpc.http2.max_ping_strikes',
+    };
+
+    const keepaliveOptions = {};
+    for (const [optionKey, optionValue] of Object.entries(
+      this.options.keepalive,
+    )) {
+      const key = keepaliveKeys[optionKey];
+      if (key === undefined) {
+        continue;
+      }
+      keepaliveOptions[key] = optionValue;
+    }
+    return keepaliveOptions;
+  }
+
   /**
    * Will create service mapping from gRPC generated Object to handlers
    * defined with @GrpcMethod or @GrpcStreamMethod annotations
@@ -100,9 +266,8 @@ export class ServerGrpc extends Server implements CustomTransportStrategy {
     const service = {};
 
     for (const methodName in grpcService.prototype) {
-      let pattern = '';
-      let methodHandler = null;
-      let streamingType = GrpcMethodStreamingType.NO_STREAMING;
+      let methodHandler: MessageHandler | null;
+      let streamingType: GrpcMethodStreamingType;
 
       const methodFunction = grpcService.prototype[methodName];
       const methodReqStreaming = methodFunction.requestStream;
@@ -110,44 +275,65 @@ export class ServerGrpc extends Server implements CustomTransportStrategy {
       if (!isUndefined(methodReqStreaming) && methodReqStreaming) {
         // Try first pattern to be presented, RX streaming pattern would be
         // a preferable pattern to select among a few defined
-        pattern = this.createPattern(
+        methodHandler = this.getMessageHandler(
           name,
           methodName,
           GrpcMethodStreamingType.RX_STREAMING,
+          methodFunction,
         );
-        methodHandler = this.messageHandlers.get(pattern);
         streamingType = GrpcMethodStreamingType.RX_STREAMING;
         // If first pattern didn't match to any of handlers then try
         // pass-through handler to be presented
         if (!methodHandler) {
-          pattern = this.createPattern(
+          methodHandler = this.getMessageHandler(
             name,
             methodName,
             GrpcMethodStreamingType.PT_STREAMING,
+            methodFunction,
           );
-          methodHandler = this.messageHandlers.get(pattern);
           streamingType = GrpcMethodStreamingType.PT_STREAMING;
         }
       } else {
-        pattern = this.createPattern(
+        // Select handler if any presented for No-Streaming pattern
+        methodHandler = this.getMessageHandler(
           name,
           methodName,
           GrpcMethodStreamingType.NO_STREAMING,
+          methodFunction,
         );
-        // Select handler if any presented for No-Streaming pattern
-        methodHandler = this.messageHandlers.get(pattern);
         streamingType = GrpcMethodStreamingType.NO_STREAMING;
       }
       if (!methodHandler) {
         continue;
       }
-      service[methodName] = await this.createServiceMethod(
+
+      Object.defineProperty(methodHandler, 'name', {
+        value: methodName,
+        writable: false,
+      });
+      service[methodName] = this.createServiceMethod(
         methodHandler,
         grpcService.prototype[methodName],
         streamingType,
       );
     }
     return service;
+  }
+
+  public getMessageHandler(
+    serviceName: string,
+    methodName: string,
+    streaming: GrpcMethodStreamingType,
+    grpcMethod: { path?: string },
+  ): MessageHandler {
+    let pattern = this.createPattern(serviceName, methodName, streaming);
+    let methodHandler = this.messageHandlers.get(pattern)!;
+    if (!methodHandler) {
+      const packageServiceName = grpcMethod.path?.split?.('/')[1];
+      pattern = this.createPattern(packageServiceName!, methodName, streaming);
+      methodHandler = this.messageHandlers.get(pattern)!;
+    }
+    return methodHandler;
   }
 
   /**
@@ -176,6 +362,7 @@ export class ServerGrpc extends Server implements CustomTransportStrategy {
    *
    * @param methodHandler
    * @param protoNativeHandler
+   * @param streamType
    */
   public createServiceMethod(
     methodHandler: Function,
@@ -205,31 +392,386 @@ export class ServerGrpc extends Server implements CustomTransportStrategy {
       : this.createUnaryServiceMethod(methodHandler);
   }
 
+  /**
+   * The context the processing hooks receive for a call: the call, named by
+   * its handler, with the `getMetadata()` of the other transports' contexts.
+   * It returns the call's metadata as packet metadata: what the client
+   * attached to the packet, and every other entry with a single text value
+   * (binary `-bin` entries are only available on `call.metadata`).
+   */
+  protected createProcessingContext(call: GrpcCall, methodHandler: Function) {
+    return {
+      ...call,
+      operationId: methodHandler.name,
+      getMetadata: (): PacketMetadata | undefined =>
+        isFunction(call.metadata?.toJSON)
+          ? toPacketMetadata(
+              Object.entries(
+                call.metadata.toJSON() as Record<string, unknown[]>,
+              ).map(([key, values]) => [
+                key,
+                values.length === 1 ? values[0] : undefined,
+              ]),
+            )
+          : undefined,
+    } as any;
+  }
+
   public createUnaryServiceMethod(methodHandler: Function): Function {
     return async (call: GrpcCall, callback: Function) => {
-      const handler = methodHandler(call.request, call.metadata, call);
-      this.transformToObservable(await handler).subscribe(
-        data => callback(null, data),
-        (err: any) => callback(err),
+      return this.runWithProcessingHooks(
+        this.createProcessingContext(call, methodHandler),
+        async runEndHook => {
+          let result$: Observable<any>;
+          try {
+            const handler = methodHandler(call.request, call.metadata, call);
+            result$ = this.transformToObservable(await handler);
+          } catch (err) {
+            // grpc-js ignores the promise returned here, so a rejection (an
+            // exception filter that throws) would go unhandled
+            runEndHook();
+            return callback(this.toInternalError(err));
+          }
+          if (call.cancelled) {
+            // The client is already gone, and the "cancelled" event that
+            // would end the subscription has fired before it could be
+            // listened for.
+            return runEndHook();
+          }
+          result$
+            .pipe(
+              // Ahead of "takeUntil", which completes the stream when the
+              // call is cancelled (and once it has been answered).
+              throwIfEmpty(() => this.createNoResponseError()),
+              takeUntil(fromEvent(call as any, CANCELLED_EVENT)),
+              finalize(runEndHook),
+            )
+            .subscribe({
+              // A response promise that rejects (an interceptor mapping to an
+              // async function) bypasses the exception filters
+              next: data =>
+                Promise.resolve(data).then(
+                  response => callback(null, response),
+                  err => callback(this.toInternalError(err)),
+                ),
+              error: (err: any) => callback(toSendableError(err)),
+            });
+        },
+        call.request,
       );
     };
   }
 
   public createStreamServiceMethod(methodHandler: Function): Function {
     return async (call: GrpcCall, callback: Function) => {
-      const handler = methodHandler(call.request, call.metadata, call);
-      const result$ = this.transformToObservable(await handler);
-      await result$
-        .pipe(
-          takeUntil(fromEvent(call as any, CANCEL_EVENT)),
-          catchError(err => {
-            call.emit('error', err);
-            return EMPTY;
-          }),
-        )
-        .forEach(data => call.write(data));
-      call.end();
+      return this.runWithProcessingHooks(
+        this.createProcessingContext(call, methodHandler),
+        async runEndHook => {
+          let result$: Observable<any>;
+          try {
+            const handler = methodHandler(call.request, call.metadata, call);
+            result$ = this.transformToObservable(await handler);
+          } catch (err) {
+            // grpc-js ignores the promise returned here, so a rejection (an
+            // exception filter that throws) would go unhandled
+            runEndHook();
+            return emitResponseError(call, this.toInternalError(err));
+          }
+          await this.writeObservableToGrpc(result$, call);
+
+          runEndHook();
+        },
+        call.request,
+      );
     };
+  }
+
+  public unwrap<T>(): T {
+    throw new Error('Method is not supported for gRPC transport');
+  }
+
+  public on<
+    EventKey extends string | number | symbol = string | number | symbol,
+    EventCallback = any,
+  >(event: EventKey, callback: EventCallback) {
+    throw new Error('Method is not supported in gRPC mode.');
+  }
+
+  /**
+   * Writes an observable to a GRPC call.
+   *
+   * This function will ensure that backpressure is managed while writing values
+   * that come from an observable to a GRPC call. On a bidirectional call, the
+   * requests stop being read while the client is not reading the responses.
+   * The observable itself cannot be paused, so a call whose client leaves more
+   * than "maxPendingResponses" of them waiting is failed.
+   * The value a promise resolves to is written in the order it was emitted.
+   *
+   * @param source The observable we want to write out to the GRPC call.
+   * @param call The GRPC call we want to write to.
+   * @returns A promise that resolves when we're done writing to the call.
+   */
+  private writeObservableToGrpc<T>(
+    source: Observable<T>,
+    call: GrpcCall<T>,
+  ): Promise<void> {
+    // This promise should **not** reject, as we're handling errors in the observable for the Call
+    // the promise is only needed to signal when writing/draining has been completed
+    return new Promise((resolve, _doNotUse) => {
+      if (call.cancelled) {
+        // The client is already gone, and the "cancelled" event that would
+        // settle this promise has fired before we could listen for it.
+        return resolve();
+      }
+      const valuesWaitingToBeDrained: unknown[] = [];
+      // Read through an index, as removing each value would move the rest
+      let nextIndex = 0;
+      let shouldErrorAfterDraining = false;
+      let error: any;
+      let shouldResolveAfterDraining = false;
+      let writing = true;
+      let requestsPaused = false;
+
+      // Used to manage finalization
+      const subscription = new Subscription();
+
+      // If the call is cancelled, unsubscribe from the source
+      const cancelHandler = () => {
+        subscription.unsubscribe();
+        // Calls that are cancelled by the client should be successfully resolved here
+        resolve();
+      };
+      call.on(CANCELLED_EVENT, cancelHandler);
+      subscription.add(() => call.off(CANCELLED_EVENT, cancelHandler));
+
+      // The observable cannot be held back, so what it emits while the client
+      // is not reading waits here, and the call is failed once more than
+      // "maxPendingResponses" values wait. Not counted are the values it
+      // emits in one go when the client has caught up: a result it already
+      // holds, such as from(rows), or a batch of a live stream. Such a batch
+      // starts when a value has to wait while nothing else does, and ends with
+      // the turn of the event loop. Its values are written first.
+      let isEmittingBatch = false;
+      let batchEnd: ReturnType<typeof setImmediate> | undefined;
+      let batchValuesWaiting = 0;
+      const startBatch = () => {
+        if (isEmittingBatch) {
+          return;
+        }
+        isEmittingBatch = true;
+        batchEnd = setImmediate(() => (isEmittingBatch = false));
+      };
+      subscription.add(() => clearImmediate(batchEnd));
+
+      const failIfTooManyWaiting = () => {
+        const waitingCount =
+          valuesWaitingToBeDrained.length - nextIndex - batchValuesWaiting;
+        if (
+          !this.maxPendingResponses ||
+          waitingCount <= this.maxPendingResponses
+        ) {
+          return;
+        }
+        this.logger.warn(
+          `The client of a gRPC call is not reading its responses: more than ${this.maxPendingResponses} of them are waiting for it, so the call is failed`,
+        );
+        // grpc-js sends the status after the responses it already holds for
+        // the call. Nothing more is held for it meanwhile.
+        valuesWaitingToBeDrained.length = 0;
+        nextIndex = 0;
+        batchValuesWaiting = 0;
+        emitResponseError(call, this.createTooManyPendingResponsesError());
+        subscription.unsubscribe();
+        resolve();
+      };
+
+      // In all cases, when we finalize, end the writable stream
+      // being careful that errors and writes must be emitted _before_ this call is ended
+      subscription.add(() => call.end());
+
+      const writeWaitingValues = () => {
+        if (subscription.closed) {
+          return;
+        }
+        let responseError: unknown;
+        while (writing && nextIndex < valuesWaitingToBeDrained.length) {
+          let value = valuesWaitingToBeDrained[nextIndex];
+          if (value instanceof PendingResponse) {
+            const { settled } = value;
+            if (!settled) {
+              break;
+            }
+            if ('error' in settled) {
+              responseError = settled.error;
+              break;
+            }
+            value = settled.value;
+            if (value === null) {
+              responseError = this.createNullResponseError();
+              break;
+            }
+          }
+          nextIndex++;
+          if (batchValuesWaiting > 0) {
+            batchValuesWaiting--;
+          }
+          // The first time `call.write` returns false, we need to stop.
+          // It wrote the value, but it won't write anything else.
+          writing = call.write(value);
+        }
+        if (nextIndex === valuesWaitingToBeDrained.length) {
+          valuesWaitingToBeDrained.length = 0;
+          nextIndex = 0;
+        } else if (nextIndex > valuesWaitingToBeDrained.length / 2) {
+          // Releases the written values of a queue that never empties
+          valuesWaitingToBeDrained.splice(0, nextIndex);
+          nextIndex = 0;
+        }
+        if (responseError) {
+          emitResponseError(call, responseError);
+          subscription.unsubscribe();
+          return resolve();
+        }
+        if (!writing) {
+          // We can't write anymore so we need to wait for the drain event
+          if (!requestsPaused && call.pause) {
+            call.pause();
+            requestsPaused = true;
+          }
+          return;
+        }
+        if (
+          requestsPaused &&
+          valuesWaitingToBeDrained.length - nextIndex <
+            (call.writableHighWaterMark ?? Infinity)
+        ) {
+          // The client has read the responses, so read its requests again
+          requestsPaused = false;
+          call.resume?.();
+        }
+        if (valuesWaitingToBeDrained.length > 0) {
+          // A promise ahead of the values waiting here has not settled
+          return;
+        }
+
+        if (shouldResolveAfterDraining) {
+          subscription.unsubscribe();
+          resolve();
+        } else if (shouldErrorAfterDraining) {
+          emitResponseError(call, error);
+          subscription.unsubscribe();
+          resolve();
+        }
+      };
+
+      const drain = () => {
+        writing = true;
+        writeWaitingValues();
+      };
+      call.on('drain', drain);
+      subscription.add(() => call.off('drain', drain));
+
+      // Settled as soon as possible: a rejection queued behind a pending
+      // promise would otherwise be reported as unhandled
+      const holdPlace = (promise: Promise<unknown>) => {
+        const pending = new PendingResponse();
+        promise
+          .then(
+            value => ({ value }),
+            err => ({ error: this.toInternalError(err) }),
+          )
+          .then(settled => {
+            pending.settled = settled;
+            writeWaitingValues();
+          });
+        return pending;
+      };
+
+      // The call is an object mode stream, whose "write" throws on null where
+      // nothing catches it, so null takes the error path instead
+      const values$ = source.pipe(
+        tap(value => {
+          if (value === null) {
+            throw this.createNullResponseError();
+          }
+        }),
+      );
+
+      const enqueue = (value: unknown) => {
+        valuesWaitingToBeDrained.push(value);
+        if (isEmittingBatch) {
+          batchValuesWaiting++;
+        }
+      };
+
+      subscription.add(
+        values$.subscribe({
+          next(value) {
+            if (value instanceof Promise) {
+              if (writing && valuesWaitingToBeDrained.length === 0) {
+                startBatch();
+              }
+              enqueue(holdPlace(value));
+            } else if (writing && valuesWaitingToBeDrained.length === 0) {
+              writing = call.write(value);
+              if (!writing) {
+                startBatch();
+              }
+              if (!writing && call.pause) {
+                // The responses to the requests read meanwhile would all be
+                // buffered here, as the client is not reading them.
+                call.pause();
+                requestsPaused = true;
+              }
+            } else {
+              // If we can't write, that's because we need to
+              // wait for the drain event before we can write again
+              // buffer the value and wait for the drain event
+              // (or for a promise queued ahead of it to settle)
+              enqueue(value);
+            }
+            failIfTooManyWaiting();
+            if (subscription.closed) {
+              return;
+            }
+            if (
+              !requestsPaused &&
+              call.pause &&
+              valuesWaitingToBeDrained.length - nextIndex >=
+                (call.writableHighWaterMark ?? Infinity)
+            ) {
+              // As many responses wait here as the call itself would buffer
+              call.pause();
+              requestsPaused = true;
+            }
+          },
+          error(err) {
+            if (valuesWaitingToBeDrained.length === 0) {
+              // We're not waiting for a drain event, so we can just
+              // reject and teardown.
+              emitResponseError(call, err);
+              subscription.unsubscribe();
+              resolve();
+            } else {
+              // We're waiting for a drain event, record the
+              // error so it can be handled after everything is drained.
+              shouldErrorAfterDraining = true;
+              error = err;
+            }
+          },
+          complete() {
+            if (valuesWaitingToBeDrained.length === 0) {
+              // We're not waiting for a drain event, so we can just
+              // resolve and teardown.
+              subscription.unsubscribe();
+              resolve();
+            } else {
+              shouldResolveAfterDraining = true;
+            }
+          },
+        }),
+      );
+    });
   }
 
   public createRequestStreamMethod(
@@ -240,50 +782,91 @@ export class ServerGrpc extends Server implements CustomTransportStrategy {
       call: GrpcCall,
       callback: (err: unknown, value: unknown) => void,
     ) => {
-      const req = new Subject<any>();
-      call.on('data', (m: any) => req.next(m));
-      call.on('error', (e: any) => {
-        // Check if error means that stream ended on other end
-        const isCancelledError = String(e).toLowerCase().indexOf('cancelled');
+      return this.runWithProcessingHooks(
+        this.createProcessingContext(call, methodHandler),
+        async runEndHook => {
+          // Needs to be a Proxy in order to buffer messages that come before handler is executed
+          // This could happen if handler has any async guards or interceptors registered that would delay
+          // the execution.
+          const { subject, next, error, complete } = this.bufferUntilDrained();
+          call.on('data', (m: any) => next(m));
+          call.on('error', (e: any) => {
+            // The response error emitted by this server on the same call
+            // is not an error of the request stream
+            if (callsEmittingResponseError.has(call)) {
+              return;
+            }
+            // Check if error means that stream ended on other end
+            const isCancelledError = String(e)
+              .toLowerCase()
+              .indexOf('cancelled');
 
-        if (isCancelledError) {
-          call.end();
-          return;
-        }
-        // If another error then just pass it along
-        req.error(e);
-      });
-      call.on('end', () => req.complete());
+            if (isCancelledError !== -1) {
+              complete();
+              call.end();
+              return;
+            }
+            // If another error then just pass it along
+            error(e);
+          });
+          // grpc-js reports a client cancellation or an expired deadline
+          // through this event alone (no "error", and for a deadline no
+          // "end"), so the request stream has to be settled here for a
+          // handler that is still consuming it.
+          call.on(CANCELLED_EVENT, () => complete());
+          call.on('end', () => complete());
 
-      const handler = methodHandler(req.asObservable(), call.metadata, call);
-      const res = this.transformToObservable(await handler);
-      if (isResponseStream) {
-        await res
-          .pipe(
-            takeUntil(fromEvent(call as any, CANCEL_EVENT)),
-            catchError(err => {
-              call.emit('error', err);
-              return EMPTY;
-            }),
-          )
-          .forEach(m => call.write(m));
+          try {
+            const handler = methodHandler(
+              subject.asObservable(),
+              call.metadata,
+              call,
+            );
+            const res = this.transformToObservable(await handler);
+            if (isResponseStream) {
+              await this.writeObservableToGrpc(res, call);
+            } else if (!call.cancelled) {
+              // Unless the client is already gone: the "cancelled" event that
+              // would end the subscription has then fired before it could be
+              // listened for.
+              let errored = false;
+              const response = await lastValueFrom(
+                res.pipe(
+                  // Ahead of "takeUntil", which completes the stream when the
+                  // call is cancelled.
+                  throwIfEmpty(() => this.createNoResponseError()),
+                  takeUntil(fromEvent(call as any, CANCELLED_EVENT)),
+                  catchError(err => {
+                    errored = true;
+                    callback(toSendableError(err), null);
+                    return EMPTY;
+                  }),
+                  defaultIfEmpty(undefined),
+                ),
+              );
 
-        call.end();
-      } else {
-        const response = await res
-          .pipe(
-            takeUntil(fromEvent(call as any, CANCEL_EVENT)),
-            catchError(err => {
-              callback(err, null);
-              return EMPTY;
-            }),
-          )
-          .toPromise();
-
-        if (typeof response !== 'undefined') {
-          callback(null, response);
-        }
-      }
+              if (!errored && !call.cancelled) {
+                callback(null, response);
+              }
+            }
+          } catch (err) {
+            // grpc-js ignores the promise returned here, so a rejection (an
+            // exception filter that throws, or a response promise that
+            // rejects) would go unhandled
+            const internalError = this.toInternalError(err);
+            if (isResponseStream) {
+              emitResponseError(call, internalError);
+            } else {
+              callback(internalError, null);
+            }
+          } finally {
+            // The span closes when the handler is done, not when the client
+            // stops sending.
+            runEndHook();
+          }
+        },
+        call.request,
+      );
     };
   }
 
@@ -295,17 +878,175 @@ export class ServerGrpc extends Server implements CustomTransportStrategy {
       call: GrpcCall,
       callback: (err: unknown, value: unknown) => void,
     ) => {
-      if (isResponseStream) {
-        methodHandler(call);
-      } else {
-        methodHandler(call, callback);
-      }
+      return this.runWithProcessingHooks(
+        this.createProcessingContext(call, methodHandler),
+        async runEndHook => {
+          const fail = (err: unknown) => {
+            if (isResponseStream) {
+              call.emit('error', err);
+            } else {
+              callback(err, null);
+            }
+          };
+          let handlerStream: Observable<any>;
+          try {
+            handlerStream = this.transformToObservable(
+              isResponseStream
+                ? await methodHandler(call)
+                : await methodHandler(call, callback),
+            );
+          } catch (err) {
+            // grpc-js ignores the promise returned here, so a rejection (an
+            // exception filter that throws) would go unhandled. The error has
+            // not been through the exception filters, so it is logged rather
+            // than sent to the client, as for the other kinds of call.
+            runEndHook();
+            return fail(this.toInternalError(err));
+          }
+          try {
+            await lastValueFrom(handlerStream.pipe(finalize(runEndHook)), {
+              defaultValue: undefined,
+            });
+          } catch (err) {
+            // The error the exception filters answered with
+            fail(toSendableError(err));
+          }
+        },
+        call.request,
+      );
     };
   }
 
-  public close() {
-    this.grpcClient && this.grpcClient.forceShutdown();
+  private createNoResponseError() {
+    return {
+      code: GrpcStatus.INTERNAL,
+      details: 'The handler completed without emitting a response',
+    };
+  }
+
+  private createNullResponseError() {
+    return {
+      code: GrpcStatus.INTERNAL,
+      details: 'The handler emitted a null response',
+    };
+  }
+
+  private createTooManyPendingResponsesError() {
+    return {
+      code: GrpcStatus.RESOURCE_EXHAUSTED,
+      details: 'Too many responses are waiting for the client to read them',
+    };
+  }
+
+  // An error that bypassed the exception filters is logged rather than sent
+  // to the client, as the built-in filters do with an unknown exception
+  private toInternalError(err: unknown) {
+    this.logger.error(err);
+    return {
+      code: GrpcStatus.INTERNAL,
+      details: MESSAGES.UNKNOWN_EXCEPTION_MESSAGE,
+    };
+  }
+
+  /**
+   * "gracePeriod" as every transport reads it (see "normalizeGracePeriod").
+   */
+  protected getGracePeriod(): number {
+    return this.normalizeGracePeriod(
+      this.getOptionsProp(this.options, 'gracePeriod'),
+    );
+  }
+
+  public close(): Promise<void> {
+    this.closeCount++;
+    // Coalesce overlapping close() calls onto the active shutdown promise
+    this.pendingClose ??= this.closeServer().finally(() => {
+      this.pendingClose = null;
+    });
+    return this.pendingClose;
+  }
+
+  private async closeServer(): Promise<void> {
+    const grpcClient = this.grpcClient;
+    if (!grpcClient) {
+      return;
+    }
     this.grpcClient = null;
+
+    const graceful = this.getOptionsProp(this.options, 'gracefulShutdown');
+    const gracePeriod = this.getGracePeriod();
+    if (!graceful || gracePeriod <= 0) {
+      grpcClient.forceShutdown();
+      return;
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+
+      const cleanupTimer = () => {
+        if (timer !== undefined) {
+          clearTimeout(timer);
+          timer = undefined;
+        }
+      };
+
+      const shutdownTimeout = () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        timer = undefined;
+        this.logger.warn(
+          `ServerGrpc (${this.url}) graceful shutdown timed out after ${gracePeriod}ms; calling forceShutdown().`,
+        );
+        try {
+          grpcClient.forceShutdown();
+          resolve();
+        } catch (forceErr) {
+          reject(forceErr);
+        }
+      };
+
+      // Not logged, as close() rejects with it
+      const abortWithForceShutdown = (cause: unknown) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanupTimer();
+        try {
+          grpcClient.forceShutdown();
+        } catch (forceErr) {
+          reject(forceErr);
+          return;
+        }
+        reject(cause);
+      };
+
+      try {
+        grpcClient.tryShutdown((error?: Error) => {
+          if (settled) {
+            return;
+          }
+          if (error) {
+            abortWithForceShutdown(error);
+            return;
+          }
+          settled = true;
+          cleanupTimer();
+          resolve();
+        });
+      } catch (syncError) {
+        abortWithForceShutdown(syncError);
+        return;
+      }
+
+      // tryShutdown() calls back at once when there is nothing to wait for
+      if (!settled) {
+        timer = setTimeout(shutdownTimeout, gracePeriod);
+      }
+    });
   }
 
   public deserialize(obj: any): any {
@@ -317,7 +1058,7 @@ export class ServerGrpc extends Server implements CustomTransportStrategy {
   }
 
   public addHandler(
-    pattern: any,
+    pattern: unknown,
     callback: MessageHandler,
     isEventHandler = false,
   ) {
@@ -326,62 +1067,92 @@ export class ServerGrpc extends Server implements CustomTransportStrategy {
     this.messageHandlers.set(route, callback);
   }
 
-  public createClient(): any {
-    const grpcOptions = {
-      'grpc.max_send_message_length': this.getOptionsProp(
-        this.options,
-        'maxSendMessageLength',
-        GRPC_DEFAULT_MAX_SEND_MESSAGE_LENGTH,
-      ),
-      'grpc.max_receive_message_length': this.getOptionsProp(
-        this.options,
-        'maxReceiveMessageLength',
-        GRPC_DEFAULT_MAX_RECEIVE_MESSAGE_LENGTH,
-      ),
+  public async createClient() {
+    await this.loadGrpcPackage();
+    // A copy, so the limits below never reach an object the caller may share
+    const channelOptions: ChannelOptions = {
+      ...this.options?.channelOptions,
     };
-    const maxMetadataSize = this.getOptionsProp(
-      this.options,
-      'maxMetadataSize',
-      -1,
-    );
-    if (maxMetadataSize > 0) {
-      grpcOptions['grpc.max_metadata_size'] = maxMetadataSize;
+    if (this.options && this.options.maxSendMessageLength) {
+      channelOptions['grpc.max_send_message_length'] =
+        this.options.maxSendMessageLength;
     }
-    const server = new grpcPackage.Server(grpcOptions);
+    if (this.options && this.options.maxReceiveMessageLength) {
+      channelOptions['grpc.max_receive_message_length'] =
+        this.options.maxReceiveMessageLength;
+    }
+    if (this.options && this.options.maxMetadataSize) {
+      channelOptions['grpc.max_metadata_size'] = this.options.maxMetadataSize;
+    }
+
+    const keepaliveOptions = this.getKeepaliveOptions();
+    const options: Record<string, string | number> = {
+      ...channelOptions,
+      ...keepaliveOptions,
+    };
+
+    // Use merged options instead of just channelOptions
+    const server = new grpcPackage.Server(options);
     const credentials = this.getOptionsProp(this.options, 'credentials');
-    server.bind(
-      this.url,
-      credentials || grpcPackage.ServerCredentials.createInsecure(),
-    );
+
+    await new Promise((resolve, reject) => {
+      server.bindAsync(
+        this.url,
+        credentials || grpcPackage.ServerCredentials.createInsecure(),
+        (error: Error | null, port: number) =>
+          error ? reject(error) : resolve(port),
+      );
+    });
+
     return server;
   }
 
   public lookupPackage(root: any, packageName: string) {
     /** Reference: https://github.com/kondi/rxjs-grpc */
     let pkg = root;
-    for (const name of packageName.split(/\./)) {
-      pkg = pkg[name];
+
+    if (packageName) {
+      for (const name of packageName.split(/\./)) {
+        if (!pkg) {
+          break;
+        }
+        pkg = pkg[name];
+      }
     }
+
     return pkg;
+  }
+
+  private async loadGrpcPackage() {
+    grpcPackage = await this.loadPackage(
+      '@grpc/grpc-js',
+      ServerGrpc.name,
+      () => import('@grpc/grpc-js'),
+    );
   }
 
   public loadProto(): any {
     try {
-      const file = this.getOptionsProp(this.options, 'protoPath');
-      const loader = this.getOptionsProp(this.options, 'loader');
-
-      const packageDefinition = grpcProtoLoaderPackage.loadSync(file, loader);
-      const packageObject = grpcPackage.loadPackageDefinition(
-        packageDefinition,
+      const packageDefinition = getGrpcPackageDefinition(
+        this.options,
+        grpcProtoLoaderPackage,
       );
-      return packageObject;
+
+      if (this.options.onLoadPackageDefinition) {
+        this.options.onLoadPackageDefinition(
+          packageDefinition,
+          this.grpcClient,
+        );
+      }
+
+      return grpcPackage.loadPackageDefinition(packageDefinition);
     } catch (err) {
-      const invalidProtoError = new InvalidProtoDefinitionException();
+      const invalidProtoError = new InvalidProtoDefinitionException(err.path);
       const message =
         err && err.message ? err.message : invalidProtoError.message;
 
       this.logger.error(message, invalidProtoError.stack);
-      throw err;
+      throw invalidProtoError;
     }
   }
 
@@ -418,14 +1189,19 @@ export class ServerGrpc extends Server implements CustomTransportStrategy {
         ? deepDefinition.service !== false
         : false;
 
+      // grpc namespace object does not have 'format' or 'service' properties defined
+      const isFormatDefined =
+        deepDefinition && !isUndefined(deepDefinition.format);
+
       if (isServiceDefined && isServiceBoolean) {
         accumulator.push({
           name: nameExtended,
           service: deepDefinition,
         });
-      }
-      // Continue recursion until objects end or service definition found
-      else {
+      } else if (isFormatDefined) {
+        // Do nothing
+      } else {
+        // Continue recursion for namespace object until objects end or service definition found
         this.collectDeepServices(nameExtended, deepDefinition, accumulator);
       }
     }
@@ -437,13 +1213,13 @@ export class ServerGrpc extends Server implements CustomTransportStrategy {
       return key;
     }
     // Otherwise add next through dot syntax
-    return name + '.' + key;
+    return `${name}.${key}`;
   }
 
-  private async createServices(grpcPkg: any) {
+  private async createServices(grpcPkg: any, packageName: string) {
     if (!grpcPkg) {
-      const invalidPackageError = new InvalidGrpcPackageException();
-      this.logger.error(invalidPackageError.message, invalidPackageError.stack);
+      const invalidPackageError = new InvalidGrpcPackageException(packageName);
+      this.logger.error(invalidPackageError);
       throw invalidPackageError;
     }
 
@@ -457,5 +1233,73 @@ export class ServerGrpc extends Server implements CustomTransportStrategy {
         await this.createService(definition.service, definition.name),
       );
     }
+  }
+
+  private bufferUntilDrained<T>() {
+    type DrainableSubject<T> = Subject<T> & { drainBuffer: () => void };
+
+    const subject = new Subject<T>();
+    let replayBuffer: ReplaySubject<T> | null = new ReplaySubject<T>();
+    let hasDrained = false;
+
+    function drainBuffer(this: DrainableSubject<T>) {
+      if (hasDrained || !replayBuffer) {
+        return;
+      }
+      hasDrained = true;
+
+      // Replay buffered values to the new subscriber
+      setImmediate(() => {
+        const subscription = replayBuffer!.subscribe(subject);
+        subscription.unsubscribe();
+        replayBuffer = null;
+      });
+    }
+
+    return {
+      subject: new Proxy<DrainableSubject<T>>(subject as DrainableSubject<T>, {
+        get(target, prop, receiver) {
+          if (prop === 'asObservable') {
+            return () => {
+              const stream = subject.asObservable();
+
+              // "drainBuffer" will be called before the evaluation of the handler
+              // but after any enhancers have been applied (e.g., `interceptors`)
+              Object.defineProperty(stream, drainBuffer.name, {
+                value: drainBuffer,
+              });
+              return stream;
+            };
+          }
+          if (hasDrained) {
+            return Reflect.get(target, prop, receiver);
+          }
+          return Reflect.get(replayBuffer!, prop, receiver);
+        },
+      }),
+      next: (value: T) => {
+        if (replayBuffer) {
+          replayBuffer.next(value);
+        }
+        if (!hasDrained || !replayBuffer) {
+          subject.next(value);
+        }
+      },
+      error: (err: any) => {
+        replayBuffer?.error(err);
+        subject.error(err);
+      },
+      complete: () => {
+        if (replayBuffer) {
+          // The subject completes once the buffer has been replayed into it,
+          // which "drainBuffer" does after the handler has subscribed. The
+          // buffer is kept until then: dropping it here would leave a handler
+          // that has not run yet without its messages and without completion.
+          replayBuffer.complete();
+          return;
+        }
+        subject.complete();
+      },
+    };
   }
 }

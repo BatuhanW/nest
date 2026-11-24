@@ -1,2 +1,3 @@
-export * from './fastify-static-options.interface';
-export * from './point-of-view-options.interface';
+export type * from './fastify-static-options.interface.js';
+export type * from './fastify-view-options.interface.js';
+export type * from './fastify-multipart-options.interface.js';

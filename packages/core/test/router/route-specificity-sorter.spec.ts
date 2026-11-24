@@ -1,0 +1,251 @@
+import { RequestMethod } from '@nestjs/common';
+import { ResolvedRoute } from '../../router/interfaces/resolved-route.interface.js';
+import { RouteSpecificitySorter } from '../../router/route-specificity-sorter.js';
+
+const makeResolvedRoute = (
+  overrides: Partial<ResolvedRoute> & { path: string },
+): ResolvedRoute => ({
+  method: RequestMethod.GET,
+  host: undefined,
+  version: undefined,
+  methodVersion: undefined,
+  controllerVersion: undefined,
+  handler: (() => undefined) as ResolvedRoute['handler'],
+  targetCallback: (() => undefined) as ResolvedRoute['targetCallback'],
+  methodName: 'handler',
+  instanceWrapper: {
+    name: 'TestController',
+  } as ResolvedRoute['instanceWrapper'],
+  ...overrides,
+});
+
+const pathsOf = (routes: ResolvedRoute[]): string[] =>
+  routes.map(route => route.path);
+
+describe('RouteSpecificitySorter', () => {
+  describe('sort', () => {
+    it('should put a static route before a parametric route at the same length', () => {
+      const parametricRoute = makeResolvedRoute({ path: '/users/:userId' });
+      const staticRoute = makeResolvedRoute({ path: '/users/me' });
+
+      const sorted = RouteSpecificitySorter.sort([
+        parametricRoute,
+        staticRoute,
+      ]);
+
+      expect(pathsOf(sorted)).toEqual(['/users/me', '/users/:userId']);
+    });
+
+    it('should put a parametric route before a wildcard route at the same length', () => {
+      const wildcardRoute = makeResolvedRoute({ path: '/users/*rest' });
+      const parametricRoute = makeResolvedRoute({ path: '/users/:userId' });
+
+      const sorted = RouteSpecificitySorter.sort([
+        wildcardRoute,
+        parametricRoute,
+      ]);
+
+      expect(pathsOf(sorted)).toEqual(['/users/:userId', '/users/*rest']);
+    });
+
+    it('should treat adapter-normalized wildcard groups as wildcard routes', () => {
+      const wildcardRoute = makeResolvedRoute({ path: '/users/{*rest}' });
+      const parametricRoute = makeResolvedRoute({ path: '/users/:userId' });
+
+      const sorted = RouteSpecificitySorter.sort([
+        wildcardRoute,
+        parametricRoute,
+      ]);
+
+      expect(pathsOf(sorted)).toEqual(['/users/:userId', '/users/{*rest}']);
+    });
+
+    it('should fully order literal < param < wildcard across a triple', () => {
+      const wildcardRoute = makeResolvedRoute({ path: '/users/*rest' });
+      const staticRoute = makeResolvedRoute({ path: '/users/me' });
+      const parametricRoute = makeResolvedRoute({ path: '/users/:userId' });
+
+      const sorted = RouteSpecificitySorter.sort([
+        wildcardRoute,
+        staticRoute,
+        parametricRoute,
+      ]);
+
+      expect(pathsOf(sorted)).toEqual([
+        '/users/me',
+        '/users/:userId',
+        '/users/*rest',
+      ]);
+    });
+
+    it('should keep declaration order when specificities tie', () => {
+      const firstStatic = makeResolvedRoute({
+        path: '/users/me',
+        methodName: 'first',
+      });
+      const secondStatic = makeResolvedRoute({
+        path: '/orders/list',
+        methodName: 'second',
+      });
+      const thirdStatic = makeResolvedRoute({
+        path: '/items/all',
+        methodName: 'third',
+      });
+
+      const sorted = RouteSpecificitySorter.sort([
+        firstStatic,
+        secondStatic,
+        thirdStatic,
+      ]);
+
+      expect(sorted.map(route => route.methodName)).toEqual([
+        'first',
+        'second',
+        'third',
+      ]);
+    });
+
+    it('should prefer the path that is more specific at the earliest differing segment', () => {
+      const ambiguousLater = makeResolvedRoute({
+        path: '/users/:userId/orders',
+      });
+      const specificEarlier = makeResolvedRoute({
+        path: '/users/me/:resource',
+      });
+
+      const sorted = RouteSpecificitySorter.sort([
+        ambiguousLater,
+        specificEarlier,
+      ]);
+
+      expect(pathsOf(sorted)).toEqual([
+        '/users/me/:resource',
+        '/users/:userId/orders',
+      ]);
+    });
+
+    it('should treat a shorter path as less specific than a longer one when the missing segment slot decides it', () => {
+      const shorterRoute = makeResolvedRoute({ path: '/users' });
+      const longerRoute = makeResolvedRoute({ path: '/users/me' });
+
+      const sorted = RouteSpecificitySorter.sort([shorterRoute, longerRoute]);
+
+      expect(pathsOf(sorted)).toEqual(['/users/me', '/users']);
+    });
+
+    it.each([
+      ['/', '/{*path}'],
+      ['/api', '/api{/*path}'],
+      ['/users', '/users{/:userId}'],
+      ['/files', '/files/{*path}'],
+      ['/report', '/report{.:format}'],
+    ])(
+      'should put `%s` before `%s`, whose optional group also matches it',
+      (exactPath, optionalGroupPath) => {
+        const optionalGroupRoute = makeResolvedRoute({
+          path: optionalGroupPath,
+        });
+        const exactRoute = makeResolvedRoute({ path: exactPath });
+
+        const sorted = RouteSpecificitySorter.sort([
+          optionalGroupRoute,
+          exactRoute,
+        ]);
+
+        expect(pathsOf(sorted)).toEqual([exactPath, optionalGroupPath]);
+      },
+    );
+
+    it('should put a literal before a segment that mixes text and params', () => {
+      const mixedRoute = makeResolvedRoute({ path: '/v:version/items' });
+      const staticRoute = makeResolvedRoute({ path: '/v1/items' });
+
+      const sorted = RouteSpecificitySorter.sort([mixedRoute, staticRoute]);
+
+      expect(pathsOf(sorted)).toEqual(['/v1/items', '/v:version/items']);
+    });
+
+    it('should put a segment that mixes text and params before a param', () => {
+      const parametricRoute = makeResolvedRoute({ path: '/files/:fileId' });
+      const mixedRoute = makeResolvedRoute({ path: '/files/:name.:ext' });
+
+      const sorted = RouteSpecificitySorter.sort([parametricRoute, mixedRoute]);
+
+      expect(pathsOf(sorted)).toEqual(['/files/:name.:ext', '/files/:fileId']);
+    });
+
+    it('should keep declaration order between a param and the same param with an optional suffix', () => {
+      const parametricRoute = makeResolvedRoute({ path: '/users/:id' });
+      const suffixedRoute = makeResolvedRoute({ path: '/users/:id{.:format}' });
+
+      expect(
+        pathsOf(RouteSpecificitySorter.sort([parametricRoute, suffixedRoute])),
+      ).toEqual(['/users/:id', '/users/:id{.:format}']);
+      expect(
+        pathsOf(RouteSpecificitySorter.sort([suffixedRoute, parametricRoute])),
+      ).toEqual(['/users/:id{.:format}', '/users/:id']);
+    });
+
+    it('should put the exact route before a catch-all declared ahead of it', () => {
+      const catchAllRoute = makeResolvedRoute({ path: '/users/{*path}' });
+      const parametricRoute = makeResolvedRoute({ path: '/users/:userId' });
+      const staticRoute = makeResolvedRoute({ path: '/users/me' });
+      const exactRoute = makeResolvedRoute({ path: '/users' });
+
+      const sorted = RouteSpecificitySorter.sort([
+        catchAllRoute,
+        parametricRoute,
+        staticRoute,
+        exactRoute,
+      ]);
+
+      expect(pathsOf(sorted)).toEqual([
+        '/users/me',
+        '/users',
+        '/users/:userId',
+        '/users/{*path}',
+      ]);
+    });
+
+    it('should keep a shorter path with a wildcard after the longer paths it can absorb', () => {
+      const shorterRoute = makeResolvedRoute({ path: '/files/*rest' });
+      const longerRoute = makeResolvedRoute({ path: '/files/*rest/:action' });
+
+      const sorted = RouteSpecificitySorter.sort([shorterRoute, longerRoute]);
+
+      expect(pathsOf(sorted)).toEqual(['/files/*rest/:action', '/files/*rest']);
+    });
+
+    it('should not mutate the input array', () => {
+      const parametricRoute = makeResolvedRoute({ path: '/users/:userId' });
+      const staticRoute = makeResolvedRoute({ path: '/users/me' });
+      const input = [parametricRoute, staticRoute];
+
+      RouteSpecificitySorter.sort(input);
+
+      expect(input).toEqual([parametricRoute, staticRoute]);
+    });
+
+    it('should return references to the same route objects (no defensive copy)', () => {
+      const parametricRoute = makeResolvedRoute({ path: '/users/:userId' });
+      const staticRoute = makeResolvedRoute({ path: '/users/me' });
+
+      const sorted = RouteSpecificitySorter.sort([
+        parametricRoute,
+        staticRoute,
+      ]);
+
+      expect(sorted[0]).toBe(staticRoute);
+      expect(sorted[1]).toBe(parametricRoute);
+    });
+
+    it('should handle an empty input', () => {
+      expect(RouteSpecificitySorter.sort([])).toEqual([]);
+    });
+
+    it('should handle a single-element input by returning it unchanged', () => {
+      const onlyRoute = makeResolvedRoute({ path: '/users/me' });
+      expect(RouteSpecificitySorter.sort([onlyRoute])).toEqual([onlyRoute]);
+    });
+  });
+});

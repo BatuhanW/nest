@@ -1,110 +1,184 @@
-import { isUndefined } from '@nestjs/common/utils/shared.utils';
-import { Observable } from 'rxjs';
+import { isObject, isUndefined } from '@nestjs/common/internal';
+import { EventEmitter } from 'events';
+import { NATS_DEFAULT_URL, NO_MESSAGE_HANDLER } from '../constants.js';
+import { NatsContext } from '../ctx-host/nats.context.js';
+import { NatsRequestJSONDeserializer } from '../deserializers/nats-request-json.deserializer.js';
+import { Transport } from '../enums/index.js';
 import {
-  CONNECT_EVENT,
-  ERROR_EVENT,
-  NATS_DEFAULT_URL,
-  NO_MESSAGE_HANDLER,
-} from '../constants';
-import { NatsContext } from '../ctx-host/nats.context';
-import { Transport } from '../enums';
-import { Client } from '../external/nats-client.interface';
-import { CustomTransportStrategy, PacketId } from '../interfaces';
-import { NatsOptions } from '../interfaces/microservice-configuration.interface';
-import { IncomingRequest, ReadPacket } from '../interfaces/packet.interface';
-import { Server } from './server';
+  NatsEvents,
+  NatsEventsMap,
+  NatsStatus,
+} from '../events/nats.events.js';
+import { MessageHandler } from '../interfaces/message-handler.interface.js';
+import {
+  NatsOptions,
+  TransportId,
+} from '../interfaces/microservice-configuration.interface.js';
+import { IncomingRequest } from '../interfaces/packet.interface.js';
+import { NatsRecord } from '../record-builders/index.js';
+import { NatsRecordSerializer } from '../serializers/nats-record.serializer.js';
+import { Server } from './server.js';
 
-let natsPackage: any = {};
+// To enable type safety for Nats. This cant be uncommented by default
+// because it would require the user to install the nats package even if they dont use Nats
+// Otherwise, TypeScript would fail to compile the code.
+//
+// type Client = import('@nats-io/transport-node').NatsConnection;
+// type NatsMsg = import('@nats-io/transport-node').Msg;
+// type Subscription = import('@nats-io/transport-node').Subscription;
 
-export class ServerNats extends Server implements CustomTransportStrategy {
-  public readonly transportId = Transport.NATS;
+type Client = any;
+type NatsMsg = any;
+type Subscription = any;
 
-  private readonly url: string;
+/**
+ * @publicApi
+ */
+export class ServerNats<
+  E extends NatsEvents = NatsEvents,
+  S extends NatsStatus = NatsStatus,
+> extends Server<E, S> {
+  public transportId: TransportId = Transport.NATS;
+
   private natsClient: Client;
+  private closeCount = 0;
+  protected statusEventEmitter = new EventEmitter<{
+    [key in keyof NatsEvents]: Parameters<NatsEvents[key]>;
+  }>();
+  private subscriptions: Subscription[] = [];
 
-  constructor(private readonly options: NatsOptions['options']) {
+  constructor(private readonly options: Required<NatsOptions>['options']) {
     super();
-    this.url = this.getOptionsProp(this.options, 'url') || NATS_DEFAULT_URL;
-
-    natsPackage = this.loadPackage('nats', ServerNats.name, () =>
-      require('nats'),
-    );
 
     this.initializeSerializer(options);
     this.initializeDeserializer(options);
   }
 
-  public listen(callback: () => void) {
-    this.natsClient = this.createNatsClient();
-    this.handleError(this.natsClient);
-    this.start(callback);
+  public async listen(
+    callback: (err?: unknown, ...optionalParams: unknown[]) => void,
+  ) {
+    const closeCount = this.closeCount;
+    try {
+      const natsClient = await this.createNatsClient();
+      if (this.closeCount !== closeCount) {
+        await natsClient.close().catch(() => {});
+        callback(new Error('Connection closed'));
+        return;
+      }
+      this.natsClient = natsClient;
+
+      this._status$.next(NatsStatus.CONNECTED as S);
+      this.handleStatusUpdates(this.natsClient).catch(err =>
+        this.logger.error(err),
+      );
+      this.start(callback);
+    } catch (err) {
+      callback(err);
+    }
   }
 
-  public start(callback?: () => void) {
+  public start(
+    callback: (err?: unknown, ...optionalParams: unknown[]) => void,
+  ) {
     this.bindEvents(this.natsClient);
-    this.natsClient.on(CONNECT_EVENT, callback);
+    callback();
   }
 
   public bindEvents(client: Client) {
-    const queue = this.getOptionsProp(this.options, 'queue');
-    const subscribe = queue
-      ? (channel: string) =>
-          client.subscribe(
-            channel,
-            { queue },
-            this.getMessageHandler(channel, client).bind(this),
-          )
-      : (channel: string) =>
-          client.subscribe(
-            channel,
-            this.getMessageHandler(channel, client).bind(this),
-          );
+    const subscribe = (channel: string, queue: string) =>
+      client.subscribe(channel, {
+        queue,
+        callback: this.getMessageHandler(channel).bind(this),
+      });
 
+    const defaultQueue = this.getOptionsProp(this.options, 'queue');
     const registeredPatterns = [...this.messageHandlers.keys()];
-    registeredPatterns.forEach(channel => subscribe(channel));
+    for (const channel of registeredPatterns) {
+      const handlerRef = this.messageHandlers.get(channel)!;
+      const queue = handlerRef.extras?.queue ?? defaultQueue;
+      const sub = subscribe(channel, queue);
+      this.subscriptions.push(sub);
+    }
   }
 
-  public close() {
-    this.natsClient && this.natsClient.close();
+  public async close() {
+    this.closeCount++;
+    if (!this.natsClient) {
+      this.statusEventEmitter.removeAllListeners();
+      return;
+    }
+    const graceful = this.getOptionsProp(this.options, 'gracefulShutdown');
+    if (graceful) {
+      this.subscriptions.forEach(sub => sub.unsubscribe());
+      this.subscriptions = [];
+      await this.waitForHandlersInFlight(
+        this.getOptionsProp(this.options, 'gracePeriod'),
+      );
+    }
+    // Reset first, so that the status updates do not take this close for a
+    // connection that gave up
+    const natsClient = this.natsClient;
     this.natsClient = null;
+    this.subscriptions = [];
+    try {
+      await natsClient?.close();
+    } finally {
+      this.statusEventEmitter.removeAllListeners();
+    }
   }
 
-  public createNatsClient(): Client {
+  public async createNatsClient(): Promise<Client> {
+    const natsPackage = await this.loadPackage(
+      '@nats-io/transport-node',
+      ServerNats.name,
+      () => import('@nats-io/transport-node'),
+    );
+
     const options = this.options || ({} as NatsOptions);
     return natsPackage.connect({
+      servers: NATS_DEFAULT_URL,
       ...options,
-      url: this.url,
-      json: true,
     });
   }
 
-  public getMessageHandler(channel: string, client: Client): Function {
-    return async (
-      buffer: ReadPacket & PacketId,
-      replyTo: string,
-      callerSubject: string,
-    ) => this.handleMessage(channel, buffer, client, replyTo, callerSubject);
+  public getMessageHandler(channel: string): Function {
+    return async (error: object | undefined, message: NatsMsg) => {
+      if (error) {
+        return this.logger.error(error);
+      }
+      return this.handleMessage(channel, message).catch(err =>
+        this.handleError(err),
+      );
+    };
   }
 
-  public async handleMessage(
-    channel: string,
-    rawMessage: any,
-    client: Client,
-    replyTo: string,
-    callerSubject: string,
-  ) {
-    const natsCtx = new NatsContext([callerSubject]);
-    const message = this.deserializer.deserialize(rawMessage, {
+  public async handleMessage(channel: string, natsMsg: NatsMsg) {
+    const callerSubject = natsMsg.subject;
+    const rawMessage = natsMsg.data;
+    const replyTo = natsMsg.reply;
+
+    const natsCtx = new NatsContext([callerSubject, natsMsg.headers]);
+    const message = await this.deserializer.deserialize(natsMsg, {
       channel,
       replyTo,
     });
+    if (this.isReply(message)) {
+      // The requester names the subject its reply is published on, so a
+      // reply of a Nest server, this one included, can arrive on the subject
+      // of a handler. It is not a message for that handler.
+      this.logger.debug?.(
+        `Skipped a reply of a Nest server that was published on "${callerSubject}"`,
+      );
+      return;
+    }
     if (isUndefined((message as IncomingRequest).id)) {
       return this.handleEvent(channel, message, natsCtx);
     }
+    this.assertValidPacketId((message as IncomingRequest).id);
     const publish = this.getPublisher(
-      client,
-      replyTo,
+      natsMsg,
       (message as IncomingRequest).id,
+      natsCtx,
     );
     const handler = this.getHandlerByPattern(channel);
     if (!handler) {
@@ -116,28 +190,227 @@ export class ServerNats extends Server implements CustomTransportStrategy {
       };
       return publish(noHandlerPacket);
     }
-    const response$ = this.transformToObservable(
-      await handler(message.data, natsCtx),
-    ) as Observable<any>;
-    response$ && this.send(response$, publish);
+    if (
+      handler.isEventHandler &&
+      this.isAnsweredByMessageHandler(callerSubject, handler)
+    ) {
+      // NATS delivers the request to every subscription whose subject matches
+      // it, so a message handler subscribed to such a subject answers it.
+      return this.handleEvent(channel, message, natsCtx);
+    }
+    if (
+      channel !== callerSubject &&
+      this.isAnsweredByOwnMessageHandler(callerSubject, handler)
+    ) {
+      // The message handler subscribed to the subject itself answers it alone
+      return;
+    }
+    this.warnIfEventHandlerReplies(handler, channel);
+    return this.handleRequest(
+      natsCtx,
+      async () =>
+        this.transformToObservable(await handler(message.data, natsCtx)),
+      publish,
+    );
   }
 
-  public getPublisher(publisher: Client, replyTo: string, id: string) {
-    if (replyTo) {
+  /**
+   * Whether the packet is a reply of a Nest server, which the default
+   * deserializer leaves as it is: a packet with an id that carries a
+   * response, an error or the end of the response stream instead of a
+   * pattern and data.
+   */
+  private isReply(packet: Record<string, any>) {
+    return (
+      isObject(packet) &&
+      !isUndefined(packet.id) &&
+      isUndefined(packet.pattern) &&
+      isUndefined(packet.data) &&
+      (!isUndefined(packet.response) ||
+        !isUndefined(packet.err) ||
+        !isUndefined(packet.isDisposed))
+    );
+  }
+
+  /**
+   * Whether a message handler receives a request published to the subject as
+   * well. NATS delivers a message to every subscription whose subject matches
+   * it, but to a single member of a queue group.
+   */
+  private isAnsweredByMessageHandler(
+    subject: string,
+    eventHandler: MessageHandler,
+  ) {
+    const defaultQueue = this.getOptionsProp(this.options, 'queue');
+    const eventQueue = eventHandler.extras?.queue ?? defaultQueue;
+    return [...this.messageHandlers].some(
+      ([pattern, handler]) =>
+        !handler.isEventHandler &&
+        (isUndefined(eventQueue) ||
+          (handler.extras?.queue ?? defaultQueue) !== eventQueue) &&
+        this.matchNatsSubject(pattern, subject),
+    );
+  }
+
+  /**
+   * Whether a message handler subscribed to the subject itself receives a
+   * request published to it as well, as it does unless it shares a queue
+   * group with the given handler.
+   */
+  private isAnsweredByOwnMessageHandler(
+    subject: string,
+    wildcardHandler: MessageHandler,
+  ) {
+    const defaultQueue = this.getOptionsProp(this.options, 'queue');
+    const queue = wildcardHandler.extras?.queue ?? defaultQueue;
+    const handler = this.messageHandlers.get(subject);
+    return (
+      !!handler &&
+      !handler.isEventHandler &&
+      (isUndefined(queue) || (handler.extras?.queue ?? defaultQueue) !== queue)
+    );
+  }
+
+  /**
+   * Whether a subject matches a subscription subject, in which "*" stands for
+   * any single token and a final ">" for one or more tokens.
+   */
+  private matchNatsSubject(pattern: string, subject: string) {
+    const patternTokens = pattern.split('.');
+    const subjectTokens = subject.split('.');
+    for (let i = 0; i < patternTokens.length; i++) {
+      if (patternTokens[i] === '>') {
+        return subjectTokens.length > i;
+      }
+      if (patternTokens[i] !== '*' && patternTokens[i] !== subjectTokens[i]) {
+        return false;
+      }
+    }
+    return patternTokens.length === subjectTokens.length;
+  }
+
+  public getPublisher(natsMsg: NatsMsg, id: string, ctx: NatsContext) {
+    if (natsMsg.reply) {
       return (response: any) => {
         Object.assign(response, { id });
-        const outgoingResponse = this.serializer.serialize(response);
-        return publisher.publish(replyTo, outgoingResponse);
+        const outgoingResponse: NatsRecord =
+          this.serializer.serialize(response);
+
+        return natsMsg.respond(outgoingResponse.data, {
+          headers: outgoingResponse.headers,
+        });
       };
     }
 
-    // In case "replyTo" topic is not provided, there's no need for a reply.
+    // In case the "reply" topic is not provided, there's no need for a reply.
     // Method returns a noop function instead
-    // eslint-disable-next-line @typescript-eslint/no-empty-function
+
     return () => {};
   }
 
-  public handleError(stream: any) {
-    stream.on(ERROR_EVENT, (err: any) => this.logger.error(err));
+  public async handleStatusUpdates(client: Client) {
+    for await (const status of client.status()) {
+      try {
+        switch (status.type) {
+          case 'error':
+            this.logger.error(
+              `NatsError: type: "${status.type}", error: "${status.error}".`,
+            );
+            break;
+
+          case 'disconnect':
+            this.logger.error(`NatsError: type: "${status.type}".`);
+
+            this._status$.next(NatsStatus.DISCONNECTED as S);
+            this.statusEventEmitter.emit(
+              NatsEventsMap.DISCONNECT,
+              status.server,
+            );
+            break;
+
+          case 'ping':
+            if (this.options.debug) {
+              this.logger.debug!(
+                `NatsStatus: type: "${status.type}", pending pings: "${status.pendingPings}".`,
+              );
+            }
+            break;
+
+          case 'reconnecting':
+            this._status$.next(NatsStatus.RECONNECTING as S);
+            break;
+
+          case 'reconnect':
+            this.logger.log(`NatsStatus: type: "${status.type}".`);
+
+            this._status$.next(NatsStatus.CONNECTED as S);
+            this.statusEventEmitter.emit(
+              NatsEventsMap.RECONNECT,
+              status.server,
+            );
+            break;
+
+          case 'update':
+            this.logger.log(
+              `NatsStatus: type: "${status.type}", added: "${status.added}", deleted: "${status.deleted}".`,
+            );
+            this.statusEventEmitter.emit(NatsEventsMap.UPDATE, {
+              added: status.added,
+              deleted: status.deleted,
+            });
+            break;
+
+          default: {
+            const data =
+              'data' in status && isObject(status.data)
+                ? JSON.stringify(status.data)
+                : 'data' in status
+                  ? status.data
+                  : '';
+            this.logger.log(
+              `NatsStatus: type: "${status.type}", data: "${data}".`,
+            );
+            break;
+          }
+        }
+      } catch (err) {
+        // A throwing listener must neither end the status updates nor
+        // escape as an unhandled rejection
+        this.logger.error(err);
+      }
+    }
+    // The status iterator only completes once the client is closed for good.
+    // Unless close() closed it, the server no longer receives any message.
+    if (this.natsClient === client) {
+      this._status$.next(NatsStatus.DISCONNECTED as S);
+      this.logger.error(
+        'The connection to the NATS server is closed and will not be reopened (see the "maxReconnectAttempts" option). The microservice no longer receives messages.',
+      );
+    }
+  }
+
+  public unwrap<T>(): T {
+    if (!this.natsClient) {
+      throw new Error(
+        'Not initialized. Please call the "listen"/"startAllMicroservices" method before accessing the server.',
+      );
+    }
+    return this.natsClient as T;
+  }
+
+  public on<
+    EventKey extends keyof E = keyof E,
+    EventCallback extends E[EventKey] = E[EventKey],
+  >(event: EventKey, callback: EventCallback) {
+    this.statusEventEmitter.on(event as string | symbol, callback as any);
+  }
+
+  protected initializeSerializer(options: NatsOptions['options']) {
+    this.serializer = options?.serializer ?? new NatsRecordSerializer();
+  }
+
+  protected initializeDeserializer(options: NatsOptions['options']) {
+    this.deserializer =
+      options?.deserializer ?? new NatsRequestJSONDeserializer();
   }
 }

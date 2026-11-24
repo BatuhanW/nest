@@ -1,0 +1,258 @@
+import urlSanitizer from 'find-my-way/lib/url-sanitizer.js';
+import { parse, type Token } from 'path-to-regexp';
+
+/**
+ * Drops the trailing slash of a pattern, so that "/users/" matches "/users"
+ * as well (as the Express router does).
+ */
+export function loosen(path: string) {
+  return path === '/' ? path : path.replace(/\/+$/, '');
+}
+
+/**
+ * The characters that stay percent-encoded in a routing path (see
+ * `getRoutingPath()`), and their escapes. "/" is left out: "%2F" never stands
+ * for a "/" of a route path.
+ */
+const RESERVED_CHARACTERS = /[#$%&+,:;=?@]/;
+const RESERVED_ESCAPES = /%(?:2[3-6bc]|3[abdf]|40)/gi;
+
+function hasDecodedText(
+  tokens: Token[],
+  segment = { hasParam: false },
+): boolean {
+  for (const token of tokens) {
+    if (token.type === 'group') {
+      // The segment may go on with or without the group
+      const { hasParam } = segment;
+      if (hasDecodedText(token.tokens, segment)) {
+        return true;
+      }
+      segment.hasParam ||= hasParam;
+    } else if (token.type === 'text') {
+      const slashIndex = token.value.indexOf('/');
+      const segmentText =
+        slashIndex === -1 ? token.value : token.value.slice(0, slashIndex);
+      if (
+        token.value.includes('%') ||
+        (segment.hasParam && RESERVED_CHARACTERS.test(segmentText))
+      ) {
+        return true;
+      }
+      segment.hasParam &&= slashIndex === -1;
+    } else {
+      segment.hasParam = true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Whether the routes match some text of a pattern (path-to-regexp syntax)
+ * with another form of the path than the routing path. find-my-way decodes
+ * the reserved characters of a segment before it matches the text that
+ * follows a parameter there (the "@" of "/:user-avatar@2x.png" matches
+ * "%40"), and it reaches a "%" of a route only as "%25" ("%2525" in such a
+ * segment). Returns `false` for a pattern path-to-regexp cannot parse.
+ */
+export function hasTextDecodedByRouter(path: string): boolean {
+  try {
+    return hasDecodedText(parse(path).tokens);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The other forms of a routing path a pattern for which
+ * `hasTextDecodedByRouter()` holds is matched in, as find-my-way may match its
+ * routes: with the reserved characters but "/" decoded, then with "%25"
+ * folded to "%" as well.
+ */
+export function getDecodedForms(path: string): [string, string] {
+  const decoded = path.replace(RESERVED_ESCAPES, decodeURIComponent);
+  return [decoded, decoded.replaceAll('%25', '%')];
+}
+
+/**
+ * The text every path a pattern (path-to-regexp syntax, as given to the
+ * case-sensitive matchers) matches starts with: "/users/" for "/users/:id",
+ * the whole path when it has no parameter. It ends before a "%", which a
+ * routing path holds as "%25" (see `getDecodedForms()`).
+ */
+export function getLiteralPrefix(path: string): string {
+  let prefix = '';
+  try {
+    for (const token of parse(path).tokens) {
+      if (token.type !== 'text') {
+        break;
+      }
+      const percentIndex = token.value.indexOf('%');
+      if (percentIndex !== -1) {
+        prefix += token.value.slice(0, percentIndex);
+        break;
+      }
+      prefix += token.value;
+    }
+  } catch {
+    // No prefix to compare: the matcher decides (and throws) on its own
+    return '';
+  }
+  return prefix;
+}
+
+/**
+ * The longest text all the given prefixes start with ("" for none).
+ */
+export function getCommonPrefix(prefixes: string[]): string {
+  if (prefixes.length === 0) {
+    return '';
+  }
+  return prefixes.reduce((common, prefix) => {
+    let length = 0;
+    while (length < common.length && common[length] === prefix[length]) {
+      length++;
+    }
+    return common.slice(0, length);
+  });
+}
+
+/**
+ * For each entry of a list of literal prefixes (`undefined` for an entry that
+ * must always be visited), the index of the first entry after it that a path
+ * not starting with its prefix may still match. The entries registered right
+ * after it whose prefix starts with its own (e.g. the other routes of the same
+ * controller) cannot match that path either, so a lookup skips them all with
+ * a single comparison.
+ */
+export function getPrefixSkips(prefixes: (string | undefined)[]): number[] {
+  const skips = new Array<number>(prefixes.length);
+  for (let i = prefixes.length - 1; i >= 0; i--) {
+    const prefix = prefixes[i];
+    let next = i + 1;
+    if (prefix !== undefined) {
+      while (next < prefixes.length) {
+        const other = prefixes[next];
+        if (other === undefined || !other.startsWith(prefix)) {
+          break;
+        }
+        next = skips[next];
+      }
+    }
+    skips[i] = next;
+  }
+  return skips;
+}
+
+/**
+ * Returns the path of an absolute-form request target
+ * ("GET http://host/path HTTP/1.1"), `null` when it is malformed, and any other
+ * target unchanged. Mirrors find-my-way, so that middleware and routes always
+ * see the same path.
+ */
+function getPathFromAbsoluteUrl(url: string): string | null {
+  const schemeEnd = url.indexOf('://');
+  if (schemeEnd === -1) {
+    return url;
+  }
+  const scheme = url.slice(0, schemeEnd).toLowerCase();
+  if (scheme !== 'http' && scheme !== 'https') {
+    return url;
+  }
+  const authorityStart = schemeEnd + 3;
+  let authorityEnd = url.length;
+  const pathStart = url.indexOf('/', authorityStart);
+  if (pathStart !== -1) {
+    authorityEnd = pathStart;
+  }
+  const queryStart = url.indexOf('?', authorityStart);
+  if (queryStart !== -1 && queryStart < authorityEnd) {
+    authorityEnd = queryStart;
+  }
+  // Fragments are not valid in a request target
+  if (
+    url.indexOf('#', authorityStart) !== -1 ||
+    authorityEnd === authorityStart
+  ) {
+    return null;
+  }
+  if (!URL.canParse(url) || new URL(url).host.length === 0) {
+    return null;
+  }
+  if (authorityEnd === url.length) {
+    return '/';
+  }
+  if (authorityEnd === queryStart) {
+    return '/' + url.slice(queryStart);
+  }
+  return url.slice(pathStart);
+}
+
+/**
+ * The path a request is routed by: the normalization find-my-way applies
+ * before looking up a route (an absolute-form target resolved to its path,
+ * percent-encoding decoded except for reserved characters such as "%2F", the
+ * query string and any fragment dropped). Middleware is matched against this
+ * path as well; matching the raw URL instead would let "/%61dmin" reach the
+ * "/admin" route while skipping the middleware guarding it.
+ *
+ * Throws a `URIError` for a malformed target or percent-encoding.
+ */
+export function getRoutingPath(url: string): string {
+  // A fragment is not valid in a request target. Cutting it off here while
+  // other code sees the raw URL would let "GET /api#/" match differently in
+  // different places, so reject it (400).
+  if (url.indexOf('#') !== -1) {
+    throw new URIError(`Invalid request target: "${url}"`);
+  }
+  if (url.charCodeAt(0) === 47 /* / */ && url.indexOf('%') === -1) {
+    // Nothing to decode
+    const index = url.indexOf('?');
+    return index === -1 ? url : url.slice(0, index);
+  }
+  let path: string | null = url;
+  if (url.charCodeAt(0) !== 47) {
+    path = getPathFromAbsoluteUrl(url);
+    if (path === null) {
+      throw new URIError(`Invalid request target: "${url}"`);
+    }
+  }
+  return urlSanitizer.safeDecodeURI(path, false).path;
+}
+
+/**
+ * Returns the index in the raw request URL where `routingPrefix`, a prefix of
+ * its routing path (see `getRoutingPath()`), ends. Decoding never turns
+ * "%2F" into "/", so the raw URL has the same "/"-separated segments.
+ */
+export function getRawPrefixEnd(url: string, routingPrefix: string): number {
+  let start = 0;
+  if (url.charCodeAt(0) !== 47 /* / */) {
+    // Absolute-form target: skip "scheme://authority", which ends at the
+    // path or at the query (as in getPathFromAbsoluteUrl())
+    const schemeEnd = url.indexOf('://');
+    const pathStart = schemeEnd === -1 ? -1 : url.indexOf('/', schemeEnd + 3);
+    const queryStart = schemeEnd === -1 ? -1 : url.indexOf('?', schemeEnd + 3);
+    start = pathStart === -1 ? url.length : pathStart;
+    if (queryStart !== -1 && queryStart < start) {
+      start = queryStart;
+    }
+  }
+  let slashes = 0;
+  for (let i = 0; i < routingPrefix.length; i++) {
+    if (routingPrefix.charCodeAt(i) === 47) {
+      slashes++;
+    }
+  }
+  let i = start;
+  for (; i < url.length; i++) {
+    const char = url.charCodeAt(i);
+    if (char === 63 /* ? */ || char === 35 /* # */) {
+      break;
+    }
+    if (char === 47 && slashes-- === 0) {
+      break;
+    }
+  }
+  return i;
+}

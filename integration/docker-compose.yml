@@ -17,14 +17,17 @@ services:
     restart: always
   mqtt:
     container_name: test-mqtt
-    image: toke/mosquitto
+    image: eclipse-mosquitto
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf
     ports:
       - "1883:1883"
       - "9001:9001"
     restart: always
   mysql:
-    image: mysql:5.7.33
+    image: mysql:26.10.0
     environment:
+      MYSQL_ROOT_HOST: '%'
       MYSQL_ROOT_PASSWORD: root
       MYSQL_DATABASE: test
     ports:
@@ -48,7 +51,7 @@ services:
   zookeeper:
     container_name: test-zookeeper
     hostname: zookeeper
-    image: confluentinc/cp-zookeeper:5.5.3
+    image: confluentinc/cp-zookeeper:7.9.11
     ports:
       - "2181:2181"
     environment:
@@ -57,7 +60,7 @@ services:
   kafka:
     container_name: test-kafka
     hostname: kafka
-    image: confluentinc/cp-kafka:5.5.3
+    image: confluentinc/cp-kafka:8.4.1
     depends_on:
       - zookeeper
     ports:

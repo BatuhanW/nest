@@ -1,30 +1,72 @@
-import { Provider, Scope, Type } from '@nestjs/common';
-import {
-  ClassProvider,
+import type {
   FactoryProvider,
+  InjectionToken,
   ValueProvider,
-} from '@nestjs/common/interfaces';
-import { randomStringGenerator } from '@nestjs/common/utils/random-string-generator.util';
-import { isNil, isUndefined } from '@nestjs/common/utils/shared.utils';
+} from '@nestjs/common';
+import {
+  Logger,
+  type LoggerService,
+  type Provider,
+  Scope,
+  type Type,
+} from '@nestjs/common';
+import {
+  type EnhancerSubtype,
+  clc,
+  isNil,
+  isString,
+  isUndefined,
+  randomStringGenerator,
+} from '@nestjs/common/internal';
 import { iterate } from 'iterare';
-import { STATIC_CONTEXT } from './constants';
-import { Module } from './module';
+import { registerClassRef } from '../helpers/class-ref-registry.js';
+import { getClassScope } from '../helpers/get-class-scope.js';
+import { isDurable } from '../helpers/is-durable.js';
+import { UuidFactory } from '../inspector/uuid-factory.js';
+import { STATIC_CONTEXT } from './constants.js';
+import { isDebugMode } from './helpers/is-debug-mode.util.js';
+import {
+  isClassProvider,
+  isFactoryProvider,
+} from './helpers/provider-classifier.js';
+import { Module } from './module.js';
+import { SettlementSignal } from './settlement-signal.js';
 
 export const INSTANCE_METADATA_SYMBOL = Symbol.for('instance_metadata:cache');
 export const INSTANCE_ID_SYMBOL = Symbol.for('instance_metadata:id');
 
+export interface HostComponentInfo {
+  /**
+   * Injection token (or class reference)
+   */
+  token: InjectionToken;
+  /**
+   * Flag that indicates whether DI subtree is durable
+   */
+  isTreeDurable: boolean;
+}
+
 export interface ContextId {
   readonly id: number;
+  payload?: unknown;
+  getParent?(info: HostComponentInfo): ContextId;
 }
 
 export interface InstancePerContext<T> {
   instance: T;
   isResolved?: boolean;
   isPending?: boolean;
-  donePromise?: Promise<void>;
+  donePromise?: Promise<unknown>;
+  /**
+   * The signal of the load for this context. The wrapper's `settlementSignal`
+   * is the one of its latest load, which may belong to a concurrent request.
+   */
+  settlementSignal?: SettlementSignal;
+  isConstructorCalled?: boolean;
 }
+
 export interface PropertyMetadata {
-  key: string;
+  key: symbol | string;
   wrapper: InstanceWrapper;
 }
 
@@ -34,30 +76,68 @@ interface InstanceMetadataStore {
   enhancers?: InstanceWrapper[];
 }
 
+const dependencyTreeParents = new WeakMap<
+  InstanceWrapper,
+  Set<InstanceWrapper>
+>();
+
 export class InstanceWrapper<T = any> {
   public readonly name: any;
+  public readonly token: InjectionToken;
   public readonly async?: boolean;
   public readonly host?: Module;
-  public readonly isAlias: boolean = false;
-
+  public isAlias: boolean = false;
+  public readonly subtype?: EnhancerSubtype;
   public scope?: Scope = Scope.DEFAULT;
-  public metatype: Type<T> | Function;
-  public inject?: (string | symbol | Function | Type<any>)[];
+  public metatype: Type<T> | Function | null;
+  public inject?: FactoryProvider['inject'] | null;
   public forwardRef?: boolean;
+  public durable?: boolean;
+  public initTime?: number;
+  public settlementSignal?: SettlementSignal;
+
+  private static logger: LoggerService = new Logger(InstanceWrapper.name);
 
   private readonly values = new WeakMap<ContextId, InstancePerContext<T>>();
   private readonly [INSTANCE_METADATA_SYMBOL]: InstanceMetadataStore = {};
   private readonly [INSTANCE_ID_SYMBOL]: string;
   private transientMap?:
-    | Map<string, WeakMap<ContextId, InstancePerContext<T>>>
-    | undefined;
+    Map<string, WeakMap<ContextId, InstancePerContext<T>>> | undefined;
   private isTreeStatic: boolean | undefined;
+  private isTreeDurable: boolean | undefined;
+  /**
+   * Whether either flag was computed since the last reset. Unlike the flags,
+   * it is not cleared by `invalidateDependencyTreeParents`, so a wrapper whose
+   * flag was only invalidated still passes a reset on to its parents.
+   */
+  private isTreeIntrospected = false;
+  private _isDetached = false;
+  private _hierarchyLevel = 0;
+
+  get hierarchyLevel(): number {
+    return this._hierarchyLevel;
+  }
+
+  set hierarchyLevel(level: number) {
+    this._hierarchyLevel = level;
+  }
+
+  /**
+   * The root inquirer reference. Present only if child instance wrapper
+   * is transient and has a parent inquirer.
+   */
+  private rootInquirer: InstanceWrapper | undefined;
 
   constructor(
-    metadata: Partial<InstanceWrapper<T>> & Partial<InstancePerContext<T>> = {},
+    metadata: Partial<InstanceWrapper<T>> &
+      Partial<InstancePerContext<T>> & { [INSTANCE_ID_SYMBOL]?: string } = {},
   ) {
-    this[INSTANCE_ID_SYMBOL] = randomStringGenerator();
     this.initialize(metadata);
+    if (this.isNewable()) {
+      registerClassRef(this.metatype!);
+    }
+    this[INSTANCE_ID_SYMBOL] =
+      metadata[INSTANCE_ID_SYMBOL] ?? this.generateUuid();
   }
 
   get id(): string {
@@ -74,8 +154,11 @@ export class InstanceWrapper<T = any> {
   }
 
   get isNotMetatype(): boolean {
-    const isFactory = this.metatype && !isNil(this.inject);
-    return !this.metatype || isFactory;
+    return !this.metatype || this.isFactory;
+  }
+
+  get isFactory(): boolean {
+    return !!this.metatype && !isNil(this.inject);
   }
 
   get isTransient(): boolean {
@@ -92,17 +175,23 @@ export class InstanceWrapper<T = any> {
     const instancePerContext = this.values.get(contextId);
     return instancePerContext
       ? instancePerContext
-      : this.cloneStaticInstance(contextId);
+      : contextId !== STATIC_CONTEXT
+        ? this.cloneStaticInstance(contextId)
+        : {
+            instance: null as T,
+            isResolved: true,
+            isPending: false,
+          };
   }
 
   public getInstanceByInquirerId(
     contextId: ContextId,
     inquirerId: string,
   ): InstancePerContext<T> {
-    let collectionPerContext = this.transientMap.get(inquirerId);
+    let collectionPerContext = this.transientMap!.get(inquirerId);
     if (!collectionPerContext) {
       collectionPerContext = new WeakMap();
-      this.transientMap.set(inquirerId, collectionPerContext);
+      this.transientMap!.set(inquirerId, collectionPerContext);
     }
     const instancePerContext = collectionPerContext.get(contextId);
     return instancePerContext
@@ -126,37 +215,78 @@ export class InstanceWrapper<T = any> {
     inquirerId: string,
     value: InstancePerContext<T>,
   ) {
-    let collection = this.transientMap.get(inquirerId);
+    let collection = this.transientMap!.get(inquirerId);
     if (!collection) {
       collection = new WeakMap();
-      this.transientMap.set(inquirerId, collection);
+      this.transientMap!.set(inquirerId, collection);
     }
     collection.set(contextId, value);
+  }
+
+  public removeInstanceByContextId(contextId: ContextId, inquirerId?: string) {
+    if (this.scope === Scope.TRANSIENT && inquirerId) {
+      return this.removeInstanceByInquirerId(contextId, inquirerId);
+    }
+    this.values.delete(contextId);
+  }
+
+  public removeInstanceByInquirerId(contextId: ContextId, inquirerId: string) {
+    const collection = this.transientMap!.get(inquirerId);
+    if (!collection) {
+      return;
+    }
+    collection.delete(contextId);
+  }
+
+  /**
+   * Returns the instances that exist for the given context, including those
+   * of every inquirer of a transient provider. Unlike `getInstanceByContextId`,
+   * it does not create one.
+   */
+  public getExistingInstancesByContextId(
+    contextId: ContextId,
+  ): InstancePerContext<T>[] {
+    const collections = [this.values, ...(this.transientMap?.values() ?? [])];
+    return collections
+      .map(collection => collection.get(contextId))
+      .filter(instancePerContext => !isUndefined(instancePerContext));
   }
 
   public addCtorMetadata(index: number, wrapper: InstanceWrapper) {
     if (!this[INSTANCE_METADATA_SYMBOL].dependencies) {
       this[INSTANCE_METADATA_SYMBOL].dependencies = [];
     }
+    if (this[INSTANCE_METADATA_SYMBOL].dependencies[index] === wrapper) {
+      return;
+    }
     this[INSTANCE_METADATA_SYMBOL].dependencies[index] = wrapper;
+    this.registerDependencyTreeParent(wrapper);
+    this.resetDependencyTreeState();
   }
 
   public getCtorMetadata(): InstanceWrapper[] {
-    return this[INSTANCE_METADATA_SYMBOL].dependencies;
+    return this[INSTANCE_METADATA_SYMBOL].dependencies!;
   }
 
-  public addPropertiesMetadata(key: string, wrapper: InstanceWrapper) {
+  public addPropertiesMetadata(key: symbol | string, wrapper: InstanceWrapper) {
     if (!this[INSTANCE_METADATA_SYMBOL].properties) {
       this[INSTANCE_METADATA_SYMBOL].properties = [];
     }
-    this[INSTANCE_METADATA_SYMBOL].properties.push({
-      key,
-      wrapper,
-    });
+    // A property that is never registered (e.g., the inquirer) keeps every
+    // resolution on the slow path, which registers the others again.
+    const properties = this[INSTANCE_METADATA_SYMBOL].properties;
+    const index = properties.findIndex(item => item.key === key);
+    if (index === -1) {
+      properties.push({ key, wrapper });
+    } else {
+      properties[index] = { key, wrapper };
+    }
+    this.registerDependencyTreeParent(wrapper);
+    this.resetDependencyTreeState();
   }
 
   public getPropertiesMetadata(): PropertyMetadata[] {
-    return this[INSTANCE_METADATA_SYMBOL].properties;
+    return this[INSTANCE_METADATA_SYMBOL].properties!;
   }
 
   public addEnhancerMetadata(wrapper: InstanceWrapper) {
@@ -164,45 +294,104 @@ export class InstanceWrapper<T = any> {
       this[INSTANCE_METADATA_SYMBOL].enhancers = [];
     }
     this[INSTANCE_METADATA_SYMBOL].enhancers.push(wrapper);
+    this.registerDependencyTreeParent(wrapper);
+    this.resetDependencyTreeState();
   }
 
   public getEnhancersMetadata(): InstanceWrapper[] {
-    return this[INSTANCE_METADATA_SYMBOL].enhancers;
+    return this[INSTANCE_METADATA_SYMBOL].enhancers!;
+  }
+
+  public isDependencyTreeDurable(lookupRegistry: string[] = []): boolean {
+    if (!isUndefined(this.isTreeDurable)) {
+      return this.isTreeDurable;
+    }
+    this.isTreeIntrospected = true;
+    if (this.scope === Scope.REQUEST) {
+      this.isTreeDurable = this.durable === undefined ? false : this.durable;
+      if (this.isTreeDurable) {
+        this.printIntrospectedAsDurable();
+      }
+      return this.isTreeDurable;
+    }
+    const isStatic = this.isDependencyTreeStatic();
+    if (isStatic) {
+      return false;
+    }
+
+    const isTreeNonDurable = this.introspectDepsAttribute(
+      (collection, registry) =>
+        collection.some(
+          (item: InstanceWrapper) =>
+            !item.isDependencyTreeStatic() &&
+            !item.isDependencyTreeDurable(registry),
+        ),
+      lookupRegistry,
+    );
+    this.isTreeDurable = !isTreeNonDurable;
+    if (this.isTreeDurable) {
+      this.printIntrospectedAsDurable();
+    } else {
+      this.invalidateDependencyTreeParents('isTreeDurable');
+    }
+    return this.isTreeDurable;
+  }
+
+  public introspectDepsAttribute(
+    callback: (
+      collection: InstanceWrapper[],
+      lookupRegistry: string[],
+    ) => boolean,
+    lookupRegistry: string[] = [],
+  ): boolean {
+    if (lookupRegistry.includes(this[INSTANCE_ID_SYMBOL])) {
+      return false;
+    }
+    lookupRegistry = lookupRegistry.concat(this[INSTANCE_ID_SYMBOL]);
+
+    const { dependencies, properties, enhancers } =
+      this[INSTANCE_METADATA_SYMBOL];
+
+    let introspectionResult = dependencies
+      ? callback(dependencies, lookupRegistry)
+      : false;
+
+    if (introspectionResult || !(properties || enhancers)) {
+      return introspectionResult;
+    }
+    introspectionResult = properties
+      ? callback(
+          properties.map(item => item.wrapper),
+          lookupRegistry,
+        )
+      : false;
+    if (introspectionResult || !enhancers) {
+      return introspectionResult;
+    }
+    return enhancers ? callback(enhancers, lookupRegistry) : false;
   }
 
   public isDependencyTreeStatic(lookupRegistry: string[] = []): boolean {
     if (!isUndefined(this.isTreeStatic)) {
       return this.isTreeStatic;
     }
+    this.isTreeIntrospected = true;
     if (this.scope === Scope.REQUEST) {
       this.isTreeStatic = false;
+      this.printIntrospectedAsRequestScoped();
       return this.isTreeStatic;
     }
-    if (lookupRegistry.includes(this[INSTANCE_ID_SYMBOL])) {
-      return true;
+    this.isTreeStatic = !this.introspectDepsAttribute(
+      (collection, registry) =>
+        collection.some(
+          (item: InstanceWrapper) => !item.isDependencyTreeStatic(registry),
+        ),
+      lookupRegistry,
+    );
+    if (!this.isTreeStatic) {
+      this.printIntrospectedAsRequestScoped();
+      this.invalidateDependencyTreeParents('isTreeStatic');
     }
-    lookupRegistry = lookupRegistry.concat(this[INSTANCE_ID_SYMBOL]);
-
-    const { dependencies, properties, enhancers } = this[
-      INSTANCE_METADATA_SYMBOL
-    ];
-    let isStatic =
-      (dependencies &&
-        this.isWrapperListStatic(dependencies, lookupRegistry)) ||
-      !dependencies;
-
-    if (!isStatic || !(properties || enhancers)) {
-      this.isTreeStatic = isStatic;
-      return this.isTreeStatic;
-    }
-    const propertiesHosts = (properties || []).map(item => item.wrapper);
-    isStatic =
-      isStatic && this.isWrapperListStatic(propertiesHosts, lookupRegistry);
-    if (!isStatic || !enhancers) {
-      this.isTreeStatic = isStatic;
-      return this.isTreeStatic;
-    }
-    this.isTreeStatic = this.isWrapperListStatic(enhancers, lookupRegistry);
     return this.isTreeStatic;
   }
 
@@ -213,12 +402,12 @@ export class InstanceWrapper<T = any> {
     }
     const instancePerContext: InstancePerContext<T> = {
       ...staticInstance,
-      instance: undefined,
+      instance: undefined!,
       isResolved: false,
       isPending: false,
     };
     if (this.isNewable()) {
-      instancePerContext.instance = Object.create(this.metatype.prototype);
+      instancePerContext.instance = Object.create(this.metatype!.prototype);
     }
     this.setInstanceByContextId(contextId, instancePerContext);
     return instancePerContext;
@@ -231,12 +420,12 @@ export class InstanceWrapper<T = any> {
     const staticInstance = this.getInstanceByContextId(STATIC_CONTEXT);
     const instancePerContext: InstancePerContext<T> = {
       ...staticInstance,
-      instance: undefined,
+      instance: undefined!,
       isResolved: false,
       isPending: false,
     };
     if (this.isNewable()) {
-      instancePerContext.instance = Object.create(this.metatype.prototype);
+      instancePerContext.instance = Object.create(this.metatype!.prototype);
     }
     this.setInstanceByInquirerId(contextId, inquirerId, instancePerContext);
     return instancePerContext;
@@ -247,12 +436,12 @@ export class InstanceWrapper<T = any> {
     if (!this.isNewable() || host.isResolved) {
       return;
     }
-    return Object.create(this.metatype.prototype);
+    return Object.create(this.metatype!.prototype);
   }
 
   public isInRequestScope(
     contextId: ContextId,
-    inquirer?: InstanceWrapper | undefined,
+    inquirer?: InstanceWrapper,
   ): boolean {
     const isDependencyTreeStatic = this.isDependencyTreeStatic();
 
@@ -267,8 +456,9 @@ export class InstanceWrapper<T = any> {
     contextId: ContextId,
     inquirer: InstanceWrapper | undefined,
   ): boolean {
-    const isInquirerRequestScoped =
-      inquirer && !inquirer.isDependencyTreeStatic();
+    const isInquirerRequestScoped = !!(
+      inquirer && !inquirer.isDependencyTreeStatic()
+    );
 
     return (
       this.isDependencyTreeStatic() &&
@@ -286,24 +476,107 @@ export class InstanceWrapper<T = any> {
     return (
       this.isDependencyTreeStatic() &&
       contextId !== STATIC_CONTEXT &&
-      (isSelfRequested || (inquirer && inquirer.scope === Scope.TRANSIENT))
+      (isSelfRequested || !!(inquirer && inquirer.scope === Scope.TRANSIENT))
     );
   }
 
   public isStatic(
     contextId: ContextId,
     inquirer: InstanceWrapper | undefined,
+    rootInquirer?: InstanceWrapper,
   ): boolean {
+    if (!this.isDependencyTreeStatic() || contextId !== STATIC_CONTEXT) {
+      return false;
+    }
+
+    // Non-transient provider in static context
+    if (!this.isTransient) {
+      return true;
+    }
+
     const isInquirerRequestScoped =
       inquirer && !inquirer.isDependencyTreeStatic();
     const isStaticTransient = this.isTransient && !isInquirerRequestScoped;
 
-    return (
-      this.isDependencyTreeStatic() &&
-      contextId === STATIC_CONTEXT &&
-      (!this.isTransient ||
-        (isStaticTransient && !!inquirer && !inquirer.isTransient))
-    );
+    // Transient provider inquired by non-transient (e.g., DEFAULT -> TRANSIENT)
+    if (isStaticTransient && inquirer && !inquirer.isTransient) {
+      return true;
+    }
+
+    // Nested transient with non-transient root (e.g., DEFAULT -> TRANSIENT -> TRANSIENT)
+    if (isStaticTransient && rootInquirer && !rootInquirer.isTransient) {
+      return true;
+    }
+
+    // Nested transient during initial instantiation (rootInquirer not yet set)
+    if (isStaticTransient && inquirer?.isTransient && !rootInquirer) {
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Whether `detachFromDependencies` was called, i.e., the wrapper is no
+   * longer in use (e.g., its module was removed from the container, or it
+   * served a single `ModuleRef#create()` call).
+   */
+  get isDetached(): boolean {
+    return this._isDetached;
+  }
+
+  /**
+   * Makes the dependencies of this wrapper (constructor, property and
+   * enhancer ones) forget it: that it depends on them, and the transient
+   * instances they hold for it. The wrapper stays detached, so that a load of
+   * it that is still running does not register it as a dependent again.
+   */
+  public detachFromDependencies() {
+    this._isDetached = true;
+    this.getDependencyWrappers().forEach(dependency => {
+      dependencyTreeParents.get(dependency)?.delete(this);
+      dependency.removeTransientInstancesOf(this);
+    });
+  }
+
+  /**
+   * Returns the wrappers that depend on this one, directly or through other
+   * wrappers (as a constructor, property or enhancer dependency).
+   */
+  public getDependents(): Set<InstanceWrapper> {
+    const dependents = new Set<InstanceWrapper>();
+    const wrappers: InstanceWrapper[] = [this];
+    while (wrappers.length > 0) {
+      dependencyTreeParents.get(wrappers.pop()!)?.forEach(parent => {
+        if (!dependents.has(parent)) {
+          dependents.add(parent);
+          wrappers.push(parent);
+        }
+      });
+    }
+    return dependents;
+  }
+
+  /**
+   * @deprecated The injector no longer reads the root inquirer from the
+   * wrapper (see `isStatic`), as it may be overwritten by a concurrent
+   * resolution for another consumer.
+   */
+  public attachRootInquirer(inquirer: InstanceWrapper) {
+    if (!this.isTransient) {
+      // Only attach root inquirer if the instance wrapper is transient
+      return;
+    }
+    this.rootInquirer = inquirer.getRootInquirer() ?? inquirer;
+  }
+
+  /**
+   * @deprecated The injector no longer reads the root inquirer from the
+   * wrapper (see `isStatic`), as it may be overwritten by a concurrent
+   * resolution for another consumer.
+   */
+  getRootInquirer(): InstanceWrapper | undefined {
+    return this.rootInquirer;
   }
 
   public getStaticTransientInstances() {
@@ -313,14 +586,19 @@ export class InstanceWrapper<T = any> {
     const instances = [...this.transientMap.values()];
     return iterate(instances)
       .map(item => item.get(STATIC_CONTEXT))
-      .filter(item => !!item)
+      .filter(item => {
+        // Only return items where constructor has been actually called
+        // This prevents calling lifecycle hooks on non-instantiated transient services
+        return !!(item && item.isConstructorCalled);
+      })
       .toArray();
   }
 
   public mergeWith(provider: Provider) {
-    if ((provider as ValueProvider).useValue) {
+    if (Object.hasOwn(provider, 'useValue')) {
       this.metatype = null;
       this.inject = null;
+
       this.scope = Scope.DEFAULT;
 
       this.setInstanceByContextId(STATIC_CONTEXT, {
@@ -328,26 +606,110 @@ export class InstanceWrapper<T = any> {
         isResolved: true,
         isPending: false,
       });
-    } else if ((provider as ClassProvider).useClass) {
+    } else if (isClassProvider(provider)) {
       this.inject = null;
-      this.metatype = (provider as ClassProvider).useClass;
-    } else if ((provider as FactoryProvider).useFactory) {
-      this.metatype = (provider as FactoryProvider).useFactory;
-      this.inject = (provider as FactoryProvider).inject || [];
+      this.metatype = provider.useClass;
+      registerClassRef(provider.useClass);
+      this.scope = getClassScope(provider.useClass) ?? Scope.DEFAULT;
+      this.durable = isDurable(provider.useClass);
+      if (this.scope === Scope.TRANSIENT && !this.transientMap) {
+        this.transientMap = new Map();
+      }
+      this.resetStaticInstance();
+    } else if (isFactoryProvider(provider)) {
+      this.metatype = provider.useFactory;
+      this.inject = provider.inject || [];
+      this.resetStaticInstance();
     }
+    this.isAlias = false;
+    this.resetDependencyTreeState();
+  }
+
+  private resetStaticInstance() {
+    this.setInstanceByContextId(STATIC_CONTEXT, {
+      instance: null as T,
+      isResolved: false,
+      isPending: false,
+    });
   }
 
   private isNewable(): boolean {
     return isNil(this.inject) && this.metatype && this.metatype.prototype;
   }
 
-  private isWrapperListStatic(
-    tree: InstanceWrapper[],
-    lookupRegistry: string[],
-  ): boolean {
-    return tree.every((item: InstanceWrapper) =>
-      item.isDependencyTreeStatic(lookupRegistry),
+  private registerDependencyTreeParent(wrapper: InstanceWrapper) {
+    if (this._isDetached) {
+      return;
+    }
+    if (wrapper instanceof InstanceWrapper) {
+      const parents = dependencyTreeParents.get(wrapper) ?? new Set();
+      parents.add(this);
+      dependencyTreeParents.set(wrapper, parents);
+    }
+  }
+
+  private getDependencyWrappers(): InstanceWrapper[] {
+    const {
+      dependencies = [],
+      properties = [],
+      enhancers = [],
+    } = this[INSTANCE_METADATA_SYMBOL];
+    return [
+      ...dependencies,
+      ...properties.map(({ wrapper }) => wrapper),
+      ...enhancers,
+    ].filter(dependency => dependency instanceof InstanceWrapper);
+  }
+
+  private removeTransientInstancesOf(inquirer: InstanceWrapper) {
+    if (!this.transientMap) {
+      return;
+    }
+    // Nested transient instances are keyed `<inquirer id>:<transient id>`
+    for (const inquirerId of this.transientMap.keys()) {
+      if (
+        inquirerId === inquirer.id ||
+        inquirerId.startsWith(`${inquirer.id}:`)
+      ) {
+        this.transientMap.delete(inquirerId);
+      }
+    }
+    this.getDependencyWrappers().forEach(dependency =>
+      dependency.removeTransientInstancesOf(inquirer),
     );
+  }
+
+  private resetDependencyTreeState(lookupRegistry = new Set<string>()) {
+    if (lookupRegistry.has(this[INSTANCE_ID_SYMBOL])) {
+      return;
+    }
+    if (!this.isTreeIntrospected) {
+      return;
+    }
+    lookupRegistry.add(this[INSTANCE_ID_SYMBOL]);
+    this.isTreeIntrospected = false;
+    this.isTreeStatic = undefined;
+    this.isTreeDurable = undefined;
+    dependencyTreeParents
+      .get(this)
+      ?.forEach(parent => parent.resetDependencyTreeState(lookupRegistry));
+  }
+
+  /**
+   * In a circular dependency, the introspection skips a wrapper that is
+   * already being introspected, so the parents in between may cache `true`
+   * before that wrapper turns out not to be static (or durable). Clears what
+   * they cached, so it is computed again with the final answer.
+   */
+  private invalidateDependencyTreeParents(
+    attribute: 'isTreeStatic' | 'isTreeDurable',
+  ) {
+    dependencyTreeParents.get(this)?.forEach(parent => {
+      if (parent[attribute]) {
+        parent[attribute] = undefined;
+        parent.invalidateDependencyTreeParents(attribute);
+      }
+    });
   }
 
   private initialize(
@@ -357,9 +719,42 @@ export class InstanceWrapper<T = any> {
     Object.assign(this, wrapperPartial);
 
     this.setInstanceByContextId(STATIC_CONTEXT, {
-      instance,
+      instance: instance as T,
       isResolved,
     });
     this.scope === Scope.TRANSIENT && (this.transientMap = new Map());
+  }
+
+  private printIntrospectedAsRequestScoped() {
+    if (!isDebugMode() || this.name === 'REQUEST') {
+      return;
+    }
+    if (isString(this.name)) {
+      InstanceWrapper.logger.log(
+        `${clc.cyanBright(this.name)}${clc.green(
+          ' introspected as ',
+        )}${clc.magentaBright('request-scoped')}`,
+      );
+    }
+  }
+
+  private printIntrospectedAsDurable() {
+    if (!isDebugMode()) {
+      return;
+    }
+    if (isString(this.name)) {
+      InstanceWrapper.logger.log(
+        `${clc.cyanBright(this.name)}${clc.green(
+          ' introspected as ',
+        )}${clc.magentaBright('durable')}`,
+      );
+    }
+  }
+
+  private generateUuid(): string {
+    let key = this.name?.toString() ?? this.token?.toString();
+    key += this.host?.name ?? '';
+
+    return key ? UuidFactory.get(key) : randomStringGenerator();
   }
 }

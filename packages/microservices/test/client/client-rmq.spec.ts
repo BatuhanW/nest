@@ -1,55 +1,91 @@
-import { expect } from 'chai';
 import { EventEmitter } from 'events';
-import { empty } from 'rxjs';
-import * as sinon from 'sinon';
-import { ClientRMQ } from '../../client/client-rmq';
+import { EMPTY, firstValueFrom } from 'rxjs';
+import { ClientRMQ } from '../../client/client-rmq.js';
+import { RMQ_DEFAULT_MAX_MESSAGE_SIZE } from '../../constants.js';
+import { MaxPacketLengthExceededException } from '../../errors/max-packet-length-exceeded.exception.js';
+import { MaxRmqShortStringLengthExceededException } from '../../errors/max-rmq-short-string-length-exceeded.exception.js';
+import { ReadPacket, WritePacket } from '../../interfaces/index.js';
+import { RmqRecord } from '../../record-builders/index.js';
+
+// amqplib settles a channel close on the broker's reply, which never arrives
+// once the connection is closed.
+const closeChannelOnlyWhileConnected = (
+  closeChannel: ReturnType<typeof vi.fn>,
+  closeConnection: ReturnType<typeof vi.fn>,
+) => {
+  let connectionClosed = false;
+  closeChannel.mockImplementation(
+    () =>
+      new Promise<void>(resolve =>
+        setImmediate(() => !connectionClosed && resolve()),
+      ),
+  );
+  closeConnection.mockImplementation(async () => {
+    connectionClosed = true;
+  });
+};
+
+const settledWithin = (promise: Promise<unknown>, ms = 50) =>
+  Promise.race([
+    promise.then(
+      () => 'resolved',
+      () => 'rejected',
+    ),
+    new Promise(resolve => setTimeout(() => resolve('pending'), ms)),
+  ]);
 
 describe('ClientRMQ', function () {
-  this.retries(10);
-
   let client: ClientRMQ;
+  let untypedClient: any;
 
   describe('connect', () => {
-    let createClientStub: sinon.SinonStub;
-    let handleErrorsSpy: sinon.SinonSpy;
-    let connect$Stub: sinon.SinonStub;
-    let mergeDisconnectEvent: sinon.SinonStub;
+    let createClientStub: ReturnType<typeof vi.fn>;
+    let registerErrorListenerSpy: ReturnType<typeof vi.fn>;
+    let connect$Stub: ReturnType<typeof vi.fn>;
 
     beforeEach(async () => {
       client = new ClientRMQ({});
-      createClientStub = sinon.stub(client, 'createClient').callsFake(() => ({
-        addListener: () => ({}),
-        removeListener: () => ({}),
-      }));
-      handleErrorsSpy = sinon.spy(client, 'handleError');
-      connect$Stub = sinon.stub(client, 'connect$' as any).callsFake(() => ({
-        subscribe: resolve => resolve(),
-        toPromise() {
-          return this;
-        },
-        pipe() {
-          return this;
-        },
-      }));
-      mergeDisconnectEvent = sinon
-        .stub(client, 'mergeDisconnectEvent')
-        .callsFake((_, source) => source);
+      untypedClient = client as any;
+
+      createClientStub = vi
+        .spyOn(client, 'createClient')
+        .mockImplementation(() => ({
+          addListener: () => ({}),
+          removeListener: () => ({}),
+        }));
+      registerErrorListenerSpy = vi.spyOn(client, 'registerErrorListener');
+      connect$Stub = vi
+        .spyOn(client, 'connect$' as any)
+        .mockImplementation(() => ({
+          subscribe: resolve => resolve(),
+          toPromise() {
+            return this;
+          },
+          pipe() {
+            return this;
+          },
+        }));
+      vi.spyOn(client, 'mergeDisconnectEvent').mockImplementation(
+        (_, source) => source,
+      );
     });
     describe('when is not connected', () => {
       beforeEach(async () => {
         try {
           client['client'] = null;
           await client.connect();
-        } catch {}
+        } catch {
+          // Ignore
+        }
       });
-      it('should call "handleError" once', async () => {
-        expect(handleErrorsSpy.called).to.be.true;
+      it('should call "registerErrorListener" once', async () => {
+        expect(registerErrorListenerSpy).toHaveBeenCalled();
       });
       it('should call "createClient" once', async () => {
-        expect(createClientStub.called).to.be.true;
+        expect(createClientStub).toHaveBeenCalled();
       });
       it('should call "connect$" once', async () => {
-        expect(connect$Stub.called).to.be.true;
+        expect(connect$Stub).toHaveBeenCalled();
       });
     });
     describe('when is connected', () => {
@@ -58,106 +94,677 @@ describe('ClientRMQ', function () {
         client['channel'] = { test: true };
       });
       it('should not call "createClient"', () => {
-        expect(createClientStub.called).to.be.false;
+        expect(createClientStub).not.toHaveBeenCalled();
       });
-      it('should not call "handleError"', () => {
-        expect(handleErrorsSpy.called).to.be.false;
+      it('should not call "registerErrorListener"', () => {
+        expect(registerErrorListenerSpy).not.toHaveBeenCalled();
       });
       it('should not call "connect$"', () => {
-        expect(connect$Stub.called).to.be.false;
+        expect(connect$Stub).not.toHaveBeenCalled();
       });
+    });
+    describe('when the connection attempt fails', () => {
+      let close: ReturnType<typeof vi.fn>;
+
+      beforeEach(() => {
+        close = vi.fn().mockResolvedValue(undefined);
+        createClientStub.mockImplementation(() => ({
+          addListener: () => ({}),
+          removeListener: () => ({}),
+          close,
+        }));
+      });
+
+      it('should discard the partial connection when an attempt fails', async () => {
+        const error = new Error('broker unavailable');
+        vi.spyOn(client, 'convertConnectionToPromise').mockRejectedValueOnce(
+          error,
+        );
+
+        await expect(client.connect()).rejects.toThrow(error);
+
+        expect(untypedClient.connectionPromise).toBeNull();
+        expect(untypedClient.client).toBeNull();
+        expect(untypedClient.channel).toBeNull();
+        // The manager the failed attempt created is closed, not left retrying.
+        expect(close).toHaveBeenCalledOnce();
+      });
+
+      it('should try again on the next call instead of caching a failed attempt', async () => {
+        const error = new Error('broker unavailable');
+        vi.spyOn(client, 'convertConnectionToPromise')
+          .mockRejectedValueOnce(error)
+          .mockResolvedValueOnce(undefined);
+
+        await expect(client.connect()).rejects.toThrow(error);
+        await client.connect();
+
+        expect(createClientStub).toHaveBeenCalledTimes(2);
+      });
+
+      it('should not discard a newer connection when a stale attempt fails', async () => {
+        let rejectFirstAttempt!: (err: Error) => void;
+        const firstClose = vi.fn().mockResolvedValue(undefined);
+        const secondClose = vi.fn().mockResolvedValue(undefined);
+        createClientStub
+          .mockImplementationOnce(() => ({
+            addListener: () => ({}),
+            removeListener: () => ({}),
+            close: firstClose,
+          }))
+          .mockImplementationOnce(() => ({
+            addListener: () => ({}),
+            removeListener: () => ({}),
+            close: secondClose,
+          }));
+        vi.spyOn(client, 'convertConnectionToPromise')
+          .mockReturnValueOnce(
+            new Promise<void>((_, reject) => (rejectFirstAttempt = reject)),
+          )
+          .mockResolvedValueOnce(undefined);
+
+        const firstAttempt = client.connect();
+        await client.close();
+        firstClose.mockClear();
+        const secondAttempt = client.connect();
+        const secondClient = untypedClient.client;
+
+        rejectFirstAttempt(new Error('broker unavailable'));
+        await expect(firstAttempt).rejects.toThrow('broker unavailable');
+        await secondAttempt;
+
+        expect(untypedClient.client).toBe(secondClient);
+        expect(untypedClient.connectionPromise).not.toBeNull();
+        expect(secondClose).not.toHaveBeenCalled();
+        // The stale attempt still closes the manager it created.
+        expect(firstClose).toHaveBeenCalledOnce();
+      });
+
+      it('should stop the attempt when close() runs while connecting', async () => {
+        let resolveAttempt!: () => void;
+        vi.spyOn(client, 'convertConnectionToPromise').mockImplementation(
+          () => new Promise<void>(resolve => (resolveAttempt = resolve)),
+        );
+
+        const connecting = client.connect();
+        await client.close();
+        close.mockClear();
+        resolveAttempt();
+
+        await expect(connecting).rejects.toThrow('Connection closed');
+        expect(untypedClient.client).toBeNull();
+        expect(untypedClient.connectionPromise).toBeNull();
+        expect(untypedClient.channel).toBeNull();
+        // The stopped attempt still closes the manager it created.
+        expect(close).toHaveBeenCalledOnce();
+      });
+
+      it('should keep an attempt started while close() disconnects the client', async () => {
+        let releaseCloseDisconnect!: () => void;
+        let releaseSecondConnect!: () => void;
+        const firstClose = vi
+          .fn()
+          .mockImplementation(
+            () =>
+              new Promise<void>(resolve => (releaseCloseDisconnect = resolve)),
+          );
+        const secondClose = vi.fn().mockResolvedValue(undefined);
+        createClientStub
+          .mockImplementationOnce(() => ({
+            addListener: () => ({}),
+            removeListener: () => ({}),
+            close: firstClose,
+          }))
+          .mockImplementationOnce(() => ({
+            addListener: () => ({}),
+            removeListener: () => ({}),
+            close: secondClose,
+          }));
+
+        vi.spyOn(client, 'convertConnectionToPromise')
+          .mockResolvedValueOnce(undefined)
+          .mockImplementationOnce(
+            () =>
+              new Promise<void>(resolve => (releaseSecondConnect = resolve)),
+          );
+
+        await client.connect();
+        const closing = client.close();
+        await new Promise(process.nextTick);
+        const connecting = client.connect();
+        const secondClient = untypedClient.client;
+        const secondConnectionPromise = untypedClient.connectionPromise;
+
+        releaseCloseDisconnect();
+        await closing;
+
+        expect(untypedClient.client).toBe(secondClient);
+        expect(untypedClient.connectionPromise).toBe(secondConnectionPromise);
+
+        releaseSecondConnect();
+        await connecting;
+
+        expect(untypedClient.client).toBe(secondClient);
+        expect(untypedClient.connectionPromise).toBe(secondConnectionPromise);
+        expect(secondClose).not.toHaveBeenCalled();
+      });
+
+      it('should reject createChannel when client is already closed', async () => {
+        untypedClient.client = null;
+        await expect(client.createChannel()).rejects.toThrow(
+          'Connection closed',
+        );
+      });
+    });
+  });
+
+  describe('connect (channel ownership)', () => {
+    let rmqClient: ClientRMQ;
+    let manager: EventEmitter & { createChannel: ReturnType<typeof vi.fn> };
+
+    beforeEach(() => {
+      rmqClient = new ClientRMQ({});
+      vi.spyOn(rmqClient['logger'], 'log').mockImplementation(() => {});
+      manager = Object.assign(new EventEmitter(), {
+        createChannel: vi.fn(({ setup }) => {
+          void setup();
+          return new EventEmitter();
+        }),
+      });
+      vi.spyOn(rmqClient, 'createClient').mockReturnValue(manager);
+      vi.spyOn(rmqClient, 'setupChannel').mockImplementation(
+        async (_, resolve) => resolve(),
+      );
+    });
+
+    it('should create a single channel when the first connection is established', async () => {
+      const connection = rmqClient.connect();
+      manager.emit('connect');
+      await connection;
+
+      expect(manager.createChannel).toHaveBeenCalledTimes(1);
+      expect(rmqClient['channel']).toBe(
+        manager.createChannel.mock.results[0].value,
+      );
+    });
+
+    it('should ignore a "disconnect" of the manager that the next attempt replaced', async () => {
+      let finishChannelClose!: () => void;
+      const previousChannel = Object.assign(new EventEmitter(), {
+        close: vi.fn(
+          () => new Promise<void>(resolve => (finishChannelClose = resolve)),
+        ),
+      });
+      const previousManager = Object.assign(new EventEmitter(), {
+        createChannel: vi.fn(({ setup }) => {
+          void setup();
+          return previousChannel;
+        }),
+        close: vi.fn().mockResolvedValue(undefined),
+      });
+      vi.mocked(rmqClient.createClient)
+        .mockReturnValueOnce(previousManager as any)
+        .mockReturnValueOnce(manager);
+      const previousConnection = rmqClient.connect();
+      previousManager.emit('connect');
+      await previousConnection;
+
+      const closing = rmqClient.close();
+      // e.g., the lazy `connect()` of a `send()` issued while closing
+      const connection = rmqClient.connect();
+      manager.emit('connect');
+      await connection;
+      const connectionPromise = rmqClient['connectionPromise'];
+
+      // The broker drops the connection while its channel still closes.
+      previousManager.emit('disconnect', { err: new Error('broker shutdown') });
+      finishChannelClose();
+      await closing;
+
+      expect(rmqClient['connectionPromise']).toBe(connectionPromise);
+    });
+
+    describe('when "close()" runs during the handshake', () => {
+      let closedManager: EventEmitter & {
+        createChannel: ReturnType<typeof vi.fn>;
+        close: ReturnType<typeof vi.fn>;
+      };
+      let finishHandshake: () => void;
+
+      // Starts the next attempt while `close()` waits for the handshake, e.g.,
+      // the lazy `connect()` of a `send()` issued while closing.
+      const closeAndConnect = async () => {
+        const closedAttempt = rmqClient.connect();
+        const closedAttemptStopped =
+          expect(closedAttempt).rejects.toThrow('Connection closed');
+        const closing = rmqClient.close();
+        const connection = rmqClient.connect();
+        const connectionPromise = rmqClient['connectionPromise'];
+
+        finishHandshake();
+        await closing;
+        await closedAttemptStopped;
+
+        return { connection, connectionPromise };
+      };
+
+      beforeEach(() => {
+        const handshake = new Promise<void>(
+          resolve => (finishHandshake = resolve),
+        );
+        closedManager = Object.assign(new EventEmitter(), {
+          createChannel: vi.fn(() => new EventEmitter()),
+          close: vi.fn().mockResolvedValue(undefined),
+        });
+        // Like amqp-connection-manager, close() waits for the handshake in
+        // progress, which still emits "connect" once it succeeds.
+        closedManager.close.mockImplementationOnce(async () => {
+          await handshake;
+          closedManager.emit('connect');
+        });
+        vi.mocked(rmqClient.createClient)
+          .mockReturnValueOnce(closedManager as any)
+          .mockReturnValueOnce(manager);
+      });
+
+      it('should not take the first "connect" of the next attempt for a reconnect', async () => {
+        const { connection, connectionPromise } = await closeAndConnect();
+
+        expect(rmqClient['isInitialConnect']).toBe(true);
+
+        manager.emit('connect');
+
+        // Must keep waiting for the channel setup instead of resolving early.
+        expect(rmqClient['connectionPromise']).toBe(connectionPromise);
+        await connection;
+      });
+
+      it('should not create a channel on the manager of the next attempt', async () => {
+        const { connection } = await closeAndConnect();
+        manager.emit('connect');
+        await connection;
+
+        expect(closedManager.createChannel).not.toHaveBeenCalled();
+        expect(manager.createChannel).toHaveBeenCalledTimes(1);
+        expect(rmqClient['channel']).toBe(
+          manager.createChannel.mock.results[0].value,
+        );
+      });
+    });
+  });
+
+  describe('connect (channel setup errors)', () => {
+    let rmqClient: ClientRMQ;
+    let manager: EventEmitter & {
+      createChannel: ReturnType<typeof vi.fn>;
+      close: ReturnType<typeof vi.fn>;
+    };
+    let channel: EventEmitter & { close: ReturnType<typeof vi.fn> };
+    let logError: ReturnType<typeof vi.spyOn>;
+    const setupError = new Error('PRECONDITION_FAILED');
+
+    beforeEach(() => {
+      rmqClient = new ClientRMQ({});
+      vi.spyOn(rmqClient['logger'], 'log').mockImplementation(() => {});
+      logError = vi
+        .spyOn(rmqClient['logger'], 'error')
+        .mockImplementation(() => {});
+      channel = Object.assign(new EventEmitter(), {
+        close: vi.fn().mockResolvedValue(undefined),
+      });
+      manager = Object.assign(new EventEmitter(), {
+        createChannel: vi.fn(() => channel),
+        close: vi.fn().mockResolvedValue(undefined),
+      });
+      vi.spyOn(rmqClient, 'createClient').mockReturnValue(manager);
+    });
+
+    it('should reject "connect()" with the error the channel setup failed with', async () => {
+      const connection = rmqClient.connect();
+      manager.emit('connect');
+      channel.emit('error', setupError);
+
+      await expect(connection).rejects.toBe(setupError);
+    });
+
+    it('should log the error the channel setup failed with', async () => {
+      const connection = rmqClient.connect();
+      manager.emit('connect');
+      channel.emit('error', setupError);
+      await connection.catch(() => {});
+
+      expect(logError).toHaveBeenCalledWith(setupError);
+    });
+
+    it('should still close the connection it discards when the channel close rejects', async () => {
+      channel.close.mockRejectedValue(new Error('Channel closing error'));
+      const connection = rmqClient.connect();
+      manager.emit('connect');
+      channel.emit('error', setupError);
+
+      await expect(connection).rejects.toBe(setupError);
+      expect(manager.close).toHaveBeenCalled();
+    });
+
+    it('should reject with the setup error when the connection close rejects', async () => {
+      manager.close.mockRejectedValue(new Error('Connection closing error'));
+      const connection = rmqClient.connect();
+      manager.emit('connect');
+      channel.emit('error', setupError);
+
+      await expect(connection).rejects.toBe(setupError);
+    });
+
+    describe('when the channel close waits for the broker', () => {
+      beforeEach(() => {
+        closeChannelOnlyWhileConnected(channel.close, manager.close);
+      });
+
+      it('should close the channel before the connection it discards', async () => {
+        const connection = rmqClient.connect();
+        manager.emit('connect');
+        channel.emit('error', setupError);
+
+        expect(await settledWithin(connection)).toBe('rejected');
+        expect(channel.close.mock.invocationCallOrder[0]).toBeLessThan(
+          manager.close.mock.invocationCallOrder[0],
+        );
+      });
+    });
+
+    it('should try again on the next call instead of caching the setup error', async () => {
+      const connection = rmqClient.connect();
+      manager.emit('connect');
+      // amqplib drops the whole connection before the setup error surfaces.
+      manager.emit('disconnect', { err: setupError });
+      channel.emit('error', setupError);
+      await connection.catch(() => {});
+
+      void rmqClient.connect();
+
+      expect(rmqClient.createClient).toHaveBeenCalledTimes(2);
+    });
+
+    it('should treat the first "connect" of the next attempt as the initial one', async () => {
+      const connection = rmqClient.connect();
+      manager.emit('connect');
+      manager.emit('disconnect', { err: setupError });
+      channel.emit('error', setupError);
+      await connection.catch(() => {});
+
+      const nextChannel = Object.assign(new EventEmitter(), {
+        close: vi.fn().mockResolvedValue(undefined),
+      });
+      const nextManager = Object.assign(new EventEmitter(), {
+        createChannel: vi.fn(() => nextChannel),
+        close: vi.fn().mockResolvedValue(undefined),
+      });
+      vi.mocked(rmqClient.createClient).mockReturnValue(nextManager as any);
+      const nextConnection = rmqClient.connect();
+      nextManager.emit('connect');
+
+      // Must keep waiting for the channel setup instead of resolving early.
+      const settled = await Promise.race([
+        rmqClient['connectionPromise']!.then(
+          () => 'resolved',
+          () => 'rejected',
+        ),
+        new Promise(resolve => setImmediate(() => resolve('pending'))),
+      ]);
+      expect(settled).toBe('pending');
+      nextChannel.emit('error', setupError);
+      await expect(nextConnection).rejects.toBe(setupError);
+    });
+
+    it('should log a later setup error without throwing once connected', async () => {
+      vi.spyOn(rmqClient, 'setupChannel').mockImplementation(
+        async (_, resolve) => resolve(),
+      );
+      manager.createChannel.mockImplementation(({ setup }) => {
+        void setup();
+        return channel;
+      });
+      const connection = rmqClient.connect();
+      manager.emit('connect');
+      await connection;
+
+      expect(() => channel.emit('error', setupError)).not.toThrow();
+      expect(logError).toHaveBeenCalledWith(setupError);
     });
   });
 
   describe('createChannel', () => {
-    let createChannelStub: sinon.SinonStub;
-    let setupChannelStub: sinon.SinonStub;
+    let createChannelStub: ReturnType<typeof vi.fn>;
+    let setupChannelStub: ReturnType<typeof vi.fn>;
 
     beforeEach(() => {
-      setupChannelStub = sinon
-        .stub(client, 'setupChannel')
-        .callsFake((_, done) => done());
-      createChannelStub = sinon.stub().callsFake(({ setup }) => setup());
+      setupChannelStub = vi
+        .spyOn(client, 'setupChannel')
+        .mockImplementation((_, done) => done());
+      createChannelStub = vi.fn().mockImplementation(({ setup }) => {
+        void setup();
+        return new EventEmitter();
+      });
       client['client'] = { createChannel: createChannelStub };
     });
     afterEach(() => {
-      setupChannelStub.restore();
+      setupChannelStub.mockRestore();
     });
     it('should call "createChannel" method of the client instance', async () => {
       await client.createChannel();
-      expect(createChannelStub.called).to.be.true;
+      expect(createChannelStub).toHaveBeenCalled();
     });
     it('should call "setupChannel" method of the client instance', async () => {
       await client.createChannel();
-      expect(setupChannelStub.called).to.be.true;
+      expect(setupChannelStub).toHaveBeenCalled();
     });
   });
 
   describe('consumeChannel', () => {
-    let addSetupStub: sinon.SinonStub;
-    let consumeStub: sinon.SinonStub;
+    let consumeStub: ReturnType<typeof vi.fn>;
     const channel: any = {};
 
     beforeEach(() => {
       client['responseEmitter'] = new EventEmitter();
-      consumeStub = sinon
-        .stub()
-        .callsFake((_, done) => done({ properties: { correlationId: 1 } }));
-      addSetupStub = sinon.stub().callsFake(fn => fn(channel));
+      consumeStub = vi
+        .fn()
+        .mockImplementation((_, done) =>
+          done({ properties: { correlationId: 1 } }),
+        );
 
       channel.consume = consumeStub;
-      client['channel'] = { addSetup: addSetupStub };
-    });
-    it('should call "addSetup" method of the channel instance', async () => {
-      await client.consumeChannel();
-      expect(addSetupStub.called).to.be.true;
     });
     it('should call "consume" method of the channel instance', async () => {
-      await client.consumeChannel();
-      expect(consumeStub.called).to.be.true;
+      await client.consumeChannel(channel);
+      expect(consumeStub).toHaveBeenCalled();
+    });
+  });
+
+  describe('consumeChannel reply consumer', () => {
+    let rmqClient: ClientRMQ;
+    let responseEmitter: EventEmitter;
+    let emitSpy: ReturnType<typeof vi.spyOn>;
+    let onMessage: (msg: unknown) => void;
+    let consumingChannel: { consume: ReturnType<typeof vi.fn> };
+
+    beforeEach(async () => {
+      rmqClient = new ClientRMQ({});
+      responseEmitter = new EventEmitter();
+      emitSpy = vi.spyOn(responseEmitter, 'emit');
+      Object.assign(rmqClient, { responseEmitter });
+      consumingChannel = {
+        consume: vi.fn().mockImplementation((_, callback) => {
+          onMessage = callback;
+        }),
+      };
+
+      await rmqClient.consumeChannel(consumingChannel as any);
+    });
+
+    it('should forward a message to the request waiting for it', () => {
+      const msg = { properties: { correlationId: 'id' }, content: 'content' };
+      const listener = vi.fn();
+      responseEmitter.on(msg.properties.correlationId, listener);
+
+      onMessage(msg);
+
+      expect(emitSpy).toHaveBeenCalledTimes(1);
+      expect(emitSpy).toHaveBeenCalledWith(msg.properties.correlationId, msg);
+      expect(listener).toHaveBeenCalledWith(msg);
+    });
+
+    it('should not throw when the broker cancels the consumer', () => {
+      expect(() => onMessage(null)).not.toThrow();
+      expect(emitSpy).not.toHaveBeenCalled();
+    });
+
+    it('should consume the reply queue again after a cancel', () => {
+      expect(consumingChannel.consume).toHaveBeenCalledTimes(1);
+
+      onMessage(null);
+
+      expect(consumingChannel.consume).toHaveBeenCalledTimes(2);
+    });
+
+    it('should fail pending requests on direct reply-to consumer cancel', () => {
+      const pendingCallback = vi.fn();
+      rmqClient['routingMap'].set('req-1', pendingCallback);
+      const handleCloseSpy = vi.spyOn(rmqClient, 'handleClose');
+
+      onMessage(null);
+
+      expect(handleCloseSpy).toHaveBeenCalledTimes(1);
+      expect(pendingCallback).toHaveBeenCalledWith({
+        err: expect.objectContaining({ message: 'Connection closed' }),
+      });
+      expect(rmqClient['routingMap'].size).toBe(0);
+    });
+
+    it('should keep pending requests when cancelling a custom reply queue consumer', async () => {
+      const customClient = new ClientRMQ({ replyQueue: 'custom.reply.queue' });
+      vi.spyOn(customClient['logger'], 'error').mockImplementation(() => {});
+      let customOnMessage!: (msg: any) => void;
+      const customChannel = {
+        consume: vi.fn((_queue, fn) => {
+          customOnMessage = fn;
+          return Promise.resolve({});
+        }),
+      };
+      await customClient.consumeChannel(customChannel as any);
+
+      const pendingCallback = vi.fn();
+      customClient['routingMap'].set('req-1', pendingCallback);
+      const handleCloseSpy = vi.spyOn(customClient, 'handleClose');
+
+      customOnMessage(null);
+
+      expect(handleCloseSpy).not.toHaveBeenCalled();
+      expect(pendingCallback).not.toHaveBeenCalled();
+      expect(customClient['routingMap'].size).toBe(1);
+    });
+
+    it('should ignore a message no request waits for', () => {
+      const msg = {
+        properties: { correlationId: 'unknown' },
+        content: 'content',
+      };
+
+      onMessage(msg);
+
+      expect(emitSpy).not.toHaveBeenCalled();
+    });
+
+    it('should not throw on a message whose correlation id is "error"', () => {
+      // Whoever publishes to the reply queue chooses the correlation id, and
+      // an "error" event without a listener throws inside amqplib's dispatch,
+      // which closes the channel and the connection
+      const msg = {
+        properties: { correlationId: 'error' },
+        content: 'content',
+      };
+
+      expect(() => onMessage(msg)).not.toThrow();
+      expect(emitSpy).not.toHaveBeenCalled();
     });
   });
 
   describe('setupChannel', () => {
     const queue = 'test';
+    const exchange = 'test.exchange';
     const queueOptions = {};
     const isGlobalPrefetchCount = true;
     const prefetchCount = 10;
 
-    let consumeStub: sinon.SinonStub;
+    let consumeStub: ReturnType<typeof vi.fn>;
     let channel: any = {};
 
     beforeEach(() => {
       client['queue'] = queue;
       client['queueOptions'] = queueOptions;
-      (client as any)['options'] = { isGlobalPrefetchCount, prefetchCount };
+      untypedClient['options'] = { isGlobalPrefetchCount, prefetchCount };
 
       channel = {
-        assertQueue: sinon.spy(() => ({})),
-        prefetch: sinon.spy(),
+        assertQueue: vi.fn(),
+        prefetch: vi.fn(),
+        bindQueue: vi.fn(),
+        assertExchange: vi.fn(),
       };
-      consumeStub = sinon.stub(client, 'consumeChannel').callsFake(() => null);
+      consumeStub = vi
+        .spyOn(client, 'consumeChannel')
+        .mockImplementation(() => null!);
     });
     afterEach(() => {
-      consumeStub.restore();
+      consumeStub.mockRestore();
     });
-    it('should call "assertQueue" with queue and queue options', async () => {
+    it('should call "assertQueue" with queue and queue options when noAssert is false', async () => {
+      client['noAssert'] = false;
+
       await client.setupChannel(channel, () => null);
-      expect(channel.assertQueue.calledWith(queue, queueOptions)).to.be.true;
+      expect(channel.assertQueue).toHaveBeenCalledWith(queue, queueOptions);
+    });
+    it('should not call "assertQueue" when noAssert is true', async () => {
+      client['noAssert'] = true;
+
+      await client.setupChannel(channel, () => null);
+      expect(channel.assertQueue).not.toHaveBeenCalled();
+    });
+    it('should not call "assertQueue" when exchangeType is fanout', async () => {
+      untypedClient['options']['exchangeType'] = 'fanout';
+      untypedClient['options']['exchange'] = exchange;
+      await client.setupChannel(channel, () => null);
+      expect(channel.assertQueue).not.toHaveBeenCalled();
+    });
+    it('should not call "assertQueue" when wildcards is true', async () => {
+      untypedClient['options']['wildcards'] = true;
+      await client.setupChannel(channel, () => null);
+      expect(channel.assertQueue).not.toHaveBeenCalled();
+    });
+    it('should not call "bindQueue" when exchangeType is fanout', async () => {
+      untypedClient['options']['exchangeType'] = 'fanout';
+      untypedClient['options']['exchange'] = exchange;
+      await client.setupChannel(channel, () => null);
+      expect(channel.bindQueue).not.toHaveBeenCalled();
+    });
+    it('should not call "bindQueue" when wildcards is true', async () => {
+      untypedClient['options']['wildcards'] = true;
+      await client.setupChannel(channel, () => null);
+      expect(channel.bindQueue).not.toHaveBeenCalled();
     });
     it('should call "prefetch" with prefetchCount and "isGlobalPrefetchCount"', async () => {
       await client.setupChannel(channel, () => null);
-      expect(channel.prefetch.calledWith(prefetchCount, isGlobalPrefetchCount))
-        .to.be.true;
+      expect(channel.prefetch).toHaveBeenCalledWith(
+        prefetchCount,
+        isGlobalPrefetchCount,
+      );
     });
     it('should call "consumeChannel" method', async () => {
       await client.setupChannel(channel, () => null);
-      expect(consumeStub.called).to.be.true;
+      expect(consumeStub).toHaveBeenCalled();
     });
     it('should call "resolve" function', async () => {
-      const resolve = sinon.spy();
+      const resolve = vi.fn();
       await client.setupChannel(channel, resolve);
-      expect(resolve.called).to.be.true;
+      expect(resolve).toHaveBeenCalled();
     });
   });
 
@@ -169,179 +776,1009 @@ describe('ClientRMQ', function () {
         off: () => ({}),
       };
       client
-        .mergeDisconnectEvent(instance as any, empty())
-        .subscribe(null, (err: any) => expect(err).to.be.eql(error));
+        .mergeDisconnectEvent(instance, EMPTY)
+        .subscribe({ error: (err: any) => expect(err).toEqual(error) });
     });
   });
 
   describe('publish', () => {
     const pattern = 'test';
-    const msg = { pattern, data: 'data' };
-    let connectSpy: sinon.SinonSpy,
-      sendToQueueSpy: sinon.SinonSpy,
-      eventSpy: sinon.SinonSpy;
+    const exchange = 'test.exchange';
+    let msg: ReadPacket;
+    let connectSpy: ReturnType<typeof vi.fn>,
+      sendToQueueStub: ReturnType<typeof vi.fn>,
+      publishStub: ReturnType<typeof vi.fn>,
+      eventSpy: ReturnType<typeof vi.fn>;
 
     beforeEach(() => {
-      connectSpy = sinon.spy(client, 'connect');
-      eventSpy = sinon.spy();
-      sendToQueueSpy = sinon.spy();
+      client = new ClientRMQ({});
+      untypedClient = client as any;
+
+      msg = { pattern, data: 'data' };
+      connectSpy = vi.spyOn(client, 'connect');
+      eventSpy = vi.fn();
+      sendToQueueStub = vi.fn().mockImplementation(() => ({ catch: vi.fn() }));
+      publishStub = vi.fn().mockImplementation(() => ({ catch: vi.fn() }));
 
       client['channel'] = {
-        sendToQueue: sendToQueueSpy,
+        sendToQueue: sendToQueueStub,
+        publish: publishStub,
       };
       client['responseEmitter'] = new EventEmitter();
       client['responseEmitter'].on(pattern, eventSpy);
     });
 
     afterEach(() => {
-      connectSpy.restore();
+      connectSpy.mockRestore();
     });
 
     it('should send message to a proper queue', () => {
       client['publish'](msg, () => {
-        expect(sendToQueueSpy.called).to.be.true;
-        expect(sendToQueueSpy.getCall(0).args[0]).to.be.eql(client['queue']);
+        expect(sendToQueueStub).toHaveBeenCalled();
+        expect(sendToQueueStub.mock.calls[0][0]).toEqual(client['queue']);
       });
+    });
+    it('should send message to exchange when exchangeType is fanout', async () => {
+      untypedClient['options']['exchangeType'] = 'fanout';
+      untypedClient['options']['exchange'] = exchange;
+      client['publish'](msg, () => {
+        expect(publishStub).toHaveBeenCalled();
+        expect(publishStub.mock.calls[0][0]).toEqual(exchange);
+      });
+    });
+    it('should publish with the routing key the server binds when wildcards is true', () => {
+      untypedClient['options']['wildcards'] = true;
+      // The server binds its queue with the normalized pattern (sorted keys)
+      client['publish'](
+        { pattern: { role: 'user', cmd: 'create' }, data: 'data' },
+        () => {},
+      );
+
+      expect(publishStub.mock.calls[0][1]).toEqual(
+        '{"cmd":"create","role":"user"}',
+      );
     });
 
     it('should send buffer from stringified message', () => {
       client['publish'](msg, () => {
-        expect(sendToQueueSpy.called).to.be.true;
-        expect(sendToQueueSpy.getCall(1).args[1]).to.be.eql(
+        expect(sendToQueueStub).toHaveBeenCalled();
+        expect(sendToQueueStub.mock.calls[1][1]).toEqual(
           Buffer.from(JSON.stringify(msg)),
         );
       });
     });
 
+    it('should not derive a correlation id from the ids before it', () => {
+      for (let i = 0; i < 3; i++) {
+        client['publish']({ pattern, data: 'data' }, () => {});
+      }
+      const [first, second, third] = sendToQueueStub.mock.calls.map(
+        ([, , options]) => options.correlationId as string,
+      );
+
+      expect(second.startsWith(first.slice(1))).toBe(false);
+      expect(third.startsWith(second.slice(1))).toBe(false);
+    });
+
+    describe('when a short string is longer than AMQP allows', () => {
+      // An AMQP short string has at most 255 bytes
+      const longest = 'a'.repeat(255);
+
+      const expectFailedWithoutPublishing = (
+        callback: ReturnType<typeof vi.fn>,
+      ) => {
+        expect(callback).toHaveBeenCalledExactlyOnceWith({
+          err: expect.any(MaxRmqShortStringLengthExceededException),
+        });
+        expect(publishStub).not.toHaveBeenCalled();
+        expect(sendToQueueStub).not.toHaveBeenCalled();
+        expect(client['routingMap'].size).toBe(0);
+      };
+
+      it.each([
+        ['wildcards', { wildcards: true }],
+        ['a fanout exchange', { exchangeType: 'fanout' }],
+      ])(
+        'should fail the request without publishing when the routing key is too long, with %s',
+        (_, options) => {
+          Object.assign(untypedClient['options'], options);
+          const callback = vi.fn();
+
+          client['publish']({ pattern: `${longest}a`, data: 'data' }, callback);
+
+          expectFailedWithoutPublishing(callback);
+        },
+      );
+
+      it('should count the length of the routing key in bytes', () => {
+        untypedClient['options']['wildcards'] = true;
+        const callback = vi.fn();
+
+        // "é" takes two bytes
+        client['publish'](
+          { pattern: `${longest.slice(1)}é`, data: 'data' },
+          callback,
+        );
+
+        expectFailedWithoutPublishing(callback);
+      });
+
+      it('should check the normalized form of an object pattern', () => {
+        untypedClient['options']['wildcards'] = true;
+        const callback = vi.fn();
+
+        client['publish'](
+          { pattern: { cmd: longest }, data: 'data' },
+          callback,
+        );
+
+        expectFailedWithoutPublishing(callback);
+      });
+
+      it('should publish a request whose routing key has 255 bytes', () => {
+        untypedClient['options']['wildcards'] = true;
+        const callback = vi.fn();
+
+        client['publish']({ pattern: longest, data: 'data' }, callback);
+
+        expect(callback).not.toHaveBeenCalled();
+        expect(publishStub.mock.calls[0][1]).toBe(longest);
+      });
+
+      it('should send a longer pattern to the queue, in the body', () => {
+        const callback = vi.fn();
+
+        client['publish']({ pattern: `${longest}a`, data: 'data' }, callback);
+
+        expect(callback).not.toHaveBeenCalled();
+        expect(sendToQueueStub).toHaveBeenCalledOnce();
+      });
+
+      it.each(['messageId', 'type', 'appId', 'expiration'])(
+        'should fail the request without publishing when "%s" is too long',
+        property => {
+          const callback = vi.fn();
+
+          client['publish'](
+            {
+              pattern,
+              data: new RmqRecord('data', { [property]: `${longest}a` }),
+            },
+            callback,
+          );
+
+          expectFailedWithoutPublishing(callback);
+        },
+      );
+
+      it('should fail the request without publishing when a header name is too long', () => {
+        const callback = vi.fn();
+
+        client['publish'](
+          {
+            pattern,
+            data: new RmqRecord('data', {
+              headers: { [`${longest}a`]: 'value' },
+            }),
+          },
+          callback,
+        );
+
+        expectFailedWithoutPublishing(callback);
+      });
+
+      it('should publish properties and header names of 255 bytes', () => {
+        const callback = vi.fn();
+
+        client['publish'](
+          {
+            pattern,
+            data: new RmqRecord('data', {
+              messageId: longest,
+              headers: { [longest]: 'a'.repeat(1000) },
+            }),
+          },
+          callback,
+        );
+
+        expect(callback).not.toHaveBeenCalled();
+        expect(sendToQueueStub.mock.calls[0][2].messageId).toBe(longest);
+      });
+    });
+
     describe('dispose callback', () => {
-      let unsubscribeSpy: sinon.SinonSpy, subscription;
+      let unsubscribeSpy: ReturnType<typeof vi.fn>, subscription;
 
       beforeEach(async () => {
-        unsubscribeSpy = sinon.spy();
-        client['responseEmitter'] = ({
+        unsubscribeSpy = vi.fn();
+        client['responseEmitter'] = {
           removeListener: unsubscribeSpy,
-          on: sinon.spy(),
-        } as any) as EventEmitter;
+          on: vi.fn(),
+        } as any as EventEmitter;
 
-        subscription = await client['publish'](msg, sinon.spy());
+        subscription = client['publish'](msg, vi.fn());
         subscription();
       });
       it('should unsubscribe', () => {
-        expect(unsubscribeSpy.called).to.be.true;
+        expect(unsubscribeSpy).toHaveBeenCalled();
+      });
+    });
+
+    describe('headers', () => {
+      it('should not generate headers if none are configured', () => {
+        client['publish'](msg, () => {
+          expect(sendToQueueStub.mock.calls[0][2].headers).toBeUndefined();
+        });
+      });
+
+      it('should send packet headers', () => {
+        const requestHeaders = { '1': '123' };
+        msg.data = new RmqRecord('data', { headers: requestHeaders });
+
+        client['publish'](msg, () => {
+          expect(sendToQueueStub.mock.calls[0][2].headers).toEqual(
+            requestHeaders,
+          );
+        });
+      });
+
+      it('should combine packet and static headers', () => {
+        const staticHeaders = { 'client-id': 'some-client-id' };
+        untypedClient.options.headers = staticHeaders;
+
+        const requestHeaders = { '1': '123' };
+        msg.data = new RmqRecord('data', { headers: requestHeaders });
+
+        client['publish'](msg, () => {
+          expect(sendToQueueStub.mock.calls[0][2].headers).toEqual({
+            ...staticHeaders,
+            ...requestHeaders,
+          });
+        });
+      });
+
+      it('should prefer packet headers over static headers', () => {
+        const staticHeaders = { 'client-id': 'some-client-id' };
+        untypedClient.options.headers = staticHeaders;
+
+        const requestHeaders = { 'client-id': 'override-client-id' };
+        msg.data = new RmqRecord('data', { headers: requestHeaders });
+
+        client['publish'](msg, () => {
+          expect(sendToQueueStub.mock.calls[0][2].headers).toEqual(
+            requestHeaders,
+          );
+        });
+      });
+
+      it('should send the packet metadata as headers, and not in the content', () => {
+        msg.metadata = { 'x-request-id': 'trace-1' };
+
+        client['publish'](msg, () => {});
+
+        const [, content, options] = sendToQueueStub.mock.calls[0];
+        expect(options.headers).toEqual({ 'x-request-id': 'trace-1' });
+        expect(JSON.parse(content.toString())).toEqual({
+          pattern,
+          data: 'data',
+          id: options.correlationId,
+        });
+      });
+
+      it('should let the record headers and the static headers win over the packet metadata', () => {
+        untypedClient.options.headers = { tenant: 'from-options' };
+        msg.data = new RmqRecord('data', {
+          headers: { 'x-request-id': 'from-record' },
+        });
+        msg.metadata = {
+          'x-request-id': 'trace-1',
+          tenant: 'acme',
+          locale: 'pl',
+        };
+
+        client['publish'](msg, () => {});
+
+        expect(sendToQueueStub.mock.calls[0][2].headers).toEqual({
+          'x-request-id': 'from-record',
+          tenant: 'from-options',
+          locale: 'pl',
+        });
+      });
+
+      it('should not generate headers for empty packet metadata', () => {
+        msg.metadata = {};
+
+        client['publish'](msg, () => {});
+
+        expect(sendToQueueStub.mock.calls[0][2].headers).toBeUndefined();
       });
     });
   });
 
   describe('handleMessage', () => {
     describe('when error', () => {
-      let callback: sinon.SinonSpy;
+      let callback: ReturnType<typeof vi.fn>;
 
       beforeEach(() => {
-        callback = sinon.spy();
+        callback = vi.fn();
       });
-      it('should call callback with correct object', () => {
+      it('should call callback with correct object', async () => {
         const packet = {
           err: true,
           response: 'test',
           isDisposed: false,
         };
-        client.handleMessage(packet, callback);
-        expect(
-          callback.calledWith({
-            err: packet.err,
-            response: 'test',
-            isDisposed: true,
-          }),
-        ).to.be.true;
+        await client.handleMessage(packet, callback);
+        expect(callback).toHaveBeenCalledWith({
+          err: packet.err,
+          response: 'test',
+          isDisposed: true,
+        });
       });
     });
     describe('when disposed', () => {
-      let callback: sinon.SinonSpy;
+      let callback: ReturnType<typeof vi.fn>;
 
       beforeEach(() => {
-        callback = sinon.spy();
+        callback = vi.fn();
       });
-      it('should call callback with correct object', () => {
+      it('should call callback with correct object', async () => {
         const packet = {
           response: 'test',
           isDisposed: true,
         };
-        client.handleMessage(packet, callback);
-        expect(
-          callback.calledWith({
-            err: undefined,
-            response: 'test',
-            isDisposed: true,
-          }),
-        ).to.be.true;
+        await client.handleMessage(packet, callback);
+        expect(callback).toHaveBeenCalledWith({
+          err: undefined,
+          response: 'test',
+          isDisposed: true,
+        });
       });
     });
 
     describe('when response', () => {
-      let callback: sinon.SinonSpy;
+      let callback: ReturnType<typeof vi.fn>;
 
       beforeEach(() => {
-        callback = sinon.spy();
+        callback = vi.fn();
       });
-      it('should call callback with correct object', () => {
+      it('should call callback with correct object', async () => {
         const packet = {
           response: 'test',
           isDisposed: false,
         };
-        client.handleMessage(packet, callback);
+        await client.handleMessage(packet, callback);
+        expect(callback).toHaveBeenCalledWith({
+          err: undefined,
+          response: packet.response,
+        });
+      });
+    });
+
+    describe('when the deserializer fails', () => {
+      const error = new TypeError('Cannot read properties of undefined');
+      const createClientWith = (deserialize: () => unknown) => {
+        const rmqClient = new ClientRMQ({});
+        Object.assign(rmqClient, { deserializer: { deserialize } });
+        return rmqClient;
+      };
+
+      it('should fail the request when the deserializer throws', async () => {
+        const rmqClient = createClientWith(() => {
+          throw error;
+        });
+        const callback = vi.fn();
+
+        await expect(
+          rmqClient.handleMessage({}, callback),
+        ).resolves.toBeUndefined();
+
+        expect(callback).toHaveBeenCalledTimes(1);
+        expect(callback).toHaveBeenCalledWith({ err: error, isDisposed: true });
+      });
+
+      it('should fail the request when the deserializer rejects', async () => {
+        const rmqClient = createClientWith(() => Promise.reject(error));
+        const callback = vi.fn();
+
+        await expect(
+          rmqClient.handleMessage({}, callback),
+        ).resolves.toBeUndefined();
+
+        expect(callback).toHaveBeenCalledTimes(1);
+        expect(callback).toHaveBeenCalledWith({ err: error, isDisposed: true });
+      });
+
+      it('should pass the options to the deserializer', async () => {
+        const deserialize = vi.fn().mockReturnValue({ response: 'res' });
+        const rmqClient = createClientWith(deserialize);
+        const packet = { content: 'packet' };
+        const options = { correlationId: 'id' };
+
+        await rmqClient.handleMessage(packet, options, vi.fn());
+
+        expect(deserialize).toHaveBeenCalledWith(packet, options);
+      });
+
+      it('should not report a failing callback as an undecodable response', async () => {
+        const rmqClient = createClientWith(() => ({ response: 'res' }));
+        const callbackError = new Error('callback failed');
+        const callback = vi.fn().mockImplementation(() => {
+          throw callbackError;
+        });
+
+        await expect(rmqClient.handleMessage({}, callback)).rejects.toBe(
+          callbackError,
+        );
+
+        expect(callback).toHaveBeenCalledTimes(1);
+      });
+
+      it('should fail the request and clear its routing entry when the reply cannot be deserialized', async () => {
+        const rmqClient = createClientWith(() => {
+          throw error;
+        });
+        const routingMap: Map<string, unknown> = Reflect.get(
+          rmqClient,
+          'routingMap',
+        );
+        const responseEmitter = new EventEmitter();
+        Object.assign(rmqClient, {
+          responseEmitter,
+          channel: { sendToQueue: vi.fn(() => ({ catch: vi.fn() })) },
+        });
+        vi.spyOn(rmqClient, 'connect').mockResolvedValue(undefined);
+
+        const response = firstValueFrom(rmqClient.send('test', 'data'));
+        await vi.waitFor(() => expect(routingMap.size).toBe(1));
+        const [correlationId] = routingMap.keys();
+        responseEmitter.emit(correlationId, {
+          content: Buffer.from('{}'),
+          options: {},
+        });
+
+        await expect(response).rejects.toBe(error);
+        expect(routingMap.size).toBe(0);
+        expect(responseEmitter.listenerCount(correlationId)).toBe(0);
+      });
+    });
+
+    describe('when the reply exceeds "maxMessageSize"', () => {
+      const maxMessageSize = 16;
+      const sendRequest = async (rmqClient: ClientRMQ) => {
+        const routingMap: Map<string, unknown> = Reflect.get(
+          rmqClient,
+          'routingMap',
+        );
+        const responseEmitter = new EventEmitter();
+        Object.assign(rmqClient, {
+          responseEmitter,
+          channel: { sendToQueue: vi.fn(() => ({ catch: vi.fn() })) },
+        });
+        vi.spyOn(rmqClient, 'connect').mockResolvedValue(undefined);
+
+        const response = firstValueFrom(rmqClient.send('test', 'data'));
+        await vi.waitFor(() => expect(routingMap.size).toBe(1));
+        const [correlationId] = routingMap.keys() as Iterable<string>;
+        const reply = (content: Buffer) =>
+          responseEmitter.emit(correlationId, { content, options: {} });
+        return { response, reply, routingMap, responseEmitter, correlationId };
+      };
+
+      it('should fail the request without decoding the reply', async () => {
+        const rmqClient = new ClientRMQ({ maxMessageSize });
+        const { response, reply, routingMap, responseEmitter, correlationId } =
+          await sendRequest(rmqClient);
+        const content = Buffer.from('{"response":"12"}');
+        expect(content.length).toBe(maxMessageSize + 1);
+        const toStringSpy = vi.spyOn(content, 'toString');
+
+        reply(content);
+
+        await expect(response).rejects.toBeInstanceOf(
+          MaxPacketLengthExceededException,
+        );
+        expect(toStringSpy).not.toHaveBeenCalled();
+        expect(routingMap.size).toBe(0);
+        expect(responseEmitter.listenerCount(correlationId)).toBe(0);
+      });
+
+      it('should pass on a reply of exactly "maxMessageSize" bytes', async () => {
+        const rmqClient = new ClientRMQ({ maxMessageSize });
+        const { response, reply } = await sendRequest(rmqClient);
+        const content = Buffer.from('{"response":"1"}');
+        expect(content.length).toBe(maxMessageSize);
+
+        reply(content);
+
+        await expect(response).resolves.toBe('1');
+      });
+
+      it('should default to 16 MiB', () => {
+        expect(RMQ_DEFAULT_MAX_MESSAGE_SIZE).toBe(16 * 1024 * 1024);
+        expect(new ClientRMQ({})['maxMessageSize']).toBe(
+          RMQ_DEFAULT_MAX_MESSAGE_SIZE,
+        );
+      });
+
+      it.each([
+        ['NaN', NaN],
+        ['a string', '16mb'],
+      ])('should use the default for %s', (_, maxMessageSize) => {
         expect(
-          callback.calledWith({
-            err: undefined,
-            response: packet.response,
-          }),
-        ).to.be.true;
+          new ClientRMQ({ maxMessageSize: maxMessageSize as number })[
+            'maxMessageSize'
+          ],
+        ).toBe(RMQ_DEFAULT_MAX_MESSAGE_SIZE);
       });
     });
   });
 
   describe('close', () => {
-    let channelCloseSpy: sinon.SinonSpy;
-    let clientCloseSpy: sinon.SinonSpy;
+    let channelCloseSpy: ReturnType<typeof vi.fn>;
+    let clientCloseSpy: ReturnType<typeof vi.fn>;
     beforeEach(() => {
-      channelCloseSpy = sinon.spy();
-      clientCloseSpy = sinon.spy();
-      (client as any).channel = { close: channelCloseSpy };
-      (client as any).client = { close: clientCloseSpy };
+      client = new ClientRMQ({});
+      untypedClient = client as any;
+
+      channelCloseSpy = vi.fn();
+      clientCloseSpy = vi.fn();
+      untypedClient.responseEmitter = new EventEmitter();
+      untypedClient.channel = {
+        close: channelCloseSpy,
+        sendToQueue: vi.fn(() => ({ catch: vi.fn() })),
+        publish: vi.fn(() => ({ catch: vi.fn() })),
+      };
+      untypedClient.client = { close: clientCloseSpy };
     });
 
-    it('should close channel when it is not null', () => {
-      client.close();
-      expect(channelCloseSpy.called).to.be.true;
+    const publish = (callback: (packet: WritePacket) => any) =>
+      untypedClient.publish({ pattern: 'pattern', data: 'data' }, callback);
+
+    it('should close channel when it is not null', async () => {
+      await client.close();
+      expect(channelCloseSpy).toHaveBeenCalled();
     });
 
-    it('should close client when it is not null', () => {
-      client.close();
-      expect(clientCloseSpy.called).to.be.true;
+    it('should close client when it is not null', async () => {
+      await client.close();
+      expect(clientCloseSpy).toHaveBeenCalled();
+    });
+
+    it('should fail pending requests with a connection closed error', async () => {
+      const callback = vi.fn();
+      publish(callback);
+
+      await client.close();
+
+      expect(callback).toHaveBeenCalledWith({
+        err: expect.objectContaining({ message: 'Connection closed' }),
+      });
+    });
+
+    it('should fail pending requests published to an exchange', async () => {
+      untypedClient.options.wildcards = true;
+      const publishToExchange = untypedClient.channel.publish;
+      const callback = vi.fn();
+      publish(callback);
+
+      await client.close();
+
+      expect(publishToExchange).toHaveBeenCalled();
+      expect(callback).toHaveBeenCalledWith({
+        err: expect.objectContaining({ message: 'Connection closed' }),
+      });
+    });
+
+    it('should not call back a request whose teardown already ran', async () => {
+      const callback = vi.fn();
+      const teardown = publish(callback);
+
+      teardown();
+      await client.close();
+
+      expect(callback).not.toHaveBeenCalled();
+      expect(untypedClient.responseEmitter.eventNames().length).toEqual(0);
+    });
+
+    it('should leave nothing pending behind', async () => {
+      const callback = vi.fn();
+      publish(callback);
+
+      await client.close();
+      await client.close();
+
+      expect(callback).toHaveBeenCalledTimes(1);
+      expect(untypedClient.routingMap.size).toEqual(0);
+      expect(untypedClient.responseEmitter.eventNames().length).toEqual(0);
+    });
+
+    it('should fail pending requests even when closing the channel rejects', async () => {
+      untypedClient.channel.close = vi
+        .fn()
+        .mockRejectedValue(new Error('Channel closing error'));
+      const callback = vi.fn();
+      publish(callback);
+
+      await expect(client.close()).rejects.toThrow('Channel closing error');
+
+      expect(callback).toHaveBeenCalledWith({
+        err: expect.objectContaining({ message: 'Connection closed' }),
+      });
+    });
+
+    it('should still close the connection and reset the state when the channel close rejects', async () => {
+      untypedClient.channel.close = vi
+        .fn()
+        .mockRejectedValue(new Error('Channel closing error'));
+
+      await expect(client.close()).rejects.toThrow('Channel closing error');
+
+      expect(clientCloseSpy).toHaveBeenCalledOnce();
+      expect(untypedClient.channel).toBeNull();
+      expect(untypedClient.client).toBeNull();
+      expect(untypedClient.isInitialConnect).toBe(true);
+    });
+
+    describe('when the channel close waits for the broker', () => {
+      beforeEach(() => {
+        closeChannelOnlyWhileConnected(channelCloseSpy, clientCloseSpy);
+      });
+
+      it('should close the channel before the connection', async () => {
+        expect(await settledWithin(client.close())).toBe('resolved');
+        expect(channelCloseSpy.mock.invocationCallOrder[0]).toBeLessThan(
+          clientCloseSpy.mock.invocationCallOrder[0],
+        );
+      });
+    });
+
+    it('should fail every pending request and close the channel when a callback throws', async () => {
+      vi.spyOn(untypedClient.logger, 'error').mockImplementation(() => {});
+      const throwingCallback = vi.fn().mockImplementation(() => {
+        throw new Error('Callback error');
+      });
+      const callback = vi.fn();
+      publish(throwingCallback);
+      publish(callback);
+
+      await client.close();
+
+      expect(throwingCallback).toHaveBeenCalledTimes(1);
+      expect(callback).toHaveBeenCalledWith({
+        err: expect.objectContaining({ message: 'Connection closed' }),
+      });
+      expect(untypedClient.routingMap.size).toEqual(0);
+      expect(untypedClient.responseEmitter.eventNames().length).toEqual(0);
+      expect(channelCloseSpy).toHaveBeenCalled();
+    });
+
+    it('should not track a request whose publish threw synchronously', async () => {
+      untypedClient.channel.sendToQueue = vi.fn(() => {
+        throw new Error('Publish error');
+      });
+      const callback = vi.fn();
+      publish(callback);
+
+      expect(untypedClient.routingMap.size).toEqual(0);
+      expect(untypedClient.responseEmitter.eventNames().length).toEqual(0);
+
+      await client.close();
+
+      expect(callback).toHaveBeenCalledTimes(1);
+      expect(callback).toHaveBeenCalledWith({
+        err: expect.objectContaining({ message: 'Publish error' }),
+      });
     });
   });
   describe('dispatchEvent', () => {
-    const msg = { pattern: 'pattern', data: 'data' };
-    let sendToQueueStub: sinon.SinonStub, channel;
+    let msg: ReadPacket;
+    const exchange = 'test.exchange';
+    let sendToQueueStub: ReturnType<typeof vi.fn>,
+      publishStub: ReturnType<typeof vi.fn>,
+      channel;
 
     beforeEach(() => {
-      sendToQueueStub = sinon.stub();
+      client = new ClientRMQ({});
+      untypedClient = client as any;
+
+      msg = { pattern: 'pattern', data: 'data' };
+      sendToQueueStub = vi.fn();
+      publishStub = vi.fn();
       channel = {
         sendToQueue: sendToQueueStub,
+        publish: publishStub,
       };
-      (client as any).channel = channel;
+      untypedClient.channel = channel;
     });
 
     it('should publish packet', async () => {
-      sendToQueueStub.callsFake((a, b, c, d) => d());
+      sendToQueueStub.mockImplementation((a, b, c, d) => d());
       await client['dispatchEvent'](msg);
 
-      expect(sendToQueueStub.called).to.be.true;
+      expect(sendToQueueStub).toHaveBeenCalled();
+    });
+    it('should publish packet to exchange when exchangeType is fanout', async () => {
+      untypedClient['options']['exchangeType'] = 'fanout';
+      untypedClient['options']['exchange'] = exchange;
+      publishStub.mockImplementation((a, b, c, d, f) => f());
+      await client['dispatchEvent'](msg);
+
+      expect(publishStub).toHaveBeenCalled();
+      expect(publishStub.mock.calls[0][0]).toEqual(exchange);
+    });
+    it('should publish with the routing key the server binds when wildcards is true', async () => {
+      untypedClient['options']['wildcards'] = true;
+      publishStub.mockImplementation((a, b, c, d, f) => f());
+      // The server binds its queue with the normalized pattern (sorted keys)
+      await client['dispatchEvent']({
+        pattern: { role: 'user', cmd: 'create' },
+        data: 'data',
+      });
+
+      expect(publishStub.mock.calls[0][1]).toEqual(
+        '{"cmd":"create","role":"user"}',
+      );
     });
     it('should throw error', async () => {
-      sendToQueueStub.callsFake((a, b, c, d) => d(new Error()));
+      sendToQueueStub.mockImplementation((a, b, c, d) => d(new Error()));
       client['dispatchEvent'](msg).catch(err =>
-        expect(err).to.be.instanceOf(Error),
+        expect(err).toBeInstanceOf(Error),
       );
+    });
+    it('should not publish an event whose routing key is longer than AMQP allows', async () => {
+      untypedClient['options']['wildcards'] = true;
+
+      await expect(
+        client['dispatchEvent']({ pattern: 'a'.repeat(256), data: 'data' }),
+      ).rejects.toBeInstanceOf(MaxRmqShortStringLengthExceededException);
+      expect(publishStub).not.toHaveBeenCalled();
+    });
+    it('should not publish an event with a property longer than AMQP allows', async () => {
+      await expect(
+        client['dispatchEvent']({
+          pattern: 'pattern',
+          data: new RmqRecord('data', { type: 'a'.repeat(256) }),
+        }),
+      ).rejects.toBeInstanceOf(MaxRmqShortStringLengthExceededException);
+      expect(sendToQueueStub).not.toHaveBeenCalled();
+    });
+    it('should publish an event whose routing key has 255 bytes', async () => {
+      untypedClient['options']['wildcards'] = true;
+      publishStub.mockImplementation((a, b, c, d, f) => f());
+
+      await client['dispatchEvent']({ pattern: 'a'.repeat(255), data: 'data' });
+
+      expect(publishStub.mock.calls[0][1]).toBe('a'.repeat(255));
+    });
+
+    describe('headers', () => {
+      it('should not generate headers if none are configured', async () => {
+        sendToQueueStub.mockImplementation((a, b, c, d) => d());
+        await client['dispatchEvent'](msg);
+        expect(sendToQueueStub.mock.calls[0][2].headers).toBeUndefined();
+      });
+
+      it('should send packet headers', async () => {
+        sendToQueueStub.mockImplementation((a, b, c, d) => d());
+        const requestHeaders = { '1': '123' };
+        msg.data = new RmqRecord('data', { headers: requestHeaders });
+
+        await client['dispatchEvent'](msg);
+        expect(sendToQueueStub.mock.calls[0][2].headers).toEqual(
+          requestHeaders,
+        );
+      });
+
+      it('should combine packet and static headers', async () => {
+        sendToQueueStub.mockImplementation((a, b, c, d) => d());
+        const staticHeaders = { 'client-id': 'some-client-id' };
+        untypedClient.options.headers = staticHeaders;
+
+        const requestHeaders = { '1': '123' };
+        msg.data = new RmqRecord('data', { headers: requestHeaders });
+
+        await client['dispatchEvent'](msg);
+        expect(sendToQueueStub.mock.calls[0][2].headers).toEqual({
+          ...staticHeaders,
+          ...requestHeaders,
+        });
+      });
+
+      it('should prefer packet headers over static headers', async () => {
+        sendToQueueStub.mockImplementation((a, b, c, d) => d());
+        const staticHeaders = { 'client-id': 'some-client-id' };
+        untypedClient.options.headers = staticHeaders;
+
+        const requestHeaders = { 'client-id': 'override-client-id' };
+        msg.data = new RmqRecord('data', { headers: requestHeaders });
+
+        await client['dispatchEvent'](msg);
+        expect(sendToQueueStub.mock.calls[0][2].headers).toEqual(
+          requestHeaders,
+        );
+      });
+
+      it('should send the packet metadata as headers, and not in the content', async () => {
+        sendToQueueStub.mockImplementation((a, b, c, d) => d());
+        msg.data = new RmqRecord('data', {
+          headers: { 'x-request-id': 'from-record' },
+        });
+        msg.metadata = { 'x-request-id': 'trace-1', tenant: 'acme' };
+
+        await client['dispatchEvent'](msg);
+
+        const [, content, options] = sendToQueueStub.mock.calls[0];
+        expect(options.headers).toEqual({
+          'x-request-id': 'from-record',
+          tenant: 'acme',
+        });
+        expect(JSON.parse(content.toString())).toEqual({
+          pattern: 'pattern',
+          data: 'data',
+        });
+      });
+    });
+  });
+
+  describe('on', () => {
+    let firstManager: ReturnType<typeof createFakeManager>;
+    let secondManager: ReturnType<typeof createFakeManager>;
+    let createClientStub: ReturnType<typeof vi.fn>;
+
+    // Plays the connection manager, so its events can be fired by hand.
+    const createFakeManager = () =>
+      Object.assign(new EventEmitter(), {
+        close: vi.fn().mockResolvedValue(undefined),
+      });
+    const connectWith = async (
+      manager: ReturnType<typeof createFakeManager>,
+    ) => {
+      const connectPromise = client.connect();
+      manager.emit('connect');
+      await connectPromise;
+    };
+    // Fails the attempt like an unreachable broker does, which discards the
+    // manager, so the next `connect()` creates a new one.
+    const failToConnect = async (
+      manager: ReturnType<typeof createFakeManager>,
+      connectPromise = client.connect(),
+    ) => {
+      const failure = { err: new Error('broker unavailable') };
+      manager.emit('connectFailed', failure);
+      await expect(connectPromise).rejects.toBe(failure);
+    };
+
+    beforeEach(() => {
+      client = new ClientRMQ({});
+      firstManager = createFakeManager();
+      secondManager = createFakeManager();
+      createClientStub = vi
+        .spyOn(client, 'createClient')
+        .mockReturnValueOnce(firstManager)
+        .mockReturnValueOnce(secondManager);
+      vi.spyOn(client, 'createChannel').mockResolvedValue(undefined);
+      vi.spyOn(client['logger'], 'log').mockImplementation(() => {});
+      vi.spyOn(client['logger'], 'error').mockImplementation(() => {});
+    });
+
+    it('should attach a listener registered before "connect()" to the client created after a failed attempt', async () => {
+      const callback = vi.fn();
+      client.on('disconnect', callback);
+
+      await failToConnect(firstManager);
+      await connectWith(secondManager);
+      secondManager.emit('disconnect');
+
+      expect(callback).toHaveBeenCalledTimes(1);
+    });
+
+    it('should attach a listener registered while "connect()" is pending to the client created after it fails', async () => {
+      const connectPromise = client.connect();
+      const callback = vi.fn();
+      client.on('disconnect', callback);
+
+      await failToConnect(firstManager, connectPromise);
+      await connectWith(secondManager);
+      secondManager.emit('disconnect');
+
+      expect(callback).toHaveBeenCalledTimes(1);
+    });
+
+    it('should keep a listener across the reconnects of the same connection manager', async () => {
+      await connectWith(firstManager);
+      const callback = vi.fn();
+      client.on('disconnect', callback);
+      // e.g., the lazy `connect()` of `send()` / `emit()`
+      await client.connect();
+
+      firstManager.emit('disconnect');
+      firstManager.emit('connect');
+      firstManager.emit('disconnect');
+
+      expect(callback).toHaveBeenCalledTimes(2);
+      expect(createClientStub).toHaveBeenCalledOnce();
+    });
+
+    it('should drop the listeners on "close()"', async () => {
+      const callback = vi.fn();
+      client.on('disconnect', callback);
+
+      await connectWith(firstManager);
+      await client.close();
+      await connectWith(secondManager);
+      secondManager.emit('disconnect');
+
+      expect(callback).not.toHaveBeenCalled();
+    });
+
+    it('should drop the listeners on "close()" while still connecting', async () => {
+      const callback = vi.fn();
+      client.on('disconnect', callback);
+
+      const firstAttempt = client.connect();
+      await client.close();
+      const secondAttempt = client.connect();
+      await failToConnect(firstManager, firstAttempt);
+      secondManager.emit('connect');
+      await secondAttempt;
+      secondManager.emit('disconnect');
+
+      expect(callback).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('when the connection is lost', () => {
+    let manager: EventEmitter & { close: ReturnType<typeof vi.fn> };
+
+    const connectClient = async (options = {}) => {
+      client = new ClientRMQ(options);
+      manager = Object.assign(new EventEmitter(), {
+        close: vi.fn().mockResolvedValue(undefined),
+      });
+      vi.spyOn(client, 'createClient').mockReturnValue(manager as any);
+      vi.spyOn(client, 'createChannel').mockResolvedValue(undefined);
+      vi.spyOn(client['logger'], 'log').mockImplementation(() => {});
+      vi.spyOn(client['logger'], 'error').mockImplementation(() => {});
+      const connectPromise = client.connect();
+      manager.emit('connect');
+      await connectPromise;
+    };
+
+    it('should fail the pending requests waiting on the direct reply-to queue', async () => {
+      await connectClient();
+      const callback = vi.fn();
+      client['routingMap'].set('id', callback);
+
+      manager.emit('disconnect', { err: new Error('broker shutdown') });
+
+      expect(callback).toHaveBeenCalledWith({
+        err: new Error('Connection closed'),
+      });
+      expect(client['routingMap'].size).toBe(0);
+    });
+
+    it('should keep the pending requests waiting on a named reply queue', async () => {
+      await connectClient({ replyQueue: 'replies' });
+      const callback = vi.fn();
+      client['routingMap'].set('id', callback);
+
+      manager.emit('disconnect', { err: new Error('broker shutdown') });
+
+      expect(callback).not.toHaveBeenCalled();
+      expect(client['routingMap'].size).toBe(1);
+    });
+
+    it('should fail "connect()" until the manager reconnects', async () => {
+      await connectClient();
+
+      manager.emit('disconnect', { err: new Error('broker shutdown') });
+      await expect(client.connect()).rejects.toBe(
+        'Error: Connection lost. Trying to reconnect...',
+      );
+
+      manager.emit('connect');
+      await expect(client.connect()).resolves.toBeUndefined();
     });
   });
 });

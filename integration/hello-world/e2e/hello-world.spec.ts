@@ -1,7 +1,8 @@
-import * as request from 'supertest';
+import request from 'supertest';
 import { Test } from '@nestjs/testing';
 import { INestApplication } from '@nestjs/common';
-import { ApplicationModule } from '../src/app.module';
+import { AppModule } from '../src/app.module.js';
+import { listenOnLoopback } from '../../_support/listen-on-loopback.js';
 
 describe('Hello world (default adapter)', () => {
   let server;
@@ -9,12 +10,12 @@ describe('Hello world (default adapter)', () => {
 
   beforeEach(async () => {
     const module = await Test.createTestingModule({
-      imports: [ApplicationModule],
+      imports: [AppModule],
     }).compile();
 
     app = module.createNestApplication();
     server = app.getHttpServer();
-    await app.init();
+    await listenOnLoopback(app);
   });
 
   [

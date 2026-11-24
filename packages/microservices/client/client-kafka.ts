@@ -1,14 +1,21 @@
-import { Logger } from '@nestjs/common/services/logger.service';
-import { loadPackage } from '@nestjs/common/utils/load-package.util';
-import { isUndefined } from '@nestjs/common/utils/shared.utils';
+import {
+  throwError as _throw,
+  connectable,
+  defer,
+  Observable,
+  Subject,
+} from 'rxjs';
+import { mergeMap } from 'rxjs/operators';
 import {
   KAFKA_DEFAULT_BROKER,
   KAFKA_DEFAULT_CLIENT,
   KAFKA_DEFAULT_GROUP,
-} from '../constants';
-import { KafkaResponseDeserializer } from '../deserializers/kafka-response.deserializer';
-import { KafkaHeaders } from '../enums';
-import { InvalidKafkaClientTopicException } from '../errors/invalid-kafka-client-topic.exception';
+} from '../constants.js';
+import { KafkaResponseDeserializer } from '../deserializers/kafka-response.deserializer.js';
+import { KafkaHeaders } from '../enums/index.js';
+import { InvalidKafkaClientTopicException } from '../errors/invalid-kafka-client-topic.exception.js';
+import { InvalidMessageException } from '../errors/invalid-message.exception.js';
+import { KafkaStatus } from '../events/index.js';
 import {
   BrokersFunction,
   Consumer,
@@ -19,47 +26,110 @@ import {
   KafkaConfig,
   KafkaMessage,
   Producer,
-} from '../external/kafka.interface';
+  TopicPartitionOffsetAndMetadata,
+} from '../external/kafka.interface.js';
 import {
   KafkaLogger,
   KafkaParser,
   KafkaReplyPartitionAssigner,
-} from '../helpers';
+} from '../helpers/index.js';
 import {
+  ClientKafkaProxy,
+  IncomingResponse,
   KafkaOptions,
+  MsPattern,
   OutgoingEvent,
+  PacketMetadata,
   ReadPacket,
   WritePacket,
-} from '../interfaces';
+} from '../interfaces/index.js';
 import {
   KafkaRequest,
   KafkaRequestSerializer,
-} from '../serializers/kafka-request.serializer';
-import { ClientProxy } from './client-proxy';
+} from '../serializers/kafka-request.serializer.js';
+import { hasPacketMetadata } from '../utils/packet-metadata.utils.js';
+import { ClientProxy } from './client-proxy.js';
+import { Logger } from '@nestjs/common';
+import { loadPackage, isNil, isUndefined } from '@nestjs/common/internal';
 
-let kafkaPackage: any = {};
+/**
+ * The consumer and producer created by a single `connect()` attempt, kept so a
+ * failed attempt can disconnect its own instances even after a newer attempt
+ * has replaced them on the client.
+ */
+interface KafkaConnectionAttempt {
+  consumer?: Consumer;
+  producer?: Producer;
+}
 
-export class ClientKafka extends ClientProxy {
-  protected client: Kafka = null;
-  protected consumer: Consumer = null;
-  protected producer: Producer = null;
+/**
+ * @publicApi
+ */
+export class ClientKafka
+  extends ClientProxy<never, KafkaStatus>
+  implements ClientKafkaProxy
+{
   protected logger = new Logger(ClientKafka.name);
+  protected client: Kafka | null = null;
+  protected parser: KafkaParser | null = null;
+  protected initialized: Promise<void> | null = null;
+  /**
+   * The attempt allowed to keep writing the client's state, or null once
+   * `close()` has taken the client over. Every step of a connection attempt
+   * checks it after an await, so an attempt that outlives `close()` stops
+   * instead of reading the fields `close()` has already cleared.
+   */
+  protected connectionAttempt: KafkaConnectionAttempt | null = null;
   protected responsePatterns: string[] = [];
   protected consumerAssignments: { [key: string]: number } = {};
-
+  protected readonly pendingRequestPartitions = new Map<
+    string,
+    { replyTopic: string; replyPartition: number }
+  >();
   protected brokers: string[] | BrokersFunction;
   protected clientId: string;
   protected groupId: string;
+  protected producerOnlyMode: boolean;
+  protected _consumer: Consumer | null = null;
+  protected _producer: Producer | null = null;
 
-  constructor(protected readonly options: KafkaOptions['options']) {
+  get consumer(): Consumer {
+    if (!this._consumer) {
+      throw new Error(
+        'No consumer initialized. Please, call the "connect" method first.',
+      );
+    }
+    return this._consumer;
+  }
+
+  get producer(): Producer {
+    if (!this._producer) {
+      throw new Error(
+        'No producer initialized. Please, call the "connect" method first.',
+      );
+    }
+    return this._producer;
+  }
+
+  constructor(protected readonly options: Required<KafkaOptions>['options']) {
     super();
 
-    const clientOptions =
-      this.getOptionsProp(this.options, 'client') || ({} as KafkaConfig);
-    const consumerOptions =
-      this.getOptionsProp(this.options, 'consumer') || ({} as ConsumerConfig);
-    const postfixId =
-      this.getOptionsProp(this.options, 'postfixId') || '-client';
+    const clientOptions = this.getOptionsProp(
+      this.options,
+      'client',
+      {} as KafkaConfig,
+    );
+    const consumerOptions = this.getOptionsProp(
+      this.options,
+      'consumer',
+      {} as ConsumerConfig,
+    );
+    const postfixId = this.getOptionsProp(this.options, 'postfixId', '-client');
+    this.producerOnlyMode = this.getOptionsProp(
+      this.options,
+      'producerOnlyMode',
+      false,
+    );
 
     this.brokers = clientOptions.brokers || [KAFKA_DEFAULT_BROKER];
 
@@ -68,103 +138,263 @@ export class ClientKafka extends ClientProxy {
     this.clientId =
       (clientOptions.clientId || KAFKA_DEFAULT_CLIENT) + postfixId;
     this.groupId = (consumerOptions.groupId || KAFKA_DEFAULT_GROUP) + postfixId;
-
-    kafkaPackage = loadPackage('kafkajs', ClientKafka.name, () =>
-      require('kafkajs'),
-    );
+    this.parser = new KafkaParser((options && options.parser) || undefined);
 
     this.initializeSerializer(options);
     this.initializeDeserializer(options);
   }
 
-  public subscribeToResponseOf(pattern: any): void {
-    const request = this.normalizePattern(pattern);
+  public subscribeToResponseOf(pattern: unknown): void {
+    const request = this.normalizePattern(pattern as MsPattern);
     this.responsePatterns.push(this.getResponsePatternName(request));
   }
 
   public async close(): Promise<void> {
-    this.producer && (await this.producer.disconnect());
-    this.consumer && (await this.consumer.disconnect());
-    this.producer = null;
-    this.consumer = null;
+    this.handleClose();
+    // Reset first, so that an in-flight `connect()` stops at its next step,
+    // and a `connect()` issued while the clients disconnect starts a new
+    // attempt that this close leaves alone. It also keeps a later `connect()`
+    // from handing back the closed producer when a disconnect throws.
+    const producer = this._producer;
+    const consumer = this._consumer;
+    this._producer = null;
+    this._consumer = null;
+    this.initialized = null;
     this.client = null;
+    this.connectionAttempt = null;
+
+    // Both clients have to be disconnected even if one of them fails, so a
+    // consumer does not stay in its group when the producer cannot be closed.
+    const results = await Promise.allSettled([
+      producer?.disconnect(),
+      consumer?.disconnect(),
+    ]);
+    const [failure, ...otherFailures] = results.filter(
+      (result): result is PromiseRejectedResult => result.status === 'rejected',
+    );
+    otherFailures.forEach(({ reason }) => this.logger.error(reason));
+    if (failure) {
+      throw failure.reason;
+    }
+  }
+
+  public handleClose() {
+    this.pendingRequestPartitions.clear();
+    if (this.routingMap.size > 0) {
+      const err = new Error('Connection closed');
+      const callbacks = [...this.routingMap.values()];
+      this.routingMap.clear();
+
+      for (const callback of callbacks) {
+        try {
+          callback({ err });
+        } catch (callbackErr) {
+          // A failing callback must not keep the remaining requests pending
+          // nor prevent the connection from being closed.
+          this.logger.error(callbackErr);
+        }
+      }
+    }
   }
 
   public async connect(): Promise<Producer> {
-    if (this.client) {
-      return this.producer;
+    if (this.initialized) {
+      return this.initialized.then(() => this._producer!);
     }
-    this.client = this.createClient();
+    const attempt: KafkaConnectionAttempt = {};
+    // Claim the client before the attempt starts, so a `close()` or a newer
+    // `connect()` can invalidate it at any later point.
+    this.connectionAttempt = attempt;
+    const initialized = this.initializeClientAndConnections(attempt).catch(
+      async err => {
+        // A rejected attempt must not be cached: the next `connect()` call
+        // has to try again once the broker is reachable, instead of failing
+        // forever with the error of the first attempt.
+        await this.discardPartialConnection(attempt, initialized);
+        throw err;
+      },
+    );
+    this.initialized = initialized;
+    return initialized.then(() => this._producer!);
+  }
 
-    const partitionAssigners = [
-      (config: ConstructorParameters<typeof KafkaReplyPartitionAssigner>[1]) =>
-        new KafkaReplyPartitionAssigner(this, config),
-    ] as any[];
+  /**
+   * Tears down whatever a failed connection attempt managed to create, so a
+   * consumer that joined its group before the producer failed does not stay
+   * behind when the next attempt creates a new one. The client's state is only
+   * reset if neither `close()` nor a newer attempt has taken it over in the
+   * meantime (e.g., `close()` followed by `connect()` while the failed attempt
+   * was still pending).
+   */
+  private async discardPartialConnection(
+    attempt: KafkaConnectionAttempt,
+    initialized: Promise<void>,
+  ): Promise<void> {
+    if (this.connectionAttempt === attempt) {
+      this.connectionAttempt = null;
+    }
+    if (this.initialized === initialized) {
+      this._consumer = null;
+      this._producer = null;
+      this.client = null;
+      this.initialized = null;
+    }
+    // Otherwise `close()` or a newer attempt owns the client's state now: this
+    // attempt stops before it publishes a field again, so only the instances
+    // it created are left to disconnect.
+    await Promise.allSettled([
+      attempt.consumer?.disconnect(),
+      attempt.producer?.disconnect(),
+    ]);
+  }
 
-    const consumerOptions = Object.assign(
-      {
+  /**
+   * Stops an attempt once `close()` or a newer `connect()` has taken the
+   * client over. Without it an attempt that outlives `close()` keeps going:
+   * it reads `client`, `_consumer` or `_producer` after the await during which
+   * `close()` cleared them, and rejects with a `TypeError` long after
+   * `close()` returned.
+   */
+  private assertConnectionIsActive(attempt: KafkaConnectionAttempt): void {
+    if (this.connectionAttempt !== attempt) {
+      throw new Error('Connection closed');
+    }
+  }
+
+  private async initializeClientAndConnections(
+    attempt: KafkaConnectionAttempt,
+  ): Promise<void> {
+    const client = await this.createClient();
+    // `close()` may have run while the Kafka client was being created: stop
+    // before publishing it, so a closed client is not left holding one.
+    this.assertConnectionIsActive(attempt);
+    this.client = client;
+
+    if (!this.producerOnlyMode) {
+      const partitionAssigners = [
+        (
+          config: ConstructorParameters<typeof KafkaReplyPartitionAssigner>[1],
+        ) => new KafkaReplyPartitionAssigner(this, config),
+      ];
+
+      const consumerOptions = {
         partitionAssigners,
-      },
-      this.options.consumer || {},
-      {
+        ...(this.options.consumer || {}),
         groupId: this.groupId,
-      },
-    );
-    this.producer = this.client.producer(this.options.producer || {});
-    this.consumer = this.client.consumer(consumerOptions);
+      };
 
-    // set member assignments on join and rebalance
-    this.consumer.on(
-      this.consumer.events.GROUP_JOIN,
-      this.setConsumerAssignments.bind(this),
-    );
+      const consumer = (attempt.consumer = client.consumer(consumerOptions));
+      this._consumer = consumer;
+      this.registerConsumerEventListeners();
 
-    await this.producer.connect();
-    await this.consumer.connect();
-    await this.bindTopics();
-    return this.producer;
+      // Set member assignments on join and rebalance
+      consumer.on(
+        consumer.events.GROUP_JOIN,
+        this.setConsumerAssignments.bind(this),
+      );
+      await consumer.connect();
+      // `close()` disconnects the consumer while it connects; the attempt has
+      // to stop instead of binding topics to the closed consumer.
+      this.assertConnectionIsActive(attempt);
+      await this.bindTopics();
+      this.assertConnectionIsActive(attempt);
+    }
+
+    const producer = (attempt.producer = client.producer(
+      this.options.producer || {},
+    ));
+    this._producer = producer;
+    this.registerProducerEventListeners();
+    await producer.connect();
+    // `close()` may have run while the producer was connecting.
+    this.assertConnectionIsActive(attempt);
   }
 
   public async bindTopics(): Promise<void> {
-    const consumerSubscribeOptions = this.options.subscribe || {};
-    const subscribeTo = async (responsePattern: string) =>
-      this.consumer.subscribe({
-        topic: responsePattern,
-        ...consumerSubscribeOptions,
-      });
-    await Promise.all(this.responsePatterns.map(subscribeTo));
+    const consumer = this._consumer;
+    if (!consumer) {
+      throw Error('No consumer initialized');
+    }
 
-    await this.consumer.run(
-      Object.assign(this.options.run || {}, {
-        eachMessage: this.createResponseCallback(),
-      }),
-    );
+    const consumerSubscribeOptions = this.options.subscribe || {};
+
+    if (this.responsePatterns.length > 0) {
+      await consumer.subscribe({
+        ...consumerSubscribeOptions,
+        topics: this.responsePatterns,
+      });
+      // `close()` may have disconnected the consumer while it was subscribing,
+      // and a newer attempt may have replaced it.
+      if (this._consumer !== consumer) {
+        throw new Error('Connection closed');
+      }
+    }
+
+    await consumer.run({
+      ...(this.options.run || {}),
+      eachMessage: this.createResponseCallback(),
+    });
   }
 
-  public createClient<T = any>(): T {
-    return new kafkaPackage.Kafka(
-      Object.assign(this.options.client || {}, {
-        clientId: this.clientId,
-        brokers: this.brokers,
-        logCreator: KafkaLogger.bind(null, this.logger),
-      }) as KafkaConfig,
+  public async createClient<T = any>(): Promise<T> {
+    const kafkaPackage = await loadPackage(
+      'kafkajs',
+      ClientKafka.name,
+      () => import('kafkajs'),
     );
+
+    const kafkaConfig: KafkaConfig = {
+      logCreator: KafkaLogger.bind(null, this.logger),
+      ...this.options.client,
+      brokers: this.brokers,
+      clientId: this.clientId,
+    };
+
+    return new kafkaPackage.Kafka(kafkaConfig);
   }
 
   public createResponseCallback(): (payload: EachMessagePayload) => any {
-    return (payload: EachMessagePayload) => {
-      const rawMessage = KafkaParser.parse<KafkaMessage>(
-        Object.assign(payload.message, {
-          topic: payload.topic,
-          partition: payload.partition,
-        }),
-      );
-      if (isUndefined(rawMessage.headers[KafkaHeaders.CORRELATION_ID])) {
+    return async (payload: EachMessagePayload) => {
+      let rawMessage: KafkaMessage;
+      try {
+        rawMessage = this.parser!.parse<KafkaMessage>(
+          Object.assign(payload.message, {
+            topic: payload.topic,
+            partition: payload.partition,
+          }),
+        );
+      } catch (err) {
+        // A rejection would make kafkajs redeliver the message forever
+        this.logger.error(
+          `Message skipped (topic "${payload.topic}", partition ${payload.partition}, offset ${payload.message.offset}): ${err.message}`,
+        );
+        // The pending request can still be failed through the raw header,
+        // instead of waiting for a response that is not coming
+        let callback: Function | undefined;
+        try {
+          callback = this.routingMap.get(
+            String(payload.message.headers?.[KafkaHeaders.CORRELATION_ID]),
+          );
+        } catch {
+          // A header too large to decode is not the id of a pending request
+        }
+        return callback?.({ err, isDisposed: true });
+      }
+      const correlationId = rawMessage.headers![KafkaHeaders.CORRELATION_ID];
+      // kafkajs decodes an empty header value as null
+      if (isNil(correlationId)) {
         return;
       }
-      const { err, response, isDisposed, id } = this.deserializer.deserialize(
-        rawMessage,
-      );
+      let incomingResponse: IncomingResponse;
+      try {
+        incomingResponse = await this.deserializer.deserialize(rawMessage);
+      } catch (error) {
+        // The correlation id is on the headers, so the pending request can be
+        // failed here instead of staying pending forever.
+        const callback = this.routingMap.get(correlationId.toString());
+        return callback?.({ err: error, isDisposed: true });
+      }
+      const { err, response, isDisposed, id } = incomingResponse;
       const callback = this.routingMap.get(id);
       if (!callback) {
         return;
@@ -187,16 +417,144 @@ export class ClientKafka extends ClientProxy {
     return this.consumerAssignments;
   }
 
-  protected dispatchEvent(packet: OutgoingEvent): Promise<any> {
-    const pattern = this.normalizePattern(packet.pattern);
-    const outgoingEvent = this.serializer.serialize(packet.data);
-    const message = Object.assign(
-      {
-        topic: pattern,
-        messages: [outgoingEvent],
-      },
-      this.options.send || {},
+  public emitBatch<TResult = any, TInput = any>(
+    pattern: any,
+    data: { messages: TInput[] },
+  ): Observable<TResult> {
+    if (isNil(pattern) || isNil(data)) {
+      return _throw(() => new InvalidMessageException());
+    }
+    const source = defer(async () => this.connect()).pipe(
+      mergeMap(() => this.dispatchBatchEvent(this.createPacket(pattern, data))),
     );
+    const connectableSource = connectable(source, {
+      connector: () => new Subject(),
+      resetOnDisconnect: false,
+    });
+    connectableSource.connect();
+    return connectableSource;
+  }
+
+  public commitOffsets(
+    topicPartitions: TopicPartitionOffsetAndMetadata[],
+  ): Promise<void> {
+    if (this._consumer) {
+      return this._consumer.commitOffsets(topicPartitions);
+    } else {
+      throw new Error('No consumer initialized');
+    }
+  }
+
+  public unwrap<T>(): T {
+    if (!this.client) {
+      throw new Error(
+        'Not initialized. Please call the "connect" method first.',
+      );
+    }
+    return this.client as T;
+  }
+
+  public on<
+    EventKey extends string | number | symbol = string | number | symbol,
+    EventCallback = any,
+  >(event: EventKey, callback: EventCallback) {
+    throw new Error('Method is not supported for Kafka client');
+  }
+
+  protected registerConsumerEventListeners() {
+    const consumer = this._consumer;
+    if (!consumer) {
+      return;
+    }
+    consumer.on(consumer.events.CONNECT, () => {
+      if (consumer !== this._consumer) {
+        return;
+      }
+      this._status$.next(KafkaStatus.CONNECTED);
+    });
+    consumer.on(consumer.events.DISCONNECT, () => {
+      if (consumer !== this._consumer) {
+        return;
+      }
+      this._status$.next(KafkaStatus.DISCONNECTED);
+    });
+    consumer.on(consumer.events.REBALANCING, () => {
+      if (consumer !== this._consumer) {
+        return;
+      }
+      this._status$.next(KafkaStatus.REBALANCING);
+    });
+    consumer.on(consumer.events.STOP, () => {
+      if (consumer !== this._consumer) {
+        return;
+      }
+      this._status$.next(KafkaStatus.STOPPED);
+      // A stopped consumer reads no more replies. kafkajs also stops (and
+      // leaves the group) before it reports a crash, restarting or not, so
+      // this covers a crash as well.
+      this.handleClose();
+    });
+    consumer.on(consumer.events.CRASH, () => {
+      if (consumer !== this._consumer) {
+        return;
+      }
+      this._status$.next(KafkaStatus.CRASHED);
+    });
+  }
+
+  protected registerProducerEventListeners() {
+    if (!this._producer) {
+      return;
+    }
+    this._producer.on(this._producer.events.CONNECT, () =>
+      this._status$.next(KafkaStatus.CONNECTED),
+    );
+    this._producer.on(this._producer.events.DISCONNECT, () =>
+      this._status$.next(KafkaStatus.DISCONNECTED),
+    );
+  }
+
+  protected async dispatchBatchEvent<TInput = any>(
+    packets: ReadPacket<{ messages: TInput[] }>,
+  ): Promise<any> {
+    if (packets.data.messages.length === 0) {
+      return;
+    }
+    const pattern = this.normalizePattern(packets.pattern);
+    const outgoingEvents = await Promise.all(
+      packets.data.messages.map(message => {
+        return this.serializer.serialize(message as any, { pattern });
+      }),
+    );
+
+    const message = {
+      topic: pattern,
+      // The batch is a single packet, so its metadata goes on every message
+      messages: outgoingEvents.map(outgoingEvent =>
+        this.withoutReplyHeaders(
+          this.mergeMetadata(outgoingEvent, packets.metadata),
+        ),
+      ),
+      ...(this.options.send || {}),
+    };
+
+    return this.producer.send(message);
+  }
+
+  protected async dispatchEvent(packet: OutgoingEvent): Promise<any> {
+    const pattern = this.normalizePattern(packet.pattern);
+    const outgoingEvent = this.withoutReplyHeaders(
+      this.mergeMetadata(
+        await this.serializer.serialize(packet.data, { pattern }),
+        packet.metadata,
+      ),
+    );
+    const message = {
+      topic: pattern,
+      messages: [outgoingEvent],
+      ...(this.options.send || {}),
+    };
+
     return this.producer.send(message);
   }
 
@@ -206,41 +564,69 @@ export class ClientKafka extends ClientProxy {
       throw new InvalidKafkaClientTopicException(topic);
     }
 
-    // get the minimum partition
+    // Get the minimum partition
     return minimumPartition.toString();
   }
 
   protected publish(
     partialPacket: ReadPacket,
     callback: (packet: WritePacket) => any,
-  ): Function {
+  ): () => void {
+    const packet = this.assignPacketId(partialPacket);
+    this.routingMap.set(packet.id, callback);
+
+    const cleanup = () => {
+      this.pendingRequestPartitions.delete(packet.id);
+      this.routingMap.delete(packet.id);
+    };
+    const errorCallback = (err: unknown) => {
+      cleanup();
+      callback({ err });
+    };
+
     try {
-      const packet = this.assignPacketId(partialPacket);
       const pattern = this.normalizePattern(partialPacket.pattern);
       const replyTopic = this.getResponsePatternName(pattern);
       const replyPartition = this.getReplyTopicPartition(replyTopic);
+      this.pendingRequestPartitions.set(packet.id, {
+        replyTopic,
+        replyPartition: Number(replyPartition),
+      });
 
-      const serializedPacket: KafkaRequest = this.serializer.serialize(
-        packet.data,
-      );
-      serializedPacket.headers[KafkaHeaders.CORRELATION_ID] = packet.id;
-      serializedPacket.headers[KafkaHeaders.REPLY_TOPIC] = replyTopic;
-      serializedPacket.headers[KafkaHeaders.REPLY_PARTITION] = replyPartition;
+      Promise.resolve(this.serializer.serialize(packet.data, { pattern }))
+        .then((serializedRequest: KafkaRequest) => {
+          // Torn down or failed (e.g., by a rebalance) while serializing
+          if (!this.routingMap.has(packet.id)) {
+            return;
+          }
+          // Ahead of the reply headers, which no metadata entry may replace
+          const serializedPacket = this.mergeMetadata(
+            serializedRequest,
+            packet.metadata,
+          );
+          serializedPacket.headers[KafkaHeaders.CORRELATION_ID] = packet.id;
+          serializedPacket.headers[KafkaHeaders.REPLY_TOPIC] = replyTopic;
+          serializedPacket.headers[KafkaHeaders.REPLY_PARTITION] =
+            replyPartition;
 
-      this.routingMap.set(packet.id, callback);
+          const message = {
+            topic: pattern,
+            messages: [serializedPacket],
+            ...(this.options.send || {}),
+          };
 
-      const message = Object.assign(
-        {
-          topic: pattern,
-          messages: [serializedPacket],
-        },
-        this.options.send || {},
-      );
-      this.producer.send(message).catch(err => callback({ err }));
+          return this.producer.send(message);
+        })
+        .catch(err => {
+          if (this.routingMap.has(packet.id)) {
+            errorCallback(err);
+          }
+        });
 
-      return () => this.routingMap.delete(packet.id);
+      return cleanup;
     } catch (err) {
-      callback({ err });
+      errorCallback(err);
+      return () => null;
     }
   }
 
@@ -248,19 +634,73 @@ export class ClientKafka extends ClientProxy {
     return `${pattern}.reply`;
   }
 
+  /**
+   * Adds the metadata a dispatch hook attached to a packet to the headers of
+   * a serialized message, under every name the message does not set itself.
+   * Returns a copy, as the message may be the caller's own record.
+   */
+  protected mergeMetadata<T extends { headers?: Record<string, any> }>(
+    message: T,
+    metadata: PacketMetadata | undefined,
+  ): T {
+    if (!hasPacketMetadata(metadata)) {
+      return message;
+    }
+    return { ...message, headers: { ...metadata, ...message.headers } };
+  }
+
+  /**
+   * Returns a copy of an event's message without the headers that make
+   * ServerKafka take a message with a correlation id for a request, and
+   * publish its response to the topic they name. The headers of an event can
+   * come from the data it forwards (an object with a "value" is sent as the
+   * message it describes), so they cannot ask for a reply.
+   */
+  protected withoutReplyHeaders<T extends { headers?: Record<string, any> }>(
+    message: T,
+  ): T {
+    if (!message?.headers) {
+      return message;
+    }
+    const headers = { ...message.headers };
+    delete headers[KafkaHeaders.REPLY_TOPIC];
+    delete headers[KafkaHeaders.REPLY_PARTITION];
+    return { ...message, headers };
+  }
+
   protected setConsumerAssignments(data: ConsumerGroupJoinEvent): void {
     const consumerAssignments: { [key: string]: number } = {};
 
-    // only need to set the minimum
-    Object.keys(data.payload.memberAssignment).forEach(memberId => {
-      const minimumPartition = Math.min(
-        ...data.payload.memberAssignment[memberId],
-      );
-
-      consumerAssignments[memberId] = minimumPartition;
-    });
+    // Only need to set the minimum
+    for (const [topic, memberPartitions] of Object.entries(
+      data.payload.memberAssignment,
+    )) {
+      if (memberPartitions.length) {
+        consumerAssignments[topic] = Math.min(...memberPartitions);
+      }
+    }
 
     this.consumerAssignments = consumerAssignments;
+
+    if (this.pendingRequestPartitions.size > 0) {
+      const err = new Error('Connection closed');
+      for (const [id, { replyTopic, replyPartition }] of this
+        .pendingRequestPartitions) {
+        const assignedPartitions = data.payload.memberAssignment[replyTopic];
+        if (!assignedPartitions?.includes(replyPartition)) {
+          this.pendingRequestPartitions.delete(id);
+          const callback = this.routingMap.get(id);
+          if (callback) {
+            this.routingMap.delete(id);
+            try {
+              callback({ err });
+            } catch (callbackErr) {
+              this.logger.error(callbackErr);
+            }
+          }
+        }
+      }
+    }
   }
 
   protected initializeSerializer(options: KafkaOptions['options']) {

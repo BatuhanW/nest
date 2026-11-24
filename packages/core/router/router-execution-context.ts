@@ -1,49 +1,75 @@
-import {
-  CanActivate,
-  ForbiddenException,
-  HttpServer,
-  ParamData,
-  PipeTransform,
-  RequestMethod,
+import type {
+  ArgumentMetadata,
+  ContextType,
+  RouteParamMetadata,
+  SseOptions,
 } from '@nestjs/common';
 import {
-  CUSTOM_ROUTE_AGRS_METADATA,
+  type CanActivate,
+  ForbiddenException,
+  type HttpServer,
+  type ParamData,
+  type PipeTransform,
+  type RequestMethod,
+  SSE_ABORT_CONTROLLER,
+  StreamableFile,
+} from '@nestjs/common';
+import {
+  type Controller,
+  CUSTOM_ROUTE_ARGS_METADATA,
   HEADERS_METADATA,
   HTTP_CODE_METADATA,
+  isEmptyArray,
+  isPlainObject,
+  isString,
   REDIRECT_METADATA,
   RENDER_METADATA,
   ROUTE_ARGS_METADATA,
+  RouteParamtypes,
   SSE_METADATA,
-} from '@nestjs/common/constants';
-import { RouteParamMetadata } from '@nestjs/common/decorators';
-import { RouteParamtypes } from '@nestjs/common/enums/route-paramtypes.enum';
-import { ContextType, Controller } from '@nestjs/common/interfaces';
-import { isEmpty, isString } from '@nestjs/common/utils/shared.utils';
+} from '@nestjs/common/internal';
+import * as commonInternal from '@nestjs/common/internal';
+import type { StandardSchemaV1 } from '@standard-schema/spec';
 import { IncomingMessage } from 'http';
-import { Observable } from 'rxjs';
-import { FORBIDDEN_MESSAGE } from '../guards/constants';
-import { GuardsConsumer } from '../guards/guards-consumer';
-import { GuardsContextCreator } from '../guards/guards-context-creator';
-import { ContextUtils } from '../helpers/context-utils';
-import { ExecutionContextHost } from '../helpers/execution-context-host';
+import { EmptyError, isObservable, Observable, type Subscriber } from 'rxjs';
+import { takeUntil, tap } from 'rxjs/operators';
+import { finished, Stream, type Writable } from 'stream';
+import {
+  FORBIDDEN_MESSAGE,
+  GuardsConsumer,
+  GuardsContextCreator,
+} from '../guards/index.js';
+import { ContextUtils } from '../helpers/context-utils.js';
+import { destroyUnsentBody } from '../helpers/destroy-unsent-body.js';
+import { ExecutionContextHost } from '../helpers/execution-context-host.js';
 import {
   HandleResponseFn,
   HandlerMetadata,
   HandlerMetadataStorage,
+  HandlerObservableNotifier,
   HandlerResponseBasicFn,
-} from '../helpers/handler-metadata-storage';
-import { STATIC_CONTEXT } from '../injector/constants';
-import { InterceptorsConsumer } from '../interceptors/interceptors-consumer';
-import { InterceptorsContextCreator } from '../interceptors/interceptors-context-creator';
-import { PipesConsumer } from '../pipes/pipes-consumer';
-import { PipesContextCreator } from '../pipes/pipes-context-creator';
-import { IRouteParamsFactory } from './interfaces/route-params-factory.interface';
+} from '../helpers/handler-metadata-storage.js';
+import { STATIC_CONTEXT } from '../injector/constants.js';
+import { InterceptorsConsumer } from '../interceptors/interceptors-consumer.js';
+import { InterceptorsContextCreator } from '../interceptors/interceptors-context-creator.js';
+import { PipesConsumer } from '../pipes/pipes-consumer.js';
+import { PipesContextCreator } from '../pipes/pipes-context-creator.js';
+import { IRouteParamsFactory } from './interfaces/route-params-factory.interface.js';
+import { markRejectedByPipes } from './rejected-by-pipes.js';
 import {
   CustomHeader,
+  onceClosed,
+  pickCloseSource,
   RedirectResponse,
   RouterResponseController,
-} from './router-response-controller';
-import { HeaderStream } from './sse-stream';
+} from './router-response-controller.js';
+import { HeaderStream } from './sse-stream.js';
+import {
+  isStreamingBody,
+  isStreamingBodyConsumed,
+  listenForStreamError,
+  type StreamingBody,
+} from './streaming-body.js';
 
 export interface ParamProperties {
   index: number;
@@ -55,7 +81,38 @@ export interface ParamProperties {
     res: TResponse,
     next: Function,
   ) => any;
+  schema?: StandardSchemaV1;
 }
+
+type HandlerStream = StreamableFile | StreamingBody;
+
+/** Signals the request's response handler each time the route returns an Observable. */
+class RouteHandlerObservableNotifier implements HandlerObservableNotifier {
+  private emitted = false;
+  private listener?: () => void;
+
+  next() {
+    this.emitted = true;
+    this.listener?.();
+  }
+
+  subscribe(listener: () => void) {
+    this.listener = listener;
+    if (this.emitted) {
+      listener();
+    }
+    return this;
+  }
+
+  unsubscribe() {
+    this.listener = undefined;
+  }
+}
+
+const isThenable = (value: unknown): value is PromiseLike<unknown> =>
+  value !== null &&
+  (typeof value === 'object' || typeof value === 'function') &&
+  typeof (value as PromiseLike<unknown>).then === 'function';
 
 export class RouterExecutionContext {
   private readonly handlerMetadataStorage = new HandlerMetadataStorage();
@@ -88,6 +145,7 @@ export class RouterExecutionContext {
     const {
       argsLength,
       fnHandleResponse,
+      isSseHandler,
       paramtypes,
       getParamsMetadata,
       httpStatusCode,
@@ -113,6 +171,13 @@ export class RouterExecutionContext {
       contextId,
       inquirerId,
     );
+    this.contextUtils.warnOnMissingParamtypes(
+      instance,
+      methodName,
+      paramtypes,
+      pipes,
+      paramsOptions.filter(({ type }) => this.isPipeable(type)),
+    );
     const guards = this.guardsContextCreator.create(
       instance,
       callback,
@@ -136,15 +201,41 @@ export class RouterExecutionContext {
     );
     const fnApplyPipes = this.createPipesFn(pipes, paramsOptions);
 
-    const handler = <TRequest, TResponse>(
-      args: any[],
-      req: TRequest,
-      res: TResponse,
-      next: Function,
-    ) => async () => {
-      fnApplyPipes && (await fnApplyPipes(args, req, res, next));
-      return callback.apply(instance, args);
-    };
+    const handler =
+      <TRequest, TResponse>(
+        args: any[],
+        req: TRequest,
+        res: TResponse,
+        next: Function,
+        handlerObservable$?: RouteHandlerObservableNotifier,
+        handlerStreams: HandlerStream[] = [],
+      ) =>
+      async () => {
+        try {
+          const pendingPipes =
+            fnApplyPipes && fnApplyPipes(args, req, res, next);
+          pendingPipes && (await pendingPipes);
+        } catch (err) {
+          // e.g. for upload interceptors to remove the files they stored
+          markRejectedByPipes(req);
+          throw err;
+        }
+        const result = callback.apply(instance, args);
+        if (!handlerObservable$) {
+          return result;
+        }
+        // Settled here, so that an Observable a promise resolves to is tapped
+        // like one the handler returns as it is. The `then()` of a thenable
+        // (e.g. a lazy query builder) is still called once, as its value is
+        // returned in its place.
+        const value = isThenable(result) ? await result : result;
+        this.observeHandlerResult(value, handlerObservable$, handlerStreams);
+        return isObservable(value)
+          ? value.pipe(
+              tap(emitted => this.trackHandlerStream(emitted, handlerStreams)),
+            )
+          : value;
+      };
 
     return async <TRequest, TResponse>(
       req: TRequest,
@@ -158,15 +249,40 @@ export class RouterExecutionContext {
       hasCustomHeaders &&
         this.responseController.setHeaders(res, responseHeaders);
 
-      const result = await this.interceptorsConsumer.intercept(
+      if (isSseHandler) {
+        // Attach a per-request AbortController before the handler runs so async
+        // @Sse() handlers can observe client disconnects via @SseSignal() during
+        // their setup. The controller is aborted in RouterResponseController.sse()
+        // when the underlying connection closes.
+        this.attachSseAbortSignal(req);
+      }
+
+      // Interceptors always hand back an Observable, so whether the route
+      // handler itself returned one can only be observed where it runs.
+      const handlerObservable$ =
+        isSseHandler || isEmptyArray(interceptors)
+          ? undefined
+          : new RouteHandlerObservableNotifier();
+      // The streams the handler produced: an interceptor may still hold one
+      // when the client goes away, wrap one in a value it cannot be sent as,
+      // or replace one with something else.
+      const handlerStreams: HandlerStream[] = [];
+      const resultOrDeferred = this.interceptorsConsumer.intercept(
         interceptors,
         [req, res, next],
         instance,
         callback,
-        handler(args, req, res, next),
+        handler(args, req, res, next, handlerObservable$, handlerStreams),
         contextType,
       );
-      await (fnHandleResponse as HandlerResponseBasicFn)(result, res, req);
+      const result = isSseHandler ? resultOrDeferred : await resultOrDeferred;
+      await (fnHandleResponse as HandlerResponseBasicFn)(
+        result,
+        res,
+        req,
+        handlerObservable$,
+        handlerStreams,
+      );
     };
   }
 
@@ -227,17 +343,18 @@ export class RouterExecutionContext {
       isResponseHandled,
       httpRedirectResponse,
     );
+    const isSseHandler = !!this.reflectSse(callback);
 
     const httpCode = this.reflectHttpStatusCode(callback);
-    const httpStatusCode = httpCode
-      ? httpCode
-      : this.responseController.getStatusByMethod(requestMethod);
+    const httpStatusCode =
+      httpCode ?? this.responseController.getStatusByMethod(requestMethod);
 
     const responseHeaders = this.reflectResponseHeaders(callback);
-    const hasCustomHeaders = !isEmpty(responseHeaders);
+    const hasCustomHeaders = !isEmptyArray(responseHeaders);
     const handlerMetadata: HandlerMetadata = {
       argsLength,
       fnHandleResponse,
+      isSseHandler,
       paramtypes,
       getParamsMetadata,
       httpStatusCode,
@@ -276,6 +393,15 @@ export class RouterExecutionContext {
     return Reflect.getMetadata(SSE_METADATA, callback);
   }
 
+  public reflectSseOptions(
+    callback: (...args: unknown[]) => unknown,
+  ): SseOptions | undefined {
+    // Check the namespace, since a named import fails with an older common.
+    return 'SSE_OPTIONS_METADATA' in commonInternal
+      ? Reflect.getMetadata(commonInternal.SSE_OPTIONS_METADATA, callback)
+      : undefined;
+  }
+
   public exchangeKeysForValues(
     keys: string[],
     metadata: Record<number, RouteParamMetadata>,
@@ -287,7 +413,7 @@ export class RouterExecutionContext {
     this.pipesContextCreator.setModuleContext(moduleContext);
 
     return keys.map(key => {
-      const { index, data, pipes: pipesCollection } = metadata[key];
+      const { index, data, pipes: pipesCollection, schema } = metadata[key];
       const pipes = this.pipesContextCreator.createConcreteContext(
         pipesCollection,
         contextId,
@@ -295,14 +421,21 @@ export class RouterExecutionContext {
       );
       const type = this.contextUtils.mapParamType(key);
 
-      if (key.includes(CUSTOM_ROUTE_AGRS_METADATA)) {
+      if (key.includes(CUSTOM_ROUTE_ARGS_METADATA)) {
         const { factory } = metadata[key];
         const customExtractValue = this.contextUtils.getCustomFactory(
           factory,
           data,
-          contextFactory,
+          contextFactory!,
         );
-        return { index, extractValue: customExtractValue, type, data, pipes };
+        return {
+          index,
+          extractValue: customExtractValue,
+          type,
+          data,
+          pipes,
+          schema,
+        };
       }
       const numericType = Number(type);
       const extractValue = <TRequest, TResponse>(
@@ -311,29 +444,21 @@ export class RouterExecutionContext {
         next: Function,
       ) =>
         this.paramsFactory.exchangeKeyForValue(numericType, data, {
-          req,
+          req: req as Record<string, any>,
           res,
           next,
         });
-      return { index, extractValue, type: numericType, data, pipes };
+      return { index, extractValue, type: numericType, data, pipes, schema };
     });
   }
 
   public async getParamValue<T>(
     value: T,
-    {
-      metatype,
-      type,
-      data,
-    }: { metatype: unknown; type: RouteParamtypes; data: unknown },
+    metadata: ArgumentMetadata,
     pipes: PipeTransform[],
   ): Promise<unknown> {
-    if (!isEmpty(pipes)) {
-      return this.pipesConsumer.apply(
-        value,
-        { metatype, type, data } as any,
-        pipes,
-      );
+    if (!isEmptyArray(pipes)) {
+      return this.pipesConsumer.apply(value, metadata, pipes);
     }
     return value;
   }
@@ -341,8 +466,13 @@ export class RouterExecutionContext {
   public isPipeable(type: number | string): boolean {
     return (
       type === RouteParamtypes.BODY ||
+      type === RouteParamtypes.RAW_BODY ||
       type === RouteParamtypes.QUERY ||
       type === RouteParamtypes.PARAM ||
+      type === RouteParamtypes.FILE ||
+      type === RouteParamtypes.FILES ||
+      type === RouteParamtypes.COOKIES ||
+      type === RouteParamtypes.SIGNED_COOKIES ||
       isString(type)
     );
   }
@@ -352,7 +482,7 @@ export class RouterExecutionContext {
     instance: Controller,
     callback: (...args: any[]) => any,
     contextType?: TContext,
-  ): (args: any[]) => Promise<void> | null {
+  ): ((args: any[]) => Promise<void>) | null {
     const canActivateFn = async (args: any[]) => {
       const canActivate = await this.guardsConsumer.tryActivate<TContext>(
         guards,
@@ -371,37 +501,88 @@ export class RouterExecutionContext {
   public createPipesFn(
     pipes: PipeTransform[],
     paramsOptions: (ParamProperties & { metatype?: any })[],
-  ) {
-    const pipesFn = async <TRequest, TResponse>(
+  ):
+    | (<TRequest, TResponse>(
+        args: any[],
+        req: TRequest,
+        res: TResponse,
+        next: Function,
+      ) => Promise<unknown> | undefined)
+    | null {
+    if (!paramsOptions.length) {
+      return null;
+    }
+    // Which pipes a param runs through is fixed for the route, so it is
+    // worked out once here rather than on every request.
+    const params = paramsOptions.map(
+      ({
+        index,
+        extractValue,
+        type,
+        data,
+        metatype,
+        pipes: paramPipes,
+        schema,
+      }) => {
+        const isPipeable = this.isPipeable(type);
+        return {
+          index,
+          extractValue,
+          isPipeable,
+          metadata: { metatype, type, data, schema } as ArgumentMetadata,
+          pipes: isPipeable ? pipes.concat(paramPipes) : [],
+        };
+      },
+    );
+
+    const applyPipes = async (
+      args: any[],
+      param: (typeof params)[number],
+      value: unknown,
+    ) => {
+      args[param.index] = await this.getParamValue(
+        value,
+        param.metadata,
+        param.pipes,
+      );
+    };
+
+    return <TRequest, TResponse>(
       args: any[],
       req: TRequest,
       res: TResponse,
       next: Function,
     ) => {
-      const resolveParamValue = async (
-        param: ParamProperties & { metatype?: any },
-      ) => {
-        const {
-          index,
-          extractValue,
-          type,
-          data,
-          metatype,
-          pipes: paramPipes,
-        } = param;
-        const value = extractValue(req, res, next);
-
-        args[index] = this.isPipeable(type)
-          ? await this.getParamValue(
-              value,
-              { metatype, type, data } as any,
-              pipes.concat(paramPipes),
-            )
-          : value;
-      };
-      await Promise.all(paramsOptions.map(resolveParamValue));
+      // A value no pipe runs on is final once extracted and needs no promise,
+      // unless it is a thenable on a pipeable param, which getParamValue() has
+      // always settled. The response, which a custom decorator can give the
+      // handler as @Res() does, is passed on unchanged, with no pipe run on
+      // it, whatever the adapter: the then() of a Fastify reply waits for the
+      // response to be sent, so settling it, or any pipe that returns it,
+      // would wait for an answer the handler has yet to give. The rest, and
+      // any extractor that throws, go through one Promise.all() in param
+      // order, as before: pipes start in the same order and the first error
+      // is the same one.
+      let pending: Promise<void>[] | undefined;
+      for (let i = 0; i < params.length; i++) {
+        const param = params[i];
+        try {
+          const value = param.extractValue(req, res, next);
+          if (
+            param.isPipeable &&
+            (param.pipes.length > 0 || isThenable(value)) &&
+            value !== res
+          ) {
+            (pending ??= []).push(applyPipes(args, param, value));
+          } else {
+            args[param.index] = value;
+          }
+        } catch (err) {
+          (pending ??= []).push(Promise.reject(err));
+        }
+      }
+      return pending && Promise.all(pending);
     };
-    return paramsOptions.length ? pipesFn : null;
   }
 
   public createHandleResponseFn(
@@ -413,37 +594,260 @@ export class RouterExecutionContext {
     const renderTemplate = this.reflectRenderTemplate(callback);
     if (renderTemplate) {
       return async <TResult, TResponse>(result: TResult, res: TResponse) => {
-        await this.responseController.render(result, res, renderTemplate);
+        return await this.responseController.render(
+          result,
+          res,
+          renderTemplate,
+        );
       };
     }
-    if (redirectResponse && typeof redirectResponse.url === 'string') {
+    if (redirectResponse && isString(redirectResponse.url)) {
       return async <TResult, TResponse>(result: TResult, res: TResponse) => {
         await this.responseController.redirect(result, res, redirectResponse);
       };
     }
     const isSseHandler = !!this.reflectSse(callback);
     if (isSseHandler) {
+      const maxPendingDataLength =
+        this.reflectSseOptions(callback)?.maxPendingDataLength;
       return async <
         TResult extends Observable<unknown> = any,
         TResponse extends HeaderStream = any,
-        TRequest extends IncomingMessage = any
+        TRequest extends IncomingMessage = any,
       >(
         result: TResult,
         res: TResponse,
         req: TRequest,
       ) => {
+        const rawResponse = (res as { raw?: TResponse }).raw ?? res;
         await this.responseController.sse(
           result,
-          (res as any).raw || res,
+          rawResponse,
           (req as any).raw || req,
+          {
+            additionalHeaders: () => res.getHeaders?.(),
+            statusCode: () => res.statusCode ?? rawResponse.statusCode,
+            maxPendingDataLength,
+          },
         );
       };
     }
-    return async <TResult, TResponse>(result: TResult, res: TResponse) => {
-      result = await this.responseController.transformToResult(result);
-      !isResponseHandled &&
-        (await this.responseController.apply(result, res, httpStatusCode));
+    return async <TResult, TResponse>(
+      result: TResult,
+      res: TResponse,
+      req?: unknown,
+      handlerObservable$?: HandlerObservableNotifier,
+      handlerStreams: HandlerStream[] = [],
+    ) => {
+      let disconnected = false;
+      try {
+        if (isObservable(result)) {
+          // Only an Observable returned by the route handler itself is torn
+          // down when the client goes away. Without interceptors, `result` is
+          // that Observable; otherwise `handlerObservable$` reports it.
+          const disconnect$ = this.fromClientDisconnect(
+            req,
+            res,
+            () => {
+              disconnected = true;
+            },
+            handlerObservable$,
+          );
+          result = result.pipe(
+            // What it emits waits for it to complete. Without interceptors, it
+            // is the handler's own Observable, whose streams are tracked here.
+            tap(value =>
+              handlerObservable$
+                ? listenForStreamError(value)
+                : this.trackHandlerStream(value, handlerStreams),
+            ),
+            takeUntil(disconnect$),
+          ) as TResult;
+        }
+        result = await this.responseController.transformToResult(result);
+      } catch (err) {
+        // `takeUntil` completes the stream on disconnect, so `lastValueFrom`
+        // rejects with an `EmptyError` if nothing was emitted yet. Any other
+        // error still goes to the exception filters.
+        if (!disconnected || !(err instanceof EmptyError)) {
+          // An interceptor failed with a stream of the handler still in hand
+          handlerStreams.forEach(destroyUnsentBody);
+          throw err;
+        }
+      }
+      if (disconnected) {
+        // Nothing is sent to a client that is gone. The stream of a
+        // StreamableFile would otherwise hold what it reads from (e.g. an
+        // open file) for good, also one the handler emitted that an
+        // interceptor held when the chain was torn down.
+        [result, ...handlerStreams].forEach(destroyUnsentBody);
+        return res;
+      }
+      if (!isResponseHandled) {
+        const streamingBody = this.pickStreamingBody(result, handlerStreams);
+        // A stream of the handler that an interceptor replaced (e.g. with an
+        // empty 304, or a stream of its own) is not sent either. What is sent
+        // in its place may still read from it, so it is released once the
+        // response is over.
+        this.releaseOnceResponseIsOver(
+          handlerStreams.filter(
+            stream => stream !== result && stream !== streamingBody,
+          ),
+          req,
+          res,
+        );
+        try {
+          await (streamingBody
+            ? this.responseController.stream(streamingBody, res, req, {
+                statusCode: httpStatusCode,
+              })
+            : this.responseController.apply(result, res, httpStatusCode));
+        } catch (err) {
+          // Not sent either, e.g. for a header value Node.js rejects
+          [result, streamingBody, ...handlerStreams].forEach(destroyUnsentBody);
+          throw err;
+        }
+      }
+      return res;
     };
+  }
+
+  /**
+   * The stream to send, if any: the one the interceptors handed back, or the
+   * one in the plain object they wrapped it in (`{ data: stream }`), which
+   * cannot go out that way, unless they read it to build their own result. It
+   * is never the handler's own in place of what they returned: they may have
+   * replaced it with a stream that leaves something out, or with something
+   * that is not a stream (a notice, nothing at all), which is sent as it is.
+   */
+  private pickStreamingBody(
+    result: unknown,
+    handlerStreams: HandlerStream[],
+  ): StreamingBody | undefined {
+    if (isStreamingBody(result)) {
+      return result;
+    }
+    // Only for a handler that streams: other routes serialize such an object
+    if (!isPlainObject(result) || !handlerStreams.some(isStreamingBody)) {
+      return undefined;
+    }
+    const wrappedBody = Object.values(result).find(isStreamingBody);
+    return wrappedBody && !isStreamingBodyConsumed(wrappedBody)
+      ? wrappedBody
+      : undefined;
+  }
+
+  /**
+   * Releases streams that are not sent once the response is over: sent, or
+   * its connection closed. The connection is watched as well, since a
+   * pipelined response that still waits for its turn never learns that it is
+   * gone.
+   */
+  private releaseOnceResponseIsOver(
+    streams: HandlerStream[],
+    req: any,
+    res: any,
+  ) {
+    if (isEmptyArray(streams)) {
+      return;
+    }
+    const response = res?.raw ?? res;
+    const connection = pickCloseSource((req?.raw ?? req)?.socket, response);
+    let isReleased = false;
+    let stopWaitingForClose: (() => void) | undefined;
+    const release = () => {
+      if (isReleased) {
+        return;
+      }
+      isReleased = true;
+      stopWaitingForClose?.();
+      streams.forEach(destroyUnsentBody);
+    };
+    if (connection?.destroyed) {
+      return release();
+    }
+    stopWaitingForClose = connection && onceClosed(connection, release);
+    // `finished()` throws for anything but a stream
+    if (response instanceof Stream) {
+      finished(response as Writable, release);
+    }
+  }
+
+  private trackHandlerStream(value: unknown, handlerStreams: HandlerStream[]) {
+    if (value instanceof StreamableFile) {
+      handlerStreams.push(value);
+    } else if (isStreamingBody(value)) {
+      handlerStreams.push(value);
+      // An 'error' emitted while an interceptor awaits, before anything
+      // listens, would bring the process down.
+      listenForStreamError(value);
+    }
+  }
+
+  private observeHandlerResult(
+    result: unknown,
+    handlerObservable$: RouteHandlerObservableNotifier,
+    handlerStreams: HandlerStream[],
+  ) {
+    if (isObservable(result)) {
+      handlerObservable$.next();
+    } else {
+      this.trackHandlerStream(result, handlerStreams);
+    }
+  }
+
+  /**
+   * Emits once the client connection closes, or right away if it already has.
+   * With interceptors, watching starts only once the route handler itself
+   * produces an Observable, and starts over each time it does (e.g. on a
+   * retry). Picks the close source the same way `RouterResponseController#sse()`
+   * does, so the two disconnect watchers cannot drift apart.
+   */
+  private fromClientDisconnect(
+    req: any,
+    res: any,
+    onDisconnect: () => void,
+    handlerObservable$?: HandlerObservableNotifier,
+  ): Observable<void> {
+    const watch = (subscriber: Subscriber<void>) => {
+      const source = pickCloseSource(
+        (req?.raw ?? req)?.socket,
+        res?.raw ?? res,
+      );
+      if (!source) {
+        return;
+      }
+      const disconnect = () => {
+        onDisconnect();
+        subscriber.next();
+      };
+      if (source.destroyed) {
+        disconnect();
+        return;
+      }
+      return onceClosed(source, disconnect);
+    };
+    if (!handlerObservable$) {
+      return new Observable(watch);
+    }
+    return new Observable<void>(subscriber => {
+      let stopWatching: (() => void) | undefined;
+      return handlerObservable$.subscribe(() => {
+        if (subscriber.closed) {
+          return;
+        }
+        try {
+          if (stopWatching) {
+            subscriber.remove(stopWatching);
+            stopWatching();
+          }
+          stopWatching = watch(subscriber);
+          subscriber.add(stopWatching);
+        } catch (err) {
+          subscriber.error(err);
+        }
+      });
+    });
   }
 
   private isResponseHandled(
@@ -460,5 +864,22 @@ export class RouterExecutionContext {
       methodName,
     );
     return hasResponseOrNextDecorator && !isPassthroughEnabled;
+  }
+
+  private attachSseAbortSignal<TRequest>(req: TRequest): void {
+    const carrier = req as TRequest & {
+      raw?: unknown;
+      [SSE_ABORT_CONTROLLER]?: AbortController;
+    };
+    // Attach to both the framework request and its raw form (when present), since
+    // @SseSignal() reads from the execution-context request while
+    // RouterResponseController.sse() operates on the raw request.
+    if (!carrier[SSE_ABORT_CONTROLLER]) {
+      carrier[SSE_ABORT_CONTROLLER] = new AbortController();
+    }
+    if (carrier.raw && !(carrier.raw as object)[SSE_ABORT_CONTROLLER]) {
+      (carrier.raw as object)[SSE_ABORT_CONTROLLER] =
+        carrier[SSE_ABORT_CONTROLLER];
+    }
   }
 }

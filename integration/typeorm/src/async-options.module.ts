@@ -1,21 +1,20 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
-import { Photo } from './photo/photo.entity';
-import { PhotoModule } from './photo/photo.module';
+import { Photo } from './photo/photo.entity.js';
+import { PhotoModule } from './photo/photo.module.js';
 
 @Module({
   imports: [
     TypeOrmModule.forRootAsync({
       useFactory: () => ({
         type: 'mysql',
-        host: 'localhost',
+        host: '127.0.0.1',
         port: 3306,
         username: 'root',
         password: 'root',
         database: 'test',
         entities: [Photo],
         synchronize: true,
-        keepConnectionAlive: true,
         retryAttempts: 2,
         retryDelay: 1000,
       }),

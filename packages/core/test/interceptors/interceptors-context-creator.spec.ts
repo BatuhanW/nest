@@ -1,9 +1,7 @@
-import { expect } from 'chai';
 import { of } from 'rxjs';
-import * as sinon from 'sinon';
-import { ApplicationConfig } from '../../application-config';
-import { InstanceWrapper } from '../../injector/instance-wrapper';
-import { InterceptorsContextCreator } from '../../interceptors/interceptors-context-creator';
+import { ApplicationConfig } from '../../application-config.js';
+import { InstanceWrapper } from '../../injector/instance-wrapper.js';
+import { InterceptorsContextCreator } from '../../interceptors/interceptors-context-creator.js';
 
 class Interceptor {}
 
@@ -12,19 +10,26 @@ describe('InterceptorsContextCreator', () => {
   let interceptors: any[];
   let applicationConfig: ApplicationConfig;
   let container: any;
-  let getSpy: sinon.SinonSpy;
+  let getSpy: ReturnType<typeof vi.fn>;
+
+  class Interceptor1 {}
+  class Interceptor2 {}
 
   beforeEach(() => {
     interceptors = [
       {
-        name: 'test',
+        name: Interceptor1.name,
+        token: Interceptor1,
+        metatype: Interceptor1,
         getInstanceByContextId: () => interceptors[0],
         instance: {
           intercept: () => of(true),
         },
       },
       {
-        name: 'test2',
+        name: Interceptor2.name,
+        token: Interceptor2,
+        metatype: Interceptor2,
         getInstanceByContextId: () => interceptors[1],
         instance: {
           intercept: () => of(true),
@@ -33,10 +38,10 @@ describe('InterceptorsContextCreator', () => {
       {},
       undefined,
     ];
-    getSpy = sinon.stub().returns({
+    getSpy = vi.fn().mockReturnValue({
       injectables: new Map([
-        ['test', interceptors[0]],
-        ['test2', interceptors[1]],
+        [Interceptor1, interceptors[0]],
+        [Interceptor2, interceptors[1]],
       ]),
     });
     container = {
@@ -46,17 +51,16 @@ describe('InterceptorsContextCreator', () => {
     };
     applicationConfig = new ApplicationConfig();
     interceptorsContextCreator = new InterceptorsContextCreator(
-      container as any,
+      container,
       applicationConfig,
     );
   });
   describe('createConcreteContext', () => {
     describe('when `moduleContext` is nil', () => {
-      it('should returns empty array', () => {
-        const result = interceptorsContextCreator.createConcreteContext(
-          interceptors,
-        );
-        expect(result).to.be.empty;
+      it('should return empty array', () => {
+        const result =
+          interceptorsContextCreator.createConcreteContext(interceptors);
+        expect(result).toHaveLength(0);
       });
     });
     describe('when `moduleContext` is defined', () => {
@@ -64,9 +68,30 @@ describe('InterceptorsContextCreator', () => {
         interceptorsContextCreator['moduleContext'] = 'test';
       });
       it('should filter metatypes', () => {
+        const interceptorTypeRefs = [
+          interceptors[0].metatype,
+          interceptors[1].instance,
+        ];
         expect(
-          interceptorsContextCreator.createConcreteContext(interceptors),
-        ).to.have.length(2);
+          interceptorsContextCreator.createConcreteContext(interceptorTypeRefs),
+        ).toHaveLength(2);
+      });
+      it('should keep classes without a name', () => {
+        const AnonymousInterceptor = (() => class {})();
+        const wrapper = {
+          instance: { intercept: () => of(true) },
+          getInstanceByContextId: () => wrapper,
+        };
+        getSpy.mockReturnValue({
+          injectables: new Map([[AnonymousInterceptor, wrapper]]),
+        });
+
+        expect(AnonymousInterceptor.name).toBe('');
+        expect(
+          interceptorsContextCreator.createConcreteContext([
+            AnonymousInterceptor,
+          ]),
+        ).toEqual([wrapper.instance]);
       });
     });
   });
@@ -74,10 +99,10 @@ describe('InterceptorsContextCreator', () => {
   describe('getInterceptorInstance', () => {
     describe('when param is an object', () => {
       it('should return instance', () => {
-        const instance = { intercept: () => null };
+        const instance = { intercept: () => null! };
         expect(
           interceptorsContextCreator.getInterceptorInstance(instance),
-        ).to.be.eql(instance);
+        ).toEqual(instance);
       });
     });
     describe('when param is a constructor', () => {
@@ -86,20 +111,78 @@ describe('InterceptorsContextCreator', () => {
           instance: 'test',
           getInstanceByContextId: () => wrapper,
         } as any;
-        sinon
-          .stub(interceptorsContextCreator, 'getInstanceByMetatype')
-          .callsFake(() => wrapper);
+        vi.spyOn(
+          interceptorsContextCreator,
+          'getInstanceByMetatype',
+        ).mockImplementation(() => wrapper);
         expect(
           interceptorsContextCreator.getInterceptorInstance(Interceptor),
-        ).to.be.eql(wrapper.instance);
+        ).toEqual(wrapper.instance);
+      });
+      it('should pick the instance from the container when the class also has a static "intercept"', () => {
+        class WithStatic {
+          static intercept() {
+            return 'static';
+          }
+          intercept() {
+            return 'instance';
+          }
+        }
+        const wrapper = {
+          instance: new WithStatic(),
+          getInstanceByContextId: () => wrapper,
+        };
+        vi.spyOn(
+          interceptorsContextCreator,
+          'getInstanceByMetatype',
+        ).mockImplementation(() => wrapper as any);
+        expect(
+          interceptorsContextCreator.getInterceptorInstance(WithStatic),
+        ).toBe(wrapper.instance);
+      });
+      it('should throw when Nest constructed the class and it has no "intercept"', () => {
+        class AbstractEnhancer {}
+        const wrapper = {
+          instance: new AbstractEnhancer(),
+          isConstructorCalled: true,
+          getInstanceByContextId: () => wrapper,
+        };
+        vi.spyOn(
+          interceptorsContextCreator,
+          'getInstanceByMetatype',
+        ).mockImplementation(() => wrapper as any);
+        expect(() =>
+          interceptorsContextCreator.getInterceptorInstance(AbstractEnhancer),
+        ).toThrow(
+          /The interceptor \(class AbstractEnhancer\) doesn't provide the "intercept" method/,
+        );
+      });
+      it('should return the class when only the class has a "intercept"', () => {
+        class StaticOnly {
+          static intercept() {
+            return 'static';
+          }
+        }
+        const wrapper = {
+          instance: new StaticOnly(),
+          getInstanceByContextId: () => wrapper,
+        };
+        vi.spyOn(
+          interceptorsContextCreator,
+          'getInstanceByMetatype',
+        ).mockImplementation(() => wrapper as any);
+        expect(
+          interceptorsContextCreator.getInterceptorInstance(StaticOnly),
+        ).toBe(StaticOnly);
       });
       it('should return null', () => {
-        sinon
-          .stub(interceptorsContextCreator, 'getInstanceByMetatype')
-          .callsFake(() => null);
+        vi.spyOn(
+          interceptorsContextCreator,
+          'getInstanceByMetatype',
+        ).mockImplementation(() => null!);
         expect(
           interceptorsContextCreator.getInterceptorInstance(Interceptor),
-        ).to.be.eql(null);
+        ).toEqual(null);
       });
     });
   });
@@ -108,8 +191,9 @@ describe('InterceptorsContextCreator', () => {
     describe('when "moduleContext" is nil', () => {
       it('should return undefined', () => {
         (interceptorsContextCreator as any).moduleContext = undefined;
-        expect(interceptorsContextCreator.getInstanceByMetatype(null)).to.be
-          .undefined;
+        expect(
+          interceptorsContextCreator.getInstanceByMetatype(null!),
+        ).toBeUndefined();
       });
     });
     describe('when "moduleContext" is not nil', () => {
@@ -119,8 +203,9 @@ describe('InterceptorsContextCreator', () => {
 
       describe('and when module exists', () => {
         it('should return undefined', () => {
-          expect(interceptorsContextCreator.getInstanceByMetatype({})).to.be
-            .undefined;
+          expect(
+            interceptorsContextCreator.getInstanceByMetatype(class {}),
+          ).toBeUndefined();
         });
       });
     });
@@ -130,7 +215,7 @@ describe('InterceptorsContextCreator', () => {
     describe('when contextId is static and inquirerId is nil', () => {
       it('should return global interceptors', () => {
         const expectedResult = applicationConfig.getGlobalInterceptors();
-        expect(interceptorsContextCreator.getGlobalMetadata()).to.be.equal(
+        expect(interceptorsContextCreator.getGlobalMetadata()).toBe(
           expectedResult,
         );
       });
@@ -142,19 +227,20 @@ describe('InterceptorsContextCreator', () => {
         const instance = 'request-scoped';
         const scopedInterceptorWrappers = [instanceWrapper];
 
-        sinon
-          .stub(applicationConfig, 'getGlobalInterceptors')
-          .callsFake(() => globalInterceptors);
-        sinon
-          .stub(applicationConfig, 'getGlobalRequestInterceptors')
-          .callsFake(() => scopedInterceptorWrappers);
-        sinon
-          .stub(instanceWrapper, 'getInstanceByContextId')
-          .callsFake(() => ({ instance } as any));
+        vi.spyOn(applicationConfig, 'getGlobalInterceptors').mockImplementation(
+          () => globalInterceptors,
+        );
+        vi.spyOn(
+          applicationConfig,
+          'getGlobalRequestInterceptors',
+        ).mockImplementation(() => scopedInterceptorWrappers);
+        vi.spyOn(instanceWrapper, 'getInstanceByContextId').mockImplementation(
+          () => ({ instance }) as any,
+        );
 
-        expect(
-          interceptorsContextCreator.getGlobalMetadata({ id: 3 }),
-        ).to.contains(instance, ...globalInterceptors);
+        expect(interceptorsContextCreator.getGlobalMetadata({ id: 3 })).toEqual(
+          expect.arrayContaining([instance, ...globalInterceptors]),
+        );
       });
     });
   });

@@ -1,8 +1,8 @@
-import { Scope } from '@nestjs/common';
-import { expect } from 'chai';
-import * as sinon from 'sinon';
-import { STATIC_CONTEXT } from '../../injector/constants';
-import { InstanceWrapper } from '../../injector/instance-wrapper';
+import { Injectable, Scope } from '@nestjs/common';
+import { getClassRef } from '../../helpers/class-ref-registry.js';
+import { createContextId } from '../../helpers/index.js';
+import { STATIC_CONTEXT } from '../../injector/constants.js';
+import { InstanceWrapper } from '../../injector/instance-wrapper.js';
 
 class TestClass {}
 
@@ -17,35 +17,256 @@ describe('InstanceWrapper', () => {
     it('should assign partial', () => {
       const instance = new InstanceWrapper(partial);
 
-      expect(instance.name).to.be.eql(partial.name);
-      expect(instance.scope).to.be.eql(partial.scope);
-      expect(instance.metatype).to.be.eql(partial.metatype);
+      expect(instance.name).toEqual(partial.name);
+      expect(instance.scope).toEqual(partial.scope);
+      expect(instance.metatype).toEqual(partial.metatype);
     });
     it('should set instance by context id', () => {
       const instance = new InstanceWrapper(partial);
 
-      expect(
-        instance.getInstanceByContextId(STATIC_CONTEXT).instance,
-      ).to.be.eql(partial.instance);
+      expect(instance.getInstanceByContextId(STATIC_CONTEXT).instance).toEqual(
+        partial.instance,
+      );
+    });
+    it('should register the metatype as the class of its instances', () => {
+      class Mixin {}
+      class Host {}
+      Host.prototype.constructor = Mixin;
+
+      new InstanceWrapper({ metatype: Host });
+      expect(getClassRef(new Host())).toBe(Host);
     });
   });
 
   describe('isDependencyTreeStatic', () => {
+    describe('when circular reference', () => {
+      it('should return true', () => {
+        const wrapper = new InstanceWrapper();
+        const otherWrapper = new InstanceWrapper();
+        wrapper.addCtorMetadata(0, otherWrapper);
+        otherWrapper.addCtorMetadata(0, wrapper);
+        expect(wrapper.isDependencyTreeStatic()).toBe(true);
+        expect(otherWrapper.isDependencyTreeStatic()).toBe(true);
+      });
+    });
+    describe('when circular reference and one non static', () => {
+      it('should return false', () => {
+        const wrapper = new InstanceWrapper();
+        const otherWrapper = new InstanceWrapper({ scope: Scope.REQUEST });
+        wrapper.addCtorMetadata(0, otherWrapper);
+        otherWrapper.addCtorMetadata(0, wrapper);
+        expect(wrapper.isDependencyTreeStatic()).toBe(false);
+        expect(otherWrapper.isDependencyTreeStatic()).toBe(false);
+      });
+    });
+    describe('when circular reference and one durable', () => {
+      it('should return false', () => {
+        const wrapper = new InstanceWrapper();
+        const otherWrapper = new InstanceWrapper({
+          scope: Scope.REQUEST,
+          durable: true,
+        });
+        wrapper.addCtorMetadata(0, otherWrapper);
+        otherWrapper.addCtorMetadata(0, wrapper);
+        expect(wrapper.isDependencyTreeStatic()).toBe(false);
+        expect(otherWrapper.isDependencyTreeStatic()).toBe(false);
+      });
+    });
+    describe('when circular reference and non static dependency is visited last', () => {
+      it('should return false', () => {
+        const wrapper = new InstanceWrapper();
+        const otherWrapper = new InstanceWrapper();
+        wrapper.addCtorMetadata(0, otherWrapper);
+        wrapper.addCtorMetadata(
+          1,
+          new InstanceWrapper({ scope: Scope.REQUEST }),
+        );
+        otherWrapper.addCtorMetadata(0, wrapper);
+        expect(wrapper.isDependencyTreeStatic()).toBe(false);
+        expect(otherWrapper.isDependencyTreeStatic()).toBe(false);
+      });
+    });
     describe('when request scoped', () => {
       it('should return false', () => {
         const wrapper = new InstanceWrapper({
           scope: Scope.REQUEST,
         });
-        expect(wrapper.isDependencyTreeStatic()).to.be.false;
+        expect(wrapper.isDependencyTreeStatic()).toBe(false);
+      });
+    });
+    describe('when request scoped durable', () => {
+      it('should return false', () => {
+        const wrapper = new InstanceWrapper({
+          scope: Scope.REQUEST,
+          durable: true,
+        });
+        expect(wrapper.isDependencyTreeStatic()).toBe(false);
+      });
+    });
+    describe('when request scoped explicit non durable', () => {
+      it('should return false', () => {
+        const wrapper = new InstanceWrapper({
+          scope: Scope.REQUEST,
+          durable: false,
+        });
+        expect(wrapper.isDependencyTreeStatic()).toBe(false);
+      });
+    });
+    describe('when default', () => {
+      it('should return true', () => {
+        const wrapper = new InstanceWrapper({});
+        expect(wrapper.isDependencyTreeStatic()).toBe(true);
+      });
+      it('should recompute when dependencies are added after static introspection', () => {
+        const wrapper = new InstanceWrapper({});
+        expect(wrapper.isDependencyTreeStatic()).toBe(true);
+
+        wrapper.addCtorMetadata(
+          0,
+          new InstanceWrapper({
+            scope: Scope.REQUEST,
+          }),
+        );
+
+        expect(wrapper.isDependencyTreeStatic()).toBe(false);
+      });
+      it('should recompute when transitive dependencies change after static introspection', () => {
+        const wrapper = new InstanceWrapper({});
+        const dependency = new InstanceWrapper({});
+        wrapper.addCtorMetadata(0, dependency);
+        expect(wrapper.isDependencyTreeStatic()).toBe(true);
+
+        dependency.addCtorMetadata(
+          0,
+          new InstanceWrapper({
+            scope: Scope.REQUEST,
+          }),
+        );
+
+        expect(wrapper.isDependencyTreeStatic()).toBe(false);
+      });
+      it('should recompute when a deep transitive dependency changes after static introspection', () => {
+        const wrapper = new InstanceWrapper({});
+        const dependency = new InstanceWrapper({});
+        const nestedDependency = new InstanceWrapper({});
+        wrapper.addCtorMetadata(0, dependency);
+        dependency.addCtorMetadata(0, nestedDependency);
+        expect(wrapper.isDependencyTreeStatic()).toBe(true);
+
+        nestedDependency.addCtorMetadata(
+          0,
+          new InstanceWrapper({
+            scope: Scope.REQUEST,
+          }),
+        );
+
+        expect(dependency.isDependencyTreeStatic()).toBe(false);
+        expect(wrapper.isDependencyTreeStatic()).toBe(false);
+      });
+      it('should recompute when a transitive dependency changes after a non-static introspection skipped it', () => {
+        const wrapper = new InstanceWrapper({});
+        const requestScoped = new InstanceWrapper({ scope: Scope.REQUEST });
+        const dependency = new InstanceWrapper({});
+        wrapper.addCtorMetadata(0, requestScoped);
+        wrapper.addCtorMetadata(1, dependency);
+        expect(wrapper.isDependencyTreeStatic()).toBe(false);
+
+        dependency.addCtorMetadata(0, new InstanceWrapper({}));
+
+        expect(dependency.isDependencyTreeStatic()).toBe(true);
+        expect(wrapper.isDependencyTreeStatic()).toBe(false);
+
+        dependency.addCtorMetadata(
+          1,
+          new InstanceWrapper({
+            scope: Scope.REQUEST,
+          }),
+        );
+
+        expect(dependency.isDependencyTreeStatic()).toBe(false);
+      });
+      it('should not reset ancestors when the same dependency is added again at the same index', () => {
+        const wrapper = new InstanceWrapper({});
+        const dependency = new InstanceWrapper({});
+        wrapper.addCtorMetadata(0, dependency);
+        expect(wrapper.isDependencyTreeStatic()).toBe(true);
+
+        const resetSpy = vi.spyOn(
+          InstanceWrapper.prototype as any,
+          'resetDependencyTreeState',
+        );
+        try {
+          wrapper.addCtorMetadata(0, dependency);
+          expect(resetSpy).not.toHaveBeenCalled();
+        } finally {
+          resetSpy.mockRestore();
+        }
+        expect(wrapper.isDependencyTreeStatic()).toBe(true);
+      });
+      it('should stop the ancestor walk at wrappers that were never introspected', () => {
+        const root = new InstanceWrapper({});
+        const middle = new InstanceWrapper({});
+        const leaf = new InstanceWrapper({});
+        root.addCtorMetadata(0, middle);
+        middle.addCtorMetadata(0, leaf);
+
+        const resetSpy = vi.spyOn(
+          InstanceWrapper.prototype as any,
+          'resetDependencyTreeState',
+        );
+        try {
+          leaf.addCtorMetadata(0, new InstanceWrapper({}));
+          expect(resetSpy).toHaveBeenCalledTimes(1);
+        } finally {
+          resetSpy.mockRestore();
+        }
+        expect(root.isDependencyTreeStatic()).toBe(true);
       });
     });
     describe('when statically scoped', () => {
+      describe('dependencies, properties, enhancers', () => {
+        describe('dependencies non static, properties static, enhancers static', () => {
+          it('should return false', () => {
+            const wrapper = new InstanceWrapper();
+            wrapper.addCtorMetadata(
+              0,
+              new InstanceWrapper({ scope: Scope.REQUEST }),
+            );
+            wrapper.addPropertiesMetadata('key1', new InstanceWrapper());
+            wrapper.addEnhancerMetadata(new InstanceWrapper());
+            expect(wrapper.isDependencyTreeStatic()).toBe(false);
+          });
+        });
+        describe('dependencies static, properties non static, enhancers static', () => {
+          it('should return false', () => {
+            const wrapper = new InstanceWrapper();
+            wrapper.addCtorMetadata(0, new InstanceWrapper());
+            wrapper.addPropertiesMetadata(
+              'key1',
+              new InstanceWrapper({ scope: Scope.REQUEST }),
+            );
+            wrapper.addEnhancerMetadata(new InstanceWrapper());
+            expect(wrapper.isDependencyTreeStatic()).toBe(false);
+          });
+        });
+        describe('dependencies static, properties static, enhancers non static', () => {
+          it('should return false', () => {
+            const wrapper = new InstanceWrapper();
+            wrapper.addCtorMetadata(0, new InstanceWrapper());
+            wrapper.addPropertiesMetadata('key1', new InstanceWrapper());
+            wrapper.addEnhancerMetadata(
+              new InstanceWrapper({ scope: Scope.REQUEST }),
+            );
+            expect(wrapper.isDependencyTreeStatic()).toBe(false);
+          });
+        });
+      });
       describe('dependencies', () => {
         describe('when each is static', () => {
           it('should return true', () => {
             const wrapper = new InstanceWrapper();
             wrapper.addCtorMetadata(0, new InstanceWrapper());
-            expect(wrapper.isDependencyTreeStatic()).to.be.true;
+            expect(wrapper.isDependencyTreeStatic()).toBe(true);
           });
         });
         describe('when one is not static', () => {
@@ -58,7 +279,7 @@ describe('InstanceWrapper', () => {
                 scope: Scope.REQUEST,
               }),
             );
-            expect(wrapper.isDependencyTreeStatic()).to.be.false;
+            expect(wrapper.isDependencyTreeStatic()).toBe(false);
           });
         });
       });
@@ -68,7 +289,7 @@ describe('InstanceWrapper', () => {
             const wrapper = new InstanceWrapper();
             wrapper.addPropertiesMetadata('key1', new InstanceWrapper());
             wrapper.addPropertiesMetadata('key2', new InstanceWrapper());
-            expect(wrapper.isDependencyTreeStatic()).to.be.true;
+            expect(wrapper.isDependencyTreeStatic()).toBe(true);
           });
         });
         describe('when one is not static', () => {
@@ -79,7 +300,7 @@ describe('InstanceWrapper', () => {
               new InstanceWrapper({ scope: Scope.REQUEST }),
             );
             wrapper.addPropertiesMetadata('key2', new InstanceWrapper());
-            expect(wrapper.isDependencyTreeStatic()).to.be.false;
+            expect(wrapper.isDependencyTreeStatic()).toBe(false);
           });
         });
       });
@@ -89,7 +310,7 @@ describe('InstanceWrapper', () => {
             const wrapper = new InstanceWrapper();
             wrapper.addEnhancerMetadata(new InstanceWrapper());
             wrapper.addEnhancerMetadata(new InstanceWrapper());
-            expect(wrapper.isDependencyTreeStatic()).to.be.true;
+            expect(wrapper.isDependencyTreeStatic()).toBe(true);
           });
         });
         describe('when one is not static', () => {
@@ -99,7 +320,512 @@ describe('InstanceWrapper', () => {
               new InstanceWrapper({ scope: Scope.REQUEST }),
             );
             wrapper.addEnhancerMetadata(new InstanceWrapper());
-            expect(wrapper.isDependencyTreeStatic()).to.be.false;
+            expect(wrapper.isDependencyTreeStatic()).toBe(false);
+          });
+        });
+      });
+    });
+  });
+
+  describe('isDependencyTreeDurable', () => {
+    it('should recompute when transitive dependencies change after durable introspection', () => {
+      const wrapper = new InstanceWrapper({});
+      const dependency = new InstanceWrapper({});
+      wrapper.addCtorMetadata(0, dependency);
+      dependency.addCtorMetadata(
+        0,
+        new InstanceWrapper({ scope: Scope.REQUEST, durable: true }),
+      );
+      expect(wrapper.isDependencyTreeDurable()).toBe(true);
+
+      dependency.addCtorMetadata(
+        1,
+        new InstanceWrapper({ scope: Scope.REQUEST }),
+      );
+
+      expect(wrapper.isDependencyTreeDurable()).toBe(false);
+    });
+    it('should recompute when a dependency whose static flag was invalidated changes', () => {
+      const wrapper = new InstanceWrapper({});
+      const dependency = new InstanceWrapper({});
+      const replaced = new InstanceWrapper({});
+      const nested = new InstanceWrapper({});
+      dependency.addCtorMetadata(0, replaced);
+      dependency.addCtorMetadata(0, nested);
+      wrapper.addCtorMetadata(0, dependency);
+      wrapper.addCtorMetadata(
+        1,
+        new InstanceWrapper({ scope: Scope.REQUEST, durable: true }),
+      );
+      expect(wrapper.isDependencyTreeDurable()).toBe(true);
+
+      // "dependency" is still registered as a parent of "replaced", so this
+      // invalidates its (static) flag
+      replaced.addCtorMetadata(
+        0,
+        new InstanceWrapper({ scope: Scope.REQUEST }),
+      );
+      expect(replaced.isDependencyTreeStatic()).toBe(false);
+
+      nested.addCtorMetadata(0, new InstanceWrapper({ scope: Scope.REQUEST }));
+
+      expect(wrapper.isDependencyTreeDurable()).toBe(false);
+    });
+    describe('when circular reference and default scope', () => {
+      it('should return false', () => {
+        const wrapper = new InstanceWrapper();
+        const otherWrapper = new InstanceWrapper();
+        wrapper.addCtorMetadata(0, otherWrapper);
+        otherWrapper.addCtorMetadata(0, wrapper);
+        expect(wrapper.isDependencyTreeDurable()).toBe(false);
+        expect(otherWrapper.isDependencyTreeDurable()).toBe(false);
+      });
+    });
+    describe('when circular reference and one non durable', () => {
+      it('should return false', () => {
+        const wrapper = new InstanceWrapper();
+        const otherWrapper = new InstanceWrapper({ scope: Scope.REQUEST });
+        wrapper.addCtorMetadata(0, otherWrapper);
+        otherWrapper.addCtorMetadata(0, wrapper);
+        expect(wrapper.isDependencyTreeDurable()).toBe(false);
+        expect(otherWrapper.isDependencyTreeDurable()).toBe(false);
+      });
+    });
+    describe('when circular reference and one durable', () => {
+      it('should return true', () => {
+        const wrapper = new InstanceWrapper();
+        const otherWrapper = new InstanceWrapper({
+          scope: Scope.REQUEST,
+          durable: true,
+        });
+        wrapper.addCtorMetadata(0, otherWrapper);
+        otherWrapper.addCtorMetadata(0, wrapper);
+        expect(wrapper.isDependencyTreeDurable()).toBe(true);
+        expect(otherWrapper.isDependencyTreeDurable()).toBe(true);
+      });
+    });
+    describe('when circular reference and non durable dependency is visited last', () => {
+      it('should return false', () => {
+        const wrapper = new InstanceWrapper();
+        const otherWrapper = new InstanceWrapper();
+        wrapper.addCtorMetadata(0, otherWrapper);
+        wrapper.addCtorMetadata(
+          1,
+          new InstanceWrapper({ scope: Scope.REQUEST }),
+        );
+        otherWrapper.addCtorMetadata(
+          0,
+          new InstanceWrapper({ scope: Scope.REQUEST, durable: true }),
+        );
+        otherWrapper.addCtorMetadata(1, wrapper);
+        expect(wrapper.isDependencyTreeDurable()).toBe(false);
+        expect(otherWrapper.isDependencyTreeDurable()).toBe(false);
+      });
+    });
+    describe('when request scoped and durable', () => {
+      it('should return true', () => {
+        const wrapper = new InstanceWrapper({
+          scope: Scope.REQUEST,
+          durable: true,
+        });
+        expect(wrapper.isDependencyTreeDurable()).toBe(true);
+      });
+    });
+    describe('when request scoped and non durable', () => {
+      it('should return false', () => {
+        const wrapper = new InstanceWrapper({
+          scope: Scope.REQUEST,
+        });
+        expect(wrapper.isDependencyTreeDurable()).toBe(false);
+      });
+    });
+    describe('when request scoped and explicit non durable', () => {
+      it('should return false', () => {
+        const wrapper = new InstanceWrapper({
+          scope: Scope.REQUEST,
+          durable: false,
+        });
+        expect(wrapper.isDependencyTreeDurable()).toBe(false);
+      });
+    });
+    describe('when default scope', () => {
+      it('should return false', () => {
+        const wrapper = new InstanceWrapper();
+        expect(wrapper.isDependencyTreeDurable()).toBe(false);
+      });
+    });
+    describe('when statically scoped', () => {
+      describe('dependencies, properties, enhancers', () => {
+        describe('dependencies non durable, properties non durable, enhancers durable', () => {
+          it('should return false', () => {
+            const wrapper = new InstanceWrapper();
+            wrapper.addCtorMetadata(
+              0,
+              new InstanceWrapper({ scope: Scope.REQUEST }),
+            );
+            wrapper.addCtorMetadata(1, new InstanceWrapper());
+            wrapper.addPropertiesMetadata('key1', new InstanceWrapper());
+            wrapper.addEnhancerMetadata(new InstanceWrapper());
+            expect(wrapper.isDependencyTreeDurable()).toBe(false);
+          });
+        });
+        describe('dependencies non durable, properties durable, enhancers durable', () => {
+          it('should return false', () => {
+            const wrapper = new InstanceWrapper();
+            wrapper.addCtorMetadata(
+              0,
+              new InstanceWrapper({ scope: Scope.REQUEST }),
+            );
+            wrapper.addCtorMetadata(1, new InstanceWrapper());
+            wrapper.addPropertiesMetadata(
+              'key1',
+              new InstanceWrapper({ scope: Scope.REQUEST }),
+            );
+            wrapper.addEnhancerMetadata(new InstanceWrapper());
+            expect(wrapper.isDependencyTreeDurable()).toBe(false);
+          });
+        });
+        describe('dependencies non durable, properties durable', () => {
+          it('should return false', () => {
+            const wrapper = new InstanceWrapper();
+            wrapper.addCtorMetadata(
+              0,
+              new InstanceWrapper({ scope: Scope.REQUEST }),
+            );
+            wrapper.addCtorMetadata(1, new InstanceWrapper());
+            wrapper.addPropertiesMetadata('key1', new InstanceWrapper());
+            wrapper.addPropertiesMetadata(
+              'key2',
+              new InstanceWrapper({ scope: Scope.REQUEST, durable: true }),
+            );
+            expect(wrapper.isDependencyTreeDurable()).toBe(false);
+          });
+        });
+        describe('properties durable, enhancers non durable', () => {
+          it('should return false', () => {
+            const wrapper = new InstanceWrapper();
+            wrapper.addPropertiesMetadata('key1', new InstanceWrapper());
+            wrapper.addPropertiesMetadata(
+              'key2',
+              new InstanceWrapper({ scope: Scope.REQUEST, durable: true }),
+            );
+            wrapper.addEnhancerMetadata(
+              new InstanceWrapper({ scope: Scope.REQUEST }),
+            );
+            expect(wrapper.isDependencyTreeDurable()).toBe(false);
+          });
+        });
+        describe('dependencies durable, enhancers non durable', () => {
+          it('should return false', () => {
+            const wrapper = new InstanceWrapper();
+            wrapper.addCtorMetadata(
+              0,
+              new InstanceWrapper({ scope: Scope.REQUEST, durable: true }),
+            );
+            wrapper.addEnhancerMetadata(
+              new InstanceWrapper({ scope: Scope.REQUEST }),
+            );
+            expect(wrapper.isDependencyTreeDurable()).toBe(false);
+          });
+        });
+      });
+      describe('dependencies', () => {
+        describe('when wrapper is non durable and dependency is static', () => {
+          it('should return false', () => {
+            const wrapper = new InstanceWrapper({ scope: Scope.REQUEST });
+            wrapper.addCtorMetadata(0, new InstanceWrapper());
+            expect(wrapper.isDependencyTreeDurable()).toBe(false);
+          });
+        });
+        describe('when wrapper is durable and dependency is static', () => {
+          it('should return true', () => {
+            const wrapper = new InstanceWrapper({
+              scope: Scope.REQUEST,
+              durable: true,
+            });
+            wrapper.addCtorMetadata(0, new InstanceWrapper());
+            expect(wrapper.isDependencyTreeDurable()).toBe(true);
+          });
+        });
+        describe('when wrapper is non durable and dependency is durable', () => {
+          it('should return false', () => {
+            const wrapper = new InstanceWrapper({
+              scope: Scope.REQUEST,
+            });
+            wrapper.addCtorMetadata(
+              0,
+              new InstanceWrapper({ scope: Scope.REQUEST, durable: true }),
+            );
+            expect(wrapper.isDependencyTreeDurable()).toBe(false);
+          });
+        });
+        describe('when wrapper is durable and dependency is static', () => {
+          it('should return true', () => {
+            const wrapper = new InstanceWrapper({
+              scope: Scope.REQUEST,
+              durable: true,
+            });
+            wrapper.addCtorMetadata(0, new InstanceWrapper());
+            expect(wrapper.isDependencyTreeDurable()).toBe(true);
+          });
+        });
+        describe('when wrapper is durable and dependency is non durable', () => {
+          it('should return true', () => {
+            const wrapper = new InstanceWrapper({
+              scope: Scope.REQUEST,
+              durable: true,
+            });
+            wrapper.addCtorMetadata(
+              0,
+              new InstanceWrapper({ scope: Scope.REQUEST }),
+            );
+            expect(wrapper.isDependencyTreeDurable()).toBe(true);
+          });
+        });
+        describe('when each is static', () => {
+          it('should return false', () => {
+            const wrapper = new InstanceWrapper();
+            wrapper.addCtorMetadata(0, new InstanceWrapper());
+            expect(wrapper.isDependencyTreeDurable()).toBe(false);
+          });
+        });
+        describe('when one is not static and non-durable', () => {
+          it('should return false', () => {
+            const wrapper = new InstanceWrapper();
+            wrapper.addCtorMetadata(0, new InstanceWrapper());
+            wrapper.addCtorMetadata(
+              1,
+              new InstanceWrapper({
+                scope: Scope.REQUEST,
+              }),
+            );
+            expect(wrapper.isDependencyTreeDurable()).toBe(false);
+          });
+        });
+        describe('when one is not static and durable', () => {
+          it('should return true', () => {
+            const wrapper = new InstanceWrapper();
+            wrapper.addCtorMetadata(0, new InstanceWrapper());
+            wrapper.addCtorMetadata(
+              1,
+              new InstanceWrapper({
+                scope: Scope.REQUEST,
+                durable: true,
+              }),
+            );
+            expect(wrapper.isDependencyTreeDurable()).toBe(true);
+          });
+        });
+        describe('when one is not static, durable and non durable', () => {
+          it('should return false', () => {
+            const wrapper = new InstanceWrapper();
+            wrapper.addCtorMetadata(0, new InstanceWrapper());
+            wrapper.addCtorMetadata(
+              1,
+              new InstanceWrapper({
+                scope: Scope.REQUEST,
+                durable: true,
+              }),
+            );
+            wrapper.addCtorMetadata(
+              2,
+              new InstanceWrapper({
+                scope: Scope.REQUEST,
+              }),
+            );
+            expect(wrapper.isDependencyTreeDurable()).toBe(false);
+          });
+        });
+      });
+      describe('properties', () => {
+        describe('when wrapper is non durable and dependency is static', () => {
+          it('should return false', () => {
+            const wrapper = new InstanceWrapper({ scope: Scope.REQUEST });
+            wrapper.addPropertiesMetadata('key1', new InstanceWrapper());
+            expect(wrapper.isDependencyTreeDurable()).toBe(false);
+          });
+        });
+        describe('when wrapper is durable and dependency is static', () => {
+          it('should return true', () => {
+            const wrapper = new InstanceWrapper({
+              scope: Scope.REQUEST,
+              durable: true,
+            });
+            wrapper.addPropertiesMetadata('key1', new InstanceWrapper());
+            expect(wrapper.isDependencyTreeDurable()).toBe(true);
+          });
+        });
+        describe('when wrapper is non durable and dependency is durable', () => {
+          it('should return false', () => {
+            const wrapper = new InstanceWrapper({
+              scope: Scope.REQUEST,
+            });
+            wrapper.addPropertiesMetadata(
+              'key1',
+              new InstanceWrapper({ scope: Scope.REQUEST, durable: true }),
+            );
+            expect(wrapper.isDependencyTreeDurable()).toBe(false);
+          });
+        });
+        describe('when wrapper is durable and dependency is static', () => {
+          it('should return true', () => {
+            const wrapper = new InstanceWrapper({
+              scope: Scope.REQUEST,
+              durable: true,
+            });
+            wrapper.addPropertiesMetadata('key1', new InstanceWrapper());
+            expect(wrapper.isDependencyTreeDurable()).toBe(true);
+          });
+        });
+        describe('when wrapper is durable and dependency is non durable', () => {
+          it('should return true', () => {
+            const wrapper = new InstanceWrapper({
+              scope: Scope.REQUEST,
+              durable: true,
+            });
+            wrapper.addPropertiesMetadata(
+              'key1',
+              new InstanceWrapper({ scope: Scope.REQUEST }),
+            );
+            expect(wrapper.isDependencyTreeDurable()).toBe(true);
+          });
+        });
+        describe('when each is static', () => {
+          it('should return false', () => {
+            const wrapper = new InstanceWrapper();
+            wrapper.addPropertiesMetadata('key1', new InstanceWrapper());
+            wrapper.addPropertiesMetadata('key2', new InstanceWrapper());
+            expect(wrapper.isDependencyTreeDurable()).toBe(false);
+          });
+        });
+        describe('when one is not static and non-durable', () => {
+          it('should return false', () => {
+            const wrapper = new InstanceWrapper();
+            wrapper.addPropertiesMetadata(
+              'key1',
+              new InstanceWrapper({ scope: Scope.REQUEST }),
+            );
+            wrapper.addPropertiesMetadata('key2', new InstanceWrapper());
+            expect(wrapper.isDependencyTreeDurable()).toBe(false);
+          });
+        });
+        describe('when one is not static and durable', () => {
+          it('should return true', () => {
+            const wrapper = new InstanceWrapper();
+            wrapper.addPropertiesMetadata(
+              'key1',
+              new InstanceWrapper({ scope: Scope.REQUEST, durable: true }),
+            );
+            wrapper.addPropertiesMetadata('key2', new InstanceWrapper());
+            expect(wrapper.isDependencyTreeDurable()).toBe(true);
+          });
+        });
+        describe('when one is not static, non durable and durable', () => {
+          it('should return false', () => {
+            const wrapper = new InstanceWrapper();
+            wrapper.addPropertiesMetadata(
+              'key1',
+              new InstanceWrapper({ scope: Scope.REQUEST, durable: true }),
+            );
+            wrapper.addPropertiesMetadata('key2', new InstanceWrapper());
+            wrapper.addPropertiesMetadata(
+              'key3',
+              new InstanceWrapper({ scope: Scope.REQUEST }),
+            );
+            expect(wrapper.isDependencyTreeDurable()).toBe(false);
+          });
+        });
+      });
+      describe('enhancers', () => {
+        describe('when wrapper is non durable and dependency is static', () => {
+          it('should return false', () => {
+            const wrapper = new InstanceWrapper({ scope: Scope.REQUEST });
+            wrapper.addEnhancerMetadata(new InstanceWrapper());
+            expect(wrapper.isDependencyTreeDurable()).toBe(false);
+          });
+        });
+        describe('when wrapper is durable and dependency is static', () => {
+          it('should return true', () => {
+            const wrapper = new InstanceWrapper({
+              scope: Scope.REQUEST,
+              durable: true,
+            });
+            wrapper.addEnhancerMetadata(new InstanceWrapper());
+            expect(wrapper.isDependencyTreeDurable()).toBe(true);
+          });
+        });
+        describe('when wrapper is non durable and dependency is durable', () => {
+          it('should return false', () => {
+            const wrapper = new InstanceWrapper({
+              scope: Scope.REQUEST,
+            });
+            wrapper.addEnhancerMetadata(
+              new InstanceWrapper({ scope: Scope.REQUEST, durable: true }),
+            );
+            expect(wrapper.isDependencyTreeDurable()).toBe(false);
+          });
+        });
+        describe('when wrapper is durable and dependency is static', () => {
+          it('should return true', () => {
+            const wrapper = new InstanceWrapper({
+              scope: Scope.REQUEST,
+              durable: true,
+            });
+            wrapper.addEnhancerMetadata(new InstanceWrapper());
+            expect(wrapper.isDependencyTreeDurable()).toBe(true);
+          });
+        });
+        describe('when wrapper is durable and dependency is non durable', () => {
+          it('should return true', () => {
+            const wrapper = new InstanceWrapper({
+              scope: Scope.REQUEST,
+              durable: true,
+            });
+            wrapper.addEnhancerMetadata(
+              new InstanceWrapper({ scope: Scope.REQUEST }),
+            );
+            expect(wrapper.isDependencyTreeDurable()).toBe(true);
+          });
+        });
+        describe('when each is static', () => {
+          it('should return false', () => {
+            const wrapper = new InstanceWrapper();
+            wrapper.addEnhancerMetadata(new InstanceWrapper());
+            wrapper.addEnhancerMetadata(new InstanceWrapper());
+            expect(wrapper.isDependencyTreeDurable()).toBe(false);
+          });
+        });
+        describe('when one is not static and non-durable', () => {
+          it('should return false', () => {
+            const wrapper = new InstanceWrapper();
+            wrapper.addEnhancerMetadata(
+              new InstanceWrapper({ scope: Scope.REQUEST }),
+            );
+            wrapper.addEnhancerMetadata(new InstanceWrapper());
+            expect(wrapper.isDependencyTreeDurable()).toBe(false);
+          });
+        });
+        describe('when one is not static and durable', () => {
+          it('should return true', () => {
+            const wrapper = new InstanceWrapper();
+            wrapper.addEnhancerMetadata(
+              new InstanceWrapper({ scope: Scope.REQUEST, durable: true }),
+            );
+            wrapper.addEnhancerMetadata(new InstanceWrapper());
+            expect(wrapper.isDependencyTreeDurable()).toBe(true);
+          });
+        });
+        describe('when one is not static, non durable and durable', () => {
+          it('should return false', () => {
+            const wrapper = new InstanceWrapper();
+            wrapper.addEnhancerMetadata(
+              new InstanceWrapper({ scope: Scope.REQUEST, durable: true }),
+            );
+            wrapper.addEnhancerMetadata(new InstanceWrapper());
+            wrapper.addEnhancerMetadata(
+              new InstanceWrapper({ scope: Scope.REQUEST }),
+            );
+            expect(wrapper.isDependencyTreeDurable()).toBe(false);
           });
         });
       });
@@ -110,14 +836,33 @@ describe('InstanceWrapper', () => {
     describe('when metatype is nil', () => {
       it('should return true', () => {
         const instance = new InstanceWrapper({ metatype: null });
-        expect(instance.isNotMetatype).to.be.true;
+        expect(instance.isNotMetatype).toBe(true);
       });
     });
     describe('when metatype is not nil', () => {
       it('should return false', () => {
         const instance = new InstanceWrapper({ metatype: TestClass });
-        expect(instance.isNotMetatype).to.be.false;
+        expect(instance.isNotMetatype).toBe(false);
       });
+    });
+  });
+
+  describe('addPropertiesMetadata', () => {
+    it('should replace the metadata of a key that is already registered', () => {
+      const instance = new InstanceWrapper();
+      const [first, second, other] = [
+        new InstanceWrapper(),
+        new InstanceWrapper(),
+        new InstanceWrapper(),
+      ];
+      instance.addPropertiesMetadata('key1', first);
+      instance.addPropertiesMetadata('key2', other);
+      instance.addPropertiesMetadata('key1', second);
+
+      expect(instance.getPropertiesMetadata()).toEqual([
+        { key: 'key1', wrapper: second },
+        { key: 'key2', wrapper: other },
+      ]);
     });
   });
 
@@ -126,7 +871,7 @@ describe('InstanceWrapper', () => {
       const instance = new InstanceWrapper();
       const enhancers = [new InstanceWrapper()];
       instance.addEnhancerMetadata(enhancers[0]);
-      expect(instance.getEnhancersMetadata()).to.be.eql(enhancers);
+      expect(instance.getEnhancersMetadata()).toEqual(enhancers);
     });
   });
 
@@ -136,7 +881,7 @@ describe('InstanceWrapper', () => {
       const wrapper = new InstanceWrapper();
       wrapper.instance = instance;
 
-      expect(wrapper.getInstanceByContextId(STATIC_CONTEXT).instance).to.be.eql(
+      expect(wrapper.getInstanceByContextId(STATIC_CONTEXT).instance).toEqual(
         instance,
       );
     });
@@ -148,7 +893,7 @@ describe('InstanceWrapper', () => {
         const instance = { test: true };
         const wrapper = new InstanceWrapper({ instance });
 
-        expect(wrapper.cloneStaticInstance({ id: 0 }).instance).to.be.eql(
+        expect(wrapper.cloneStaticInstance({ id: 0 }).instance).toEqual(
           instance,
         );
       });
@@ -158,7 +903,7 @@ describe('InstanceWrapper', () => {
         const instance = { test: true };
         const wrapper = new InstanceWrapper({ instance, scope: Scope.REQUEST });
 
-        expect(wrapper.cloneStaticInstance({ id: 0 }).instance).to.be.undefined;
+        expect(wrapper.cloneStaticInstance({ id: 0 }).instance).toBeUndefined();
       });
     });
   });
@@ -169,12 +914,12 @@ describe('InstanceWrapper', () => {
         const wrapper = new InstanceWrapper({
           scope: Scope.TRANSIENT,
         });
-        const getInstanceByInquirerIdSpy = sinon.spy(
+        const getInstanceByInquirerIdSpy = vi.spyOn(
           wrapper,
           'getInstanceByInquirerId',
         );
         wrapper.getInstanceByContextId(STATIC_CONTEXT, 'inquirerId');
-        expect(getInstanceByInquirerIdSpy.called).to.be.true;
+        expect(getInstanceByInquirerIdSpy).toHaveBeenCalled();
       });
     });
   });
@@ -185,7 +930,7 @@ describe('InstanceWrapper', () => {
         const wrapper = new InstanceWrapper({
           scope: Scope.TRANSIENT,
         });
-        const setInstanceByInquirerIdSpy = sinon.spy(
+        const setInstanceByInquirerIdSpy = vi.spyOn(
           wrapper,
           'setInstanceByInquirerId',
         );
@@ -194,7 +939,54 @@ describe('InstanceWrapper', () => {
           { instance: {} },
           'inquirerId',
         );
-        expect(setInstanceByInquirerIdSpy.called).to.be.true;
+        expect(setInstanceByInquirerIdSpy).toHaveBeenCalled();
+      });
+    });
+  });
+
+  describe('removeInstanceByContextId', () => {
+    describe('without inquirer', () => {
+      it('should remove instance for given context', () => {
+        const wrapper = new InstanceWrapper({
+          scope: Scope.TRANSIENT,
+        });
+
+        const contextId = createContextId();
+        wrapper.setInstanceByContextId(contextId, { instance: {} });
+
+        const existingContext = wrapper.getInstanceByContextId(contextId);
+        expect(existingContext.instance).toBeDefined();
+        wrapper.removeInstanceByContextId(contextId);
+
+        const removedContext = wrapper.getInstanceByContextId(contextId);
+        expect(removedContext.instance).toBeUndefined();
+      });
+    });
+
+    describe('when transient and inquirer has been passed', () => {
+      it('should remove instance for given context', () => {
+        const wrapper = new InstanceWrapper({
+          scope: Scope.TRANSIENT,
+        });
+
+        wrapper.setInstanceByContextId(
+          STATIC_CONTEXT,
+          { instance: {} },
+          'inquirerId',
+        );
+
+        const existingContext = wrapper.getInstanceByContextId(
+          STATIC_CONTEXT,
+          'inquirerId',
+        );
+        expect(existingContext.instance).toBeDefined();
+        wrapper.removeInstanceByContextId(STATIC_CONTEXT, 'inquirerId');
+
+        const removedContext = wrapper.getInstanceByContextId(
+          STATIC_CONTEXT,
+          'inquirerId',
+        );
+        expect(removedContext.instance).toBeUndefined();
       });
     });
   });
@@ -205,7 +997,7 @@ describe('InstanceWrapper', () => {
         const wrapper = new InstanceWrapper({
           scope: Scope.REQUEST,
         });
-        expect(wrapper.isInRequestScope({ id: 3 })).to.be.true;
+        expect(wrapper.isInRequestScope({ id: 3 })).toBe(true);
       });
     });
     describe('otherwise', () => {
@@ -213,12 +1005,12 @@ describe('InstanceWrapper', () => {
         const wrapper = new InstanceWrapper({
           scope: Scope.TRANSIENT,
         });
-        expect(wrapper.isInRequestScope({ id: 3 })).to.be.false;
+        expect(wrapper.isInRequestScope({ id: 3 })).toBe(false);
 
         const wrapper2 = new InstanceWrapper({
           scope: Scope.REQUEST,
         });
-        expect(wrapper2.isInRequestScope(STATIC_CONTEXT)).to.be.false;
+        expect(wrapper2.isInRequestScope(STATIC_CONTEXT)).toBe(false);
       });
     });
   });
@@ -236,7 +1028,7 @@ describe('InstanceWrapper', () => {
               scope: Scope.REQUEST,
             }),
           ),
-        ).to.be.true;
+        ).toBe(true);
       });
     });
     describe('otherwise', () => {
@@ -244,8 +1036,9 @@ describe('InstanceWrapper', () => {
         const wrapper = new InstanceWrapper({
           scope: Scope.TRANSIENT,
         });
-        expect(wrapper.isLazyTransient({ id: 3 }, new InstanceWrapper())).to.be
-          .false;
+        expect(wrapper.isLazyTransient({ id: 3 }, new InstanceWrapper())).toBe(
+          false,
+        );
 
         const wrapper2 = new InstanceWrapper({
           scope: Scope.REQUEST,
@@ -257,7 +1050,7 @@ describe('InstanceWrapper', () => {
               scope: Scope.TRANSIENT,
             }),
           ),
-        ).to.be.false;
+        ).toBe(false);
       });
     });
   });
@@ -275,7 +1068,7 @@ describe('InstanceWrapper', () => {
               scope: Scope.DEFAULT,
             }),
           ),
-        ).to.be.true;
+        ).toBe(true);
       });
     });
     describe('otherwise', () => {
@@ -283,7 +1076,7 @@ describe('InstanceWrapper', () => {
         const wrapper = new InstanceWrapper({
           scope: Scope.REQUEST,
         });
-        expect(wrapper.isStatic({ id: 3 }, new InstanceWrapper())).to.be.false;
+        expect(wrapper.isStatic({ id: 3 }, new InstanceWrapper())).toBe(false);
 
         const wrapper2 = new InstanceWrapper({
           scope: Scope.TRANSIENT,
@@ -295,7 +1088,44 @@ describe('InstanceWrapper', () => {
               scope: Scope.REQUEST,
             }),
           ),
-        ).to.be.false;
+        ).toBe(false);
+      });
+    });
+    describe('when both wrapper and inquirer are transient', () => {
+      const wrapper = new InstanceWrapper({ scope: Scope.TRANSIENT });
+      const inquirer = new InstanceWrapper({ scope: Scope.TRANSIENT });
+
+      it('should return true if root inquirer is not transient', () => {
+        const rootInquirer = new InstanceWrapper();
+        expect(wrapper.isStatic(STATIC_CONTEXT, inquirer, rootInquirer)).toBe(
+          true,
+        );
+      });
+
+      it('should return false if root inquirer is transient', () => {
+        const rootInquirer = new InstanceWrapper({ scope: Scope.TRANSIENT });
+        expect(wrapper.isStatic(STATIC_CONTEXT, inquirer, rootInquirer)).toBe(
+          false,
+        );
+      });
+
+      it('should return true if there is no root inquirer', () => {
+        expect(wrapper.isStatic(STATIC_CONTEXT, inquirer)).toBe(true);
+      });
+
+      it('should not read the root inquirer attached to the inquirer', () => {
+        const otherInquirer = new InstanceWrapper({ scope: Scope.TRANSIENT });
+        otherInquirer.attachRootInquirer(
+          new InstanceWrapper({ scope: Scope.TRANSIENT }),
+        );
+        expect(
+          wrapper.isStatic(
+            STATIC_CONTEXT,
+            otherInquirer,
+            new InstanceWrapper(),
+          ),
+        ).toBe(true);
+        expect(wrapper.isStatic(STATIC_CONTEXT, otherInquirer)).toBe(true);
       });
     });
   });
@@ -306,20 +1136,403 @@ describe('InstanceWrapper', () => {
         const wrapper = new InstanceWrapper({
           scope: Scope.DEFAULT,
         });
-        expect(wrapper.getStaticTransientInstances()).to.be.eql([]);
+        expect(wrapper.getStaticTransientInstances()).toEqual([]);
       });
     });
     describe('when instance is transient', () => {
-      it('should return all static instances', () => {
+      it('should return instances where constructor was called', () => {
         const wrapper = new InstanceWrapper({
           scope: Scope.TRANSIENT,
         });
         const instanceHost = {
           instance: {},
+          isConstructorCalled: true,
         };
         wrapper.setInstanceByInquirerId(STATIC_CONTEXT, 'test', instanceHost);
-        expect(wrapper.getStaticTransientInstances()).to.be.eql([instanceHost]);
+        expect(wrapper.getStaticTransientInstances()).toEqual([instanceHost]);
       });
+
+      describe('lifecycle hooks on transient services', () => {
+        // Tests for issue #15553: prevent lifecycle hooks on non-instantiated transient services
+        it('should filter out instances created with Object.create (prototype only)', () => {
+          const wrapper = new InstanceWrapper({
+            scope: Scope.TRANSIENT,
+          });
+          // Simulates what happens in cloneTransientInstance
+          const prototypeOnlyInstance = {
+            instance: Object.create({}),
+            isResolved: true, // This is set to true incorrectly in injector.ts
+            isConstructorCalled: false, // But constructor was never called
+          };
+          wrapper.setInstanceByInquirerId(
+            STATIC_CONTEXT,
+            'inquirer',
+            prototypeOnlyInstance,
+          );
+
+          // Should not include this instance for lifecycle hooks
+          expect(wrapper.getStaticTransientInstances()).toEqual([]);
+        });
+
+        it('should include instances where constructor was actually invoked', () => {
+          class TestService {}
+          const wrapper = new InstanceWrapper({
+            scope: Scope.TRANSIENT,
+            metatype: TestService,
+          });
+          // Simulates what happens after instantiateClass
+          const properInstance = {
+            instance: new TestService(),
+            isResolved: true,
+            isConstructorCalled: true,
+          };
+          wrapper.setInstanceByInquirerId(
+            STATIC_CONTEXT,
+            'inquirer',
+            properInstance,
+          );
+
+          // Should include this instance for lifecycle hooks
+          expect(wrapper.getStaticTransientInstances()).toEqual([
+            properInstance,
+          ]);
+        });
+      });
+    });
+  });
+
+  describe('mergeWith', () => {
+    it('should no longer be an alias once merged with a provider', () => {
+      const wrapper = new InstanceWrapper({ isAlias: true });
+      wrapper.mergeWith({ useClass: TestClass, provide: 'token' });
+
+      expect(wrapper.isAlias).toBe(false);
+    });
+
+    describe('when provider is a ValueProvider', () => {
+      it('should provide the given value in the STATIC_CONTEXT', () => {
+        const wrapper = new InstanceWrapper();
+        wrapper.mergeWith({
+          useValue: 'value',
+          provide: 'token',
+        });
+
+        expect(wrapper.getInstanceByContextId(STATIC_CONTEXT).instance).toBe(
+          'value',
+        );
+      });
+
+      it('should provide undefined when the value is undefined', () => {
+        const wrapper = new InstanceWrapper({ metatype: TestClass });
+        wrapper.mergeWith({
+          useValue: undefined,
+          provide: 'token',
+        });
+
+        const host = wrapper.getInstanceByContextId(STATIC_CONTEXT);
+        expect(host.instance).toBeUndefined();
+        expect(host.isResolved).toBe(true);
+        expect(wrapper.metatype).toBeNull();
+      });
+    });
+
+    describe('when provider is a ClassProvider', () => {
+      it('should alter the instance wrapper metatype with the given class', () => {
+        const wrapper = new InstanceWrapper();
+
+        wrapper.mergeWith({
+          useClass: TestClass,
+          provide: 'token',
+        });
+
+        expect(wrapper.metatype).toEqual(TestClass);
+      });
+
+      it('should register the given class as the class of its instances', () => {
+        class Mixin {}
+        class Host {}
+        Host.prototype.constructor = Mixin;
+
+        const wrapper = new InstanceWrapper();
+        wrapper.mergeWith({ useClass: Host, provide: 'token' });
+        expect(getClassRef(new Host())).toBe(Host);
+      });
+
+      it('should reset a previously resolved instance in the STATIC_CONTEXT', () => {
+        const wrapper = new InstanceWrapper({
+          metatype: null,
+          instance: 'value',
+          isResolved: true,
+        });
+
+        wrapper.mergeWith({
+          useClass: TestClass,
+          provide: 'token',
+        });
+
+        const { instance, isResolved, isPending } =
+          wrapper.getInstanceByContextId(STATIC_CONTEXT);
+        expect(instance).toBeNull();
+        expect(isResolved).toBe(false);
+        expect(isPending).toBeFalsy();
+      });
+
+      it('should take the scope and durability of the given class', () => {
+        @Injectable({ scope: Scope.REQUEST, durable: true })
+        class DurableTestClass {}
+
+        const wrapper = new InstanceWrapper();
+        expect(wrapper.isDependencyTreeStatic()).toBe(true);
+
+        wrapper.mergeWith({
+          useClass: DurableTestClass,
+          provide: 'token',
+        });
+
+        expect(wrapper.scope).toBe(Scope.REQUEST);
+        expect(wrapper.durable).toBe(true);
+        expect(wrapper.isDependencyTreeStatic()).toBe(false);
+        expect(wrapper.isDependencyTreeDurable()).toBe(true);
+      });
+
+      it('should drop the previous scope when the given class has none', () => {
+        const wrapper = new InstanceWrapper({ scope: Scope.REQUEST });
+        expect(wrapper.isDependencyTreeStatic()).toBe(false);
+
+        wrapper.mergeWith({ useClass: class TestClass {}, provide: 'token' });
+
+        expect(wrapper.scope).toBe(Scope.DEFAULT);
+        expect(wrapper.isDependencyTreeStatic()).toBe(true);
+      });
+
+      it('should support transient instances after taking a transient scope', () => {
+        @Injectable({ scope: Scope.TRANSIENT })
+        class TransientTestClass {}
+
+        const wrapper = new InstanceWrapper();
+        wrapper.mergeWith({ useClass: TransientTestClass, provide: 'token' });
+
+        expect(() =>
+          wrapper.getInstanceByContextId(STATIC_CONTEXT, 'inquirer'),
+        ).not.toThrow();
+      });
+    });
+
+    describe('when provider is a FactoryProvider', () => {
+      it('should reset a previously resolved instance in the STATIC_CONTEXT', () => {
+        const wrapper = new InstanceWrapper({
+          metatype: null,
+          instance: 'value',
+          isResolved: true,
+        });
+
+        wrapper.mergeWith({
+          provide: 'token',
+          useFactory: () => 'factory value',
+        });
+
+        const { instance, isResolved, isPending } =
+          wrapper.getInstanceByContextId(STATIC_CONTEXT);
+        expect(instance).toBeNull();
+        expect(isResolved).toBe(false);
+        expect(isPending).toBeFalsy();
+      });
+
+      describe('and it has injected dependencies', () => {
+        it('should alter the instance wrapper metatype and inject attributes with the given values', () => {
+          const wrapper = new InstanceWrapper();
+
+          const factory = (_dependency1: any, _dependency2: any) => {};
+          const injectedDependencies = ['dependency1', 'dependency2'];
+
+          wrapper.mergeWith({
+            provide: 'token',
+            useFactory: factory,
+            inject: injectedDependencies,
+          });
+
+          expect(wrapper.metatype).toEqual(factory);
+          expect(wrapper.inject).toBe(injectedDependencies);
+        });
+      });
+
+      describe('and it has no injected dependencies', () => {
+        it('should alter the instance wrapper metatype with the given values', () => {
+          const wrapper = new InstanceWrapper();
+          const factory = (_dependency1: any, _dependency2: any) => {};
+
+          wrapper.mergeWith({
+            provide: 'token',
+            useFactory: factory,
+          });
+
+          expect(wrapper.metatype).toEqual(factory);
+          expect(wrapper.inject).toEqual([]);
+        });
+      });
+    });
+  });
+
+  describe('id', () => {
+    it('should return a string identifier', () => {
+      const wrapper = new InstanceWrapper({ name: 'TestId' });
+      expect(typeof wrapper.id).toBe('string');
+      expect(wrapper.id.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe('isFactory', () => {
+    it('should return true when inject is defined', () => {
+      const wrapper = new InstanceWrapper({
+        metatype: TestClass,
+        inject: ['dep1'],
+      });
+      expect(wrapper.isFactory).toBe(true);
+    });
+
+    it('should return false when inject is not defined', () => {
+      const wrapper = new InstanceWrapper({ metatype: TestClass });
+      expect(wrapper.isFactory).toBe(false);
+    });
+  });
+
+  describe('isTransient', () => {
+    it('should return true when scope is TRANSIENT', () => {
+      const wrapper = new InstanceWrapper({ scope: Scope.TRANSIENT });
+      expect(wrapper.isTransient).toBe(true);
+    });
+
+    it('should return false when scope is DEFAULT', () => {
+      const wrapper = new InstanceWrapper({ scope: Scope.DEFAULT });
+      expect(wrapper.isTransient).toBe(false);
+    });
+  });
+
+  describe('isNotMetatype with inject set', () => {
+    it('should return true when metatype is set but inject is also set (factory)', () => {
+      const wrapper = new InstanceWrapper({
+        metatype: (() => {}) as any,
+        inject: [],
+      });
+      expect(wrapper.isNotMetatype).toBe(true);
+    });
+  });
+
+  describe('createPrototype', () => {
+    it('should return prototype when metatype is newable and not resolved', () => {
+      const wrapper = new InstanceWrapper({ metatype: TestClass });
+      const proto = wrapper.createPrototype(STATIC_CONTEXT);
+      expect(proto).toBeDefined();
+      expect(Object.getPrototypeOf(proto)).toBe(TestClass.prototype);
+    });
+
+    it('should return undefined when instance is already resolved', () => {
+      const wrapper = new InstanceWrapper({
+        metatype: TestClass,
+        instance: new TestClass(),
+        isResolved: true,
+      });
+      const proto = wrapper.createPrototype(STATIC_CONTEXT);
+      expect(proto).toBeUndefined();
+    });
+
+    it('should return undefined when inject is set (factory provider)', () => {
+      const wrapper = new InstanceWrapper({
+        metatype: (() => {}) as any,
+        inject: [],
+      });
+      const proto = wrapper.createPrototype(STATIC_CONTEXT);
+      expect(proto).toBeUndefined();
+    });
+  });
+
+  describe('isExplicitlyRequested', () => {
+    it('should return true when inquirer is self', () => {
+      const wrapper = new InstanceWrapper({ scope: Scope.DEFAULT });
+      expect(wrapper.isExplicitlyRequested({ id: 3 }, wrapper)).toBe(true);
+    });
+
+    it('should return true when inquirer is transient', () => {
+      const wrapper = new InstanceWrapper({ scope: Scope.DEFAULT });
+      const inquirer = new InstanceWrapper({ scope: Scope.TRANSIENT });
+      expect(wrapper.isExplicitlyRequested({ id: 3 }, inquirer)).toBe(true);
+    });
+
+    it('should return false in static context', () => {
+      const wrapper = new InstanceWrapper({ scope: Scope.DEFAULT });
+      expect(wrapper.isExplicitlyRequested(STATIC_CONTEXT)).toBe(false);
+    });
+  });
+
+  describe('attachRootInquirer', () => {
+    it('should set rootInquirer for transient wrapper', () => {
+      const wrapper = new InstanceWrapper({ scope: Scope.TRANSIENT });
+      const inquirer = new InstanceWrapper({ name: 'root' });
+      wrapper.attachRootInquirer(inquirer);
+      expect(wrapper.getRootInquirer()).toBe(inquirer);
+    });
+
+    it('should not set rootInquirer for non-transient wrapper', () => {
+      const wrapper = new InstanceWrapper({ scope: Scope.DEFAULT });
+      const inquirer = new InstanceWrapper({ name: 'root' });
+      wrapper.attachRootInquirer(inquirer);
+      expect(wrapper.getRootInquirer()).toBeUndefined();
+    });
+
+    it('should use root inquirer of inquirer when available', () => {
+      const root = new InstanceWrapper({ name: 'root', scope: Scope.DEFAULT });
+      const mid = new InstanceWrapper({ name: 'mid', scope: Scope.TRANSIENT });
+      mid.attachRootInquirer(root);
+
+      const leaf = new InstanceWrapper({
+        name: 'leaf',
+        scope: Scope.TRANSIENT,
+      });
+      leaf.attachRootInquirer(mid);
+      expect(leaf.getRootInquirer()).toBe(root);
+    });
+  });
+
+  describe('removeInstanceByInquirerId', () => {
+    it('should handle missing collection gracefully', () => {
+      const wrapper = new InstanceWrapper({ scope: Scope.TRANSIENT });
+      expect(() =>
+        wrapper.removeInstanceByInquirerId(STATIC_CONTEXT, 'nonexistent'),
+      ).not.toThrow();
+    });
+  });
+
+  describe('cloneTransientInstance', () => {
+    it('should create a new instance per context for transient scope', () => {
+      const wrapper = new InstanceWrapper({
+        metatype: TestClass,
+        scope: Scope.TRANSIENT,
+        instance: new TestClass(),
+      });
+      const contextId = createContextId();
+      const clone = wrapper.cloneTransientInstance(contextId, 'inquirer');
+      expect(clone.instance).toBeDefined();
+      expect(clone.isResolved).toBe(false);
+    });
+  });
+
+  describe('mergeWith edge cases', () => {
+    it('should reset metatype and inject for value provider', () => {
+      const wrapper = new InstanceWrapper({
+        metatype: TestClass,
+        inject: ['dep'],
+      });
+      wrapper.mergeWith({ provide: 'token', useValue: 42 });
+      expect(wrapper.metatype).toBeNull();
+      expect(wrapper.inject).toBeNull();
+      expect(wrapper.scope).toBe(Scope.DEFAULT);
+    });
+
+    it('should reset inject for class provider', () => {
+      const wrapper = new InstanceWrapper({ inject: ['dep'] });
+      wrapper.mergeWith({ provide: 'token', useClass: TestClass });
+      expect(wrapper.inject).toBeNull();
+      expect(wrapper.metatype).toBe(TestClass);
     });
   });
 });

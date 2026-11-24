@@ -1,0 +1,182 @@
+import {
+  FastifyAdapter,
+  NestFastifyApplication,
+} from '@nestjs/platform-fastify';
+import { Test } from '@nestjs/testing';
+import { readFileSync } from 'fs';
+import { join } from 'path';
+import { AppModule } from '../src/app.module.js';
+
+const readme = readFileSync(join(process.cwd(), 'Readme.md'));
+const readmeString = readme.toString();
+
+describe('Fastify FileSend', () => {
+  let app: NestFastifyApplication;
+
+  beforeEach(async () => {
+    const modRef = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+
+    app = modRef.createNestApplication(new FastifyAdapter());
+    await app.init();
+  });
+
+  it('should return a file from a stream', async () => {
+    return app
+      .inject({
+        method: 'GET',
+        url: '/file/stream',
+      })
+      .then(({ payload, statusCode }) => {
+        expect(statusCode).toBe(200);
+        expect(payload.toString()).toBe(readmeString);
+      });
+  });
+  it('should return a file from a buffer', async () => {
+    return app
+      .inject({
+        method: 'GET',
+        url: '/file/buffer',
+      })
+      .then(({ payload, statusCode }) => {
+        expect(statusCode).toBe(200);
+        expect(payload.toString()).toBe(readmeString);
+      });
+  });
+  /**
+   * It seems that Fastify has a similar issue as Kamil initially pointed out
+   * If a class has a `pipe` method, it will be treated as a stream. This means
+   * that the `NonFile` test is a failed case for fastify, hence the skip.
+   */
+  it.skip('should not stream a non-file', async () => {
+    return app
+      .inject({
+        url: '/non-file/pipe-method',
+        method: 'get',
+      })
+      .then(({ payload }) => {
+        expect(payload).toBe({ value: 'Hello world' });
+      });
+  });
+  it('should return a file from an RxJS stream', async () => {
+    return app
+      .inject({
+        method: 'GET',
+        url: '/file/rxjs/stream',
+      })
+      .then(({ payload, statusCode }) => {
+        expect(statusCode).toBe(200);
+        expect(payload.toString()).toBe(readmeString);
+      });
+  });
+  it('should return a file with correct headers', async () => {
+    return app
+      .inject({ url: '/file/with/headers', method: 'get' })
+      .then(({ statusCode, headers, payload }) => {
+        expect(statusCode).toBe(200);
+        expect(headers['content-type']).toBe('text/markdown');
+        expect(headers['content-disposition']).toBe(
+          'attachment; filename="Readme.md"',
+        );
+        expect(headers['content-length']).toBe(`${readme.byteLength}`);
+        expect(payload).toBe(readmeString);
+      });
+  });
+  it('should return an error if the file does not exist', async () => {
+    return app
+      .inject({
+        method: 'GET',
+        url: '/file/not/exist',
+      })
+      .then(({ statusCode }) => {
+        expect(statusCode).toBe(500);
+      });
+  });
+  it('should answer with JSON if the file does not exist and its type is malformed', async () => {
+    const { statusCode, headers, payload } = await app.inject({
+      method: 'GET',
+      url: '/file/not/exist/malformed-type',
+    });
+
+    expect(statusCode).toBe(500);
+    expect(headers['content-type']).toBe('application/json; charset=utf-8');
+    expect(JSON.parse(payload)).toEqual({
+      statusCode: 500,
+      message: 'Internal server error',
+    });
+  });
+  it('should answer a HEAD request with the headers of a file', async () => {
+    return app
+      .inject({ url: '/file/with/headers', method: 'HEAD' })
+      .then(({ statusCode, headers, payload }) => {
+        expect(statusCode).toBe(200);
+        expect(headers['content-type']).toBe('text/markdown');
+        expect(headers['content-disposition']).toBe(
+          'attachment; filename="Readme.md"',
+        );
+        expect(headers['content-length']).toBe(`${readme.byteLength}`);
+        expect(payload).toBe('');
+      });
+  });
+  /**
+   * A HEAD request does not read the file, so its answer does not depend on
+   * whether the file can be opened (unlike the 500 of a GET request).
+   */
+  it('should answer a HEAD request without reading a file that does not exist', async () => {
+    return app
+      .inject({
+        method: 'HEAD',
+        url: '/file/not/exist',
+      })
+      .then(({ statusCode }) => {
+        expect(statusCode).toBe(200);
+      });
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+});
+
+describe('Fastify static assets', () => {
+  let app: NestFastifyApplication;
+
+  beforeEach(async () => {
+    const modRef = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+
+    app = modRef.createNestApplication(new FastifyAdapter());
+    app.useStaticAssets({
+      root: join(process.cwd(), 'integration/send-files/src'),
+      prefix: '/static/',
+    });
+    await app.init();
+  });
+
+  it('should serve a file', async () => {
+    const { statusCode } = await app.inject({
+      method: 'GET',
+      url: '/static/non-file.ts',
+    });
+    expect(statusCode).toBe(200);
+  });
+
+  /**
+   * The plugin refuses these paths, as plain Fastify does with a 403. The
+   * answer must not be a 500, which is for a server fault.
+   */
+  it.each(['/static/a%00', '/static/%00', '/static/%5Ca.txt'])(
+    'should answer 403 for the path %s that the plugin refuses',
+    async url => {
+      const { statusCode, json } = await app.inject({ method: 'GET', url });
+      expect(statusCode).toBe(403);
+      expect(json()).toEqual({ statusCode: 403, message: 'Forbidden' });
+    },
+  );
+
+  afterEach(async () => {
+    await app.close();
+  });
+});

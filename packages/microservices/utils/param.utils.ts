@@ -1,38 +1,96 @@
-import { PipeTransform, Type } from '@nestjs/common';
-import { assignMetadata } from '@nestjs/common/decorators/http/route-params.decorator';
+import type {
+  ParameterDecoratorOptions,
+  PipeTransform,
+  Type,
+} from '@nestjs/common';
+import { assignMetadata } from '@nestjs/common';
+import {
+  isNil,
+  isParameterDecoratorOptions,
+  isString,
+} from '@nestjs/common/internal';
 import 'reflect-metadata';
-import { PARAM_ARGS_METADATA } from '../constants';
-import { RpcParamtype } from '../enums/rpc-paramtype.enum';
+import { PARAM_ARGS_METADATA } from '../constants.js';
+import { RpcParamtype } from '../enums/rpc-paramtype.enum.js';
+import { getParamArgsMetadata } from './get-param-args-metadata.util.js';
 
 export function createRpcParamDecorator(
   paramtype: RpcParamtype,
 ): (...pipes: (Type<PipeTransform> | PipeTransform)[]) => ParameterDecorator {
-  return (...pipes: (Type<PipeTransform> | PipeTransform)[]) => (
-    target,
-    key,
-    index,
-  ) => {
-    const args =
-      Reflect.getMetadata(PARAM_ARGS_METADATA, target.constructor, key) || {};
-    Reflect.defineMetadata(
-      PARAM_ARGS_METADATA,
-      assignMetadata(args, paramtype, index, undefined, ...pipes),
-      target.constructor,
-      key,
-    );
-  };
+  return (...pipes: (Type<PipeTransform> | PipeTransform)[]) =>
+    (target, key, index) => {
+      const args = getParamArgsMetadata(
+        PARAM_ARGS_METADATA,
+        target,
+        key!,
+        index,
+      );
+      Reflect.defineMetadata(
+        PARAM_ARGS_METADATA,
+        assignMetadata(args, paramtype, index, { pipes }),
+        target.constructor,
+        key!,
+      );
+    };
 }
 
-export const createPipesRpcParamDecorator = (paramtype: RpcParamtype) => (
-  ...pipes: (Type<PipeTransform> | PipeTransform)[]
-): ParameterDecorator => (target, key, index) => {
-  const args =
-    Reflect.getMetadata(PARAM_ARGS_METADATA, target.constructor, key) || {};
+export const createPipesRpcParamDecorator =
+  (paramtype: RpcParamtype) =>
+  (
+    data?: any,
+    optionsOrPipe?:
+      | ParameterDecoratorOptions
+      | Type<PipeTransform>
+      | PipeTransform,
+    ...pipes: (Type<PipeTransform> | PipeTransform)[]
+  ): ParameterDecorator =>
+  (target, key, index) => {
+    const args = getParamArgsMetadata(PARAM_ARGS_METADATA, target, key!, index);
 
-  Reflect.defineMetadata(
-    PARAM_ARGS_METADATA,
-    assignMetadata(args, paramtype, index, undefined, ...pipes),
-    target.constructor,
-    key,
-  );
-};
+    const isDataOptions = isParameterDecoratorOptions(data);
+
+    if (isDataOptions) {
+      const opts = data as ParameterDecoratorOptions;
+      Reflect.defineMetadata(
+        PARAM_ARGS_METADATA,
+        assignMetadata(args, paramtype, index, {
+          pipes: opts.pipes ?? [],
+          schema: opts.schema,
+        }),
+        target.constructor,
+        key!,
+      );
+      return;
+    }
+
+    const hasParamData = isNil(data) || isString(data);
+    const paramData = hasParamData ? data : undefined;
+
+    const isOptions = isParameterDecoratorOptions(optionsOrPipe);
+
+    let paramPipes: (Type<PipeTransform> | PipeTransform)[];
+    if (isOptions) {
+      paramPipes = [...(optionsOrPipe.pipes ?? []), ...pipes];
+    } else if (hasParamData) {
+      paramPipes = [optionsOrPipe, ...pipes].filter(Boolean) as (
+        | Type<PipeTransform>
+        | PipeTransform
+      )[];
+    } else {
+      paramPipes = [data, optionsOrPipe, ...pipes].filter(Boolean) as (
+        | Type<PipeTransform>
+        | PipeTransform
+      )[];
+    }
+
+    Reflect.defineMetadata(
+      PARAM_ARGS_METADATA,
+      assignMetadata(args, paramtype, index, {
+        data: paramData!,
+        pipes: paramPipes,
+        schema: isOptions ? optionsOrPipe.schema : undefined,
+      }),
+      target.constructor,
+      key!,
+    );
+  };

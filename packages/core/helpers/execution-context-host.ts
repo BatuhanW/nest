@@ -1,19 +1,18 @@
-import { ExecutionContext } from '@nestjs/common';
-import { Type } from '@nestjs/common/interfaces';
-import {
-  ContextType,
+import type { ExecutionContext } from '@nestjs/common';
+import type { Type, ContextType } from '@nestjs/common';
+import type {
   HttpArgumentsHost,
   RpcArgumentsHost,
   WsArgumentsHost,
-} from '@nestjs/common/interfaces/features/arguments-host.interface';
+} from '@nestjs/common/internal';
 
 export class ExecutionContextHost implements ExecutionContext {
   private contextType = 'http';
 
   constructor(
     private readonly args: any[],
-    private readonly constructorRef: Type<any> = null,
-    private readonly handler: Function = null,
+    private readonly constructorRef: Type<any> | null = null,
+    private readonly handler: Function | null = null,
   ) {}
 
   setType<TContext extends string = ContextType>(type: TContext) {
@@ -25,11 +24,11 @@ export class ExecutionContextHost implements ExecutionContext {
   }
 
   getClass<T = any>(): Type<T> {
-    return this.constructorRef;
+    return this.constructorRef!;
   }
 
   getHandler(): Function {
-    return this.handler;
+    return this.handler!;
   }
 
   getArgs<T extends Array<any> = any[]>(): T {
@@ -59,6 +58,7 @@ export class ExecutionContextHost implements ExecutionContext {
     return Object.assign(this, {
       getClient: () => this.getArgByIndex(0),
       getData: () => this.getArgByIndex(1),
+      getPattern: () => this.getArgByIndex(this.getArgs().length - 1),
     });
   }
 }

@@ -1,10 +1,10 @@
 import { NotFoundException } from '@nestjs/common';
 import { Args, Mutation, Query, Resolver, Subscription } from '@nestjs/graphql';
-import { PubSub } from 'apollo-server-express';
-import { NewRecipeInput } from './dto/new-recipe.input';
-import { RecipesArgs } from './dto/recipes.args';
-import { Recipe } from './models/recipe.model';
-import { RecipesService } from './recipes.service';
+import { PubSub } from 'graphql-subscriptions';
+import { NewRecipeInput } from './dto/new-recipe.input.js';
+import { RecipesArgs } from './dto/recipes.args.js';
+import { Recipe } from './models/recipe.model.js';
+import { RecipesService } from './recipes.service.js';
 
 const pubSub = new PubSub();
 
@@ -42,6 +42,6 @@ export class RecipesResolver {
 
   @Subscription(returns => Recipe)
   recipeAdded() {
-    return pubSub.asyncIterator('recipeAdded');
+    return pubSub.asyncIterableIterator('recipeAdded');
   }
 }

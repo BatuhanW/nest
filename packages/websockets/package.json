@@ -1,28 +1,56 @@
 {
   "name": "@nestjs/websockets",
-  "version": "7.6.11",
-  "description": "Nest - modern, fast, powerful node.js web framework (@websockets)",
+  "version": "12.6.0",
+  "description": "WebSockets for NestJS: gateways with message handlers, guards, pipes and interceptors, on Socket.IO or ws.",
+  "keywords": [
+    "nestjs",
+    "nest",
+    "websockets",
+    "websocket",
+    "gateway",
+    "realtime",
+    "socket.io",
+    "ws"
+  ],
   "author": "Kamil Mysliwiec",
   "license": "MIT",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json",
+    "./internal": "./internal.js",
+    "./*.js": "./*.js",
+    "./*": "./*.js"
+  },
   "repository": {
     "type": "git",
-    "url": "https://github.com/nestjs/nest"
+    "url": "https://github.com/nestjs/nest.git",
+    "directory": "packages/websockets"
   },
   "publishConfig": {
     "access": "public"
   },
   "dependencies": {
     "iterare": "1.2.1",
-    "tslib": "2.1.0"
+    "object-hash": "3.0.0",
+    "tslib": "2.9.1"
   },
   "devDependencies": {
-    "@nestjs/common": "7.6.11",
-    "@nestjs/core": "7.6.11"
+    "@nestjs/common": "12.6.0",
+    "@nestjs/core": "12.6.0"
   },
   "peerDependencies": {
-    "@nestjs/common": "^7.0.0",
-    "@nestjs/core": "^7.0.0",
-    "reflect-metadata": "^0.1.12",
-    "rxjs": "^6.0.0"
-  }
+    "@nestjs/common": "^12.0.0",
+    "@nestjs/core": "^12.0.0",
+    "@nestjs/platform-socket.io": "^12.0.0",
+    "reflect-metadata": "^0.1.12 || ^0.2.0",
+    "rxjs": "^7.1.0"
+  },
+  "peerDependenciesMeta": {
+    "@nestjs/platform-socket.io": {
+      "optional": true
+    }
+  },
+  "gitHead": "ab3fb3d5ca7d51d078835e44a8db1b354f8b651b"
 }

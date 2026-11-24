@@ -1,8 +1,6 @@
-import * as sinon from 'sinon';
-import { expect } from 'chai';
-import { ArgumentMetadata } from '../../interfaces';
-import { ParseIntPipe } from '../../pipes/parse-int.pipe';
-import { HttpException } from '../../exceptions';
+import { HttpException } from '../../exceptions/index.js';
+import { ArgumentMetadata } from '../../interfaces/index.js';
+import { ParseIntPipe } from '../../pipes/parse-int.pipe.js';
 
 class CustomTestError extends HttpException {
   constructor() {
@@ -21,16 +19,33 @@ describe('ParseIntPipe', () => {
     describe('when validation passes', () => {
       it('should return number', async () => {
         const num = '3';
-        expect(await target.transform(num, {} as ArgumentMetadata)).to.equal(
+        expect(await target.transform(num, {} as ArgumentMetadata)).toBe(
           parseInt(num, 10),
         );
+      });
+      it('should return negative number', async () => {
+        const num = '-3';
+        expect(await target.transform(num, {} as ArgumentMetadata)).toBe(-3);
+      });
+      it('should not throw an error if the value is undefined/null and optional is true', async () => {
+        const target = new ParseIntPipe({ optional: true });
+        const value = await target.transform(
+          undefined!,
+          {} as ArgumentMetadata,
+        );
+        expect(value).toBe(undefined);
       });
     });
     describe('when validation fails', () => {
       it('should throw an error', async () => {
         return expect(
           target.transform('123abc', {} as ArgumentMetadata),
-        ).to.be.rejectedWith(CustomTestError);
+        ).rejects.toThrow(CustomTestError);
+      });
+      it('should throw an error when number has wrong number encoding', async () => {
+        return expect(
+          target.transform('0xFF', {} as ArgumentMetadata),
+        ).rejects.toThrow(CustomTestError);
       });
     });
   });

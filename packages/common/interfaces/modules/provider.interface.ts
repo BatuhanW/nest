@@ -1,6 +1,7 @@
-import { Abstract } from '../abstract.interface';
-import { Scope } from '../scope-options.interface';
-import { Type } from '../type.interface';
+import { Scope } from '../scope-options.interface.js';
+import { Type } from '../type.interface.js';
+import { InjectionToken } from './injection-token.interface.js';
+import { OptionalFactoryDependency } from './optional-factory-dependency.interface.js';
 
 /**
  *
@@ -27,7 +28,7 @@ export type Provider<T = any> =
  * };
  * ```
  *
- * @see [Use class](https://docs.nestjs.com/fundamentals/custom-providers#use-class)
+ * @see [Class providers](https://docs.nestjs.com/fundamentals/custom-providers#class-providers-useclass)
  * @see [Injection scopes](https://docs.nestjs.com/fundamentals/injection-scopes)
  *
  * @publicApi
@@ -36,7 +37,7 @@ export interface ClassProvider<T = any> {
   /**
    * Injection token
    */
-  provide: string | symbol | Type<any> | Abstract<any> | Function;
+  provide: InjectionToken;
   /**
    * Type (class name) of provider (instance to be injected).
    */
@@ -45,6 +46,19 @@ export interface ClassProvider<T = any> {
    * Optional enum defining lifetime of the provider that is injected.
    */
   scope?: Scope;
+  /**
+   * This option is only available on factory providers!
+   *
+   * @see [Use factory](https://docs.nestjs.com/fundamentals/custom-providers#factory-providers-usefactory)
+   */
+  inject?: never;
+  /**
+   * Flags provider as durable. This flag can be used in combination with custom context id
+   * factory strategy to construct lazy DI subtrees.
+   *
+   * This flag can be used only in conjunction with scope = Scope.REQUEST.
+   */
+  durable?: boolean;
 }
 
 /**
@@ -58,7 +72,7 @@ export interface ClassProvider<T = any> {
  * };
  * ```
  *
- * @see [Use value](https://docs.nestjs.com/fundamentals/custom-providers#use-value)
+ * @see [Value providers](https://docs.nestjs.com/fundamentals/custom-providers#value-providers-usevalue)
  *
  * @publicApi
  */
@@ -66,11 +80,17 @@ export interface ValueProvider<T = any> {
   /**
    * Injection token
    */
-  provide: string | symbol | Type<any> | Abstract<any> | Function;
+  provide: InjectionToken;
   /**
    * Instance of a provider to be injected.
    */
   useValue: T;
+  /**
+   * This option is only available on factory providers!
+   *
+   * @see [Use factory](https://docs.nestjs.com/fundamentals/custom-providers#factory-providers-usefactory)
+   */
+  inject?: never;
 }
 
 /**
@@ -88,7 +108,7 @@ export interface ValueProvider<T = any> {
  * };
  * ```
  *
- * @see [Use factory](https://docs.nestjs.com/fundamentals/custom-providers#use-factory)
+ * @see [Factory providers](https://docs.nestjs.com/fundamentals/custom-providers#factory-providers-usefactory)
  * @see [Injection scopes](https://docs.nestjs.com/fundamentals/injection-scopes)
  *
  * @publicApi
@@ -97,19 +117,26 @@ export interface FactoryProvider<T = any> {
   /**
    * Injection token
    */
-  provide: string | symbol | Type<any> | Abstract<any> | Function;
+  provide: InjectionToken;
   /**
    * Factory function that returns an instance of the provider to be injected.
    */
-  useFactory: (...args: any[]) => T;
+  useFactory: (...args: any[]) => T | Promise<T>;
   /**
    * Optional list of providers to be injected into the context of the Factory function.
    */
-  inject?: Array<Type<any> | string | symbol | Abstract<any> | Function>;
+  inject?: Array<InjectionToken | OptionalFactoryDependency>;
   /**
    * Optional enum defining lifetime of the provider that is returned by the Factory function.
    */
   scope?: Scope;
+  /**
+   * Flags provider as durable. This flag can be used in combination with custom context id
+   * factory strategy to construct lazy DI subtrees.
+   *
+   * This flag can be used only in conjunction with scope = Scope.REQUEST.
+   */
+  durable?: boolean;
 }
 
 /**
@@ -123,7 +150,7 @@ export interface FactoryProvider<T = any> {
  * };
  * ```
  *
- * @see [Use existing](https://docs.nestjs.com/fundamentals/custom-providers#use-existing)
+ * @see [Alias providers](https://docs.nestjs.com/fundamentals/custom-providers#alias-providers-useexisting)
  *
  * @publicApi
  */
@@ -131,7 +158,7 @@ export interface ExistingProvider<T = any> {
   /**
    * Injection token
    */
-  provide: string | symbol | Type<any> | Abstract<any> | Function;
+  provide: InjectionToken;
   /**
    * Provider to be aliased by the Injection token.
    */

@@ -1,85 +1,211 @@
-import { isUndefined } from '@nestjs/common/utils/shared.utils';
-import { Observable } from 'rxjs';
 import {
-  CONNECT_EVENT,
-  ERROR_EVENT,
-  MESSAGE_EVENT,
+  CONNECTION_FAILED_MESSAGE,
   MQTT_DEFAULT_URL,
+  MQTT_MAX_TOPIC_LENGTH,
   MQTT_SEPARATOR,
   MQTT_WILDCARD_ALL,
   MQTT_WILDCARD_SINGLE,
   NO_MESSAGE_HANDLER,
-} from '../constants';
-import { MqttContext } from '../ctx-host/mqtt.context';
-import { Transport } from '../enums';
-import { MqttClient } from '../external/mqtt-client.interface';
+} from '../constants.js';
+import { MqttContext } from '../ctx-host/mqtt.context.js';
+import { Transport } from '../enums/index.js';
+import { MaxMqttTopicLengthExceededException } from '../errors/max-mqtt-topic-length-exceeded.exception.js';
 import {
-  CustomTransportStrategy,
+  MqttEvents,
+  MqttEventsMap,
+  MqttStatus,
+} from '../events/mqtt.events.js';
+import {
   IncomingRequest,
   MessageHandler,
   PacketId,
   ReadPacket,
-} from '../interfaces';
-import { MqttOptions } from '../interfaces/microservice-configuration.interface';
-import { Server } from './server';
+} from '../interfaces/index.js';
+import {
+  MqttOptions,
+  TransportId,
+} from '../interfaces/microservice-configuration.interface.js';
+import { MqttRecord } from '../record-builders/mqtt.record-builder.js';
+import { MqttRecordSerializer } from '../serializers/mqtt-record.serializer.js';
+import { Server } from './server.js';
+import { isUndefined } from '@nestjs/common/internal';
 
-let mqttPackage: any = {};
+const INFINITE_CONNECTION_ATTEMPTS = -1;
 
-export class ServerMqtt extends Server implements CustomTransportStrategy {
-  public readonly transportId = Transport.MQTT;
+// To enable type safety for MQTT. This cant be uncommented by default
+// because it would require the user to install the mqtt package even if they dont use MQTT
+// Otherwise, TypeScript would fail to compile the code.
+//
+// type MqttClient = import('mqtt').MqttClient;
+type MqttClient = any;
 
-  private readonly url: string;
-  private mqttClient: MqttClient;
+/**
+ * @publicApi
+ */
+export class ServerMqtt extends Server<MqttEvents, MqttStatus> {
+  public transportId: TransportId = Transport.MQTT;
+  protected readonly url: string;
+  protected mqttClient: MqttClient;
+  private closeCount = 0;
+  protected connectionAttempts = 0;
+  protected hasConnected = false;
+  protected pendingEventListeners: Array<{
+    event: keyof MqttEvents;
+    callback: MqttEvents[keyof MqttEvents];
+  }> = [];
 
-  constructor(private readonly options: MqttOptions['options']) {
+  constructor(private readonly options: Required<MqttOptions>['options']) {
     super();
-    this.url = this.getOptionsProp(options, 'url') || MQTT_DEFAULT_URL;
-
-    mqttPackage = this.loadPackage('mqtt', ServerMqtt.name, () =>
-      require('mqtt'),
-    );
+    this.url = this.getOptionsProp(options, 'url', MQTT_DEFAULT_URL);
 
     this.initializeSerializer(options);
     this.initializeDeserializer(options);
   }
 
-  public async listen(callback: () => void) {
-    this.mqttClient = this.createMqttClient();
-    this.start(callback);
+  public async listen(
+    callback: (err?: unknown, ...optionalParams: unknown[]) => void,
+  ) {
+    const closeCount = this.closeCount;
+    try {
+      // Re-arm the attempts limit so that a restarted server gets a fresh
+      // startup window.
+      this.connectionAttempts = 0;
+      this.hasConnected = false;
+
+      const mqttClient = await this.createMqttClient();
+      if (this.closeCount !== closeCount) {
+        await mqttClient.endAsync().catch(() => {});
+        callback(new Error('Connection closed'));
+        return;
+      }
+      this.mqttClient = mqttClient;
+      this.start(callback);
+    } catch (err) {
+      callback(err);
+    }
   }
 
-  public start(callback?: () => void) {
-    this.handleError(this.mqttClient);
+  public start(
+    callback: (err?: unknown, ...optionalParams: unknown[]) => void,
+  ) {
+    // The bootstrap callback must settle exactly once, no matter whether the
+    // connection succeeds or the attempts limit is exhausted first.
+    let listenCallback:
+      ((err?: unknown, ...optionalParams: unknown[]) => void) | undefined =
+      callback;
+    const settleListenCallback = (err?: unknown) => {
+      const cb = listenCallback;
+      listenCallback = undefined;
+      isUndefined(err) ? cb?.() : cb?.(err);
+    };
+
+    this.registerErrorListener(this.mqttClient, settleListenCallback);
+    this.registerReconnectListener(this.mqttClient);
+    this.registerDisconnectListener(this.mqttClient);
+    this.registerCloseListener(this.mqttClient);
+    this.registerConnectListener(this.mqttClient);
+
+    this.pendingEventListeners.forEach(({ event, callback }) =>
+      this.mqttClient.on(event, callback),
+    );
+    this.pendingEventListeners = [];
     this.bindEvents(this.mqttClient);
 
-    this.mqttClient.on(CONNECT_EVENT, callback);
+    this.mqttClient.once(MqttEventsMap.CONNECT, () => settleListenCallback());
   }
 
   public bindEvents(mqttClient: MqttClient) {
-    mqttClient.on(MESSAGE_EVENT, this.getMessageHandler(mqttClient).bind(this));
+    mqttClient.on('message', this.getMessageHandler(mqttClient).bind(this));
+
     const registeredPatterns = [...this.messageHandlers.keys()];
     registeredPatterns.forEach(pattern => {
-      const { isEventHandler } = this.messageHandlers.get(pattern);
+      const handler = this.messageHandlers.get(pattern)!;
+      const { extras } = handler;
+
+      const globalSubscribeOptions = this.getOptionsProp(
+        this.options,
+        'subscribeOptions',
+      );
+      const subscribeOptions =
+        extras?.qos !== undefined
+          ? { ...globalSubscribeOptions, qos: extras.qos }
+          : globalSubscribeOptions;
+
       mqttClient.subscribe(
-        isEventHandler ? pattern : this.getRequestPattern(pattern),
+        this.getSubscriptionTopic(pattern, handler),
+        subscribeOptions,
       );
     });
   }
 
-  public close() {
-    this.mqttClient && this.mqttClient.end();
+  public async close() {
+    this.closeCount++;
+    // Reset first, so that the status update of the client being closed is not
+    // taken for the connection that gave up, and a listener registered right
+    // after close() waits for the next listen() instead of attaching to it
+    const mqttClient = this.mqttClient;
+    this.mqttClient = null;
+    this.pendingEventListeners = [];
+    if (mqttClient && this.getOptionsProp(this.options, 'gracefulShutdown')) {
+      await this.stopReceivingMessages(mqttClient);
+      await this.waitForHandlersInFlight(
+        this.getOptionsProp(this.options, 'gracePeriod'),
+      );
+    }
+    // Awaited, so that a close() the caller awaits really has the connection
+    // closed, as with the other transports: mqtt closes it on a later tick and
+    // the broker still delivers to it until then
+    await mqttClient?.endAsync();
   }
 
-  public createMqttClient(): MqttClient {
-    return mqttPackage.connect(this.url, this.options as MqttOptions);
+  private async stopReceivingMessages(mqttClient: MqttClient) {
+    // On a reconnect, mqtt subscribes again to every topic it has not
+    // unsubscribed from. Turned off, as the client is discarded after close().
+    mqttClient.options.resubscribe = false;
+    const topics = [...this.messageHandlers].map(([pattern, handler]) =>
+      this.getSubscriptionTopic(pattern, handler),
+    );
+    // While disconnected, mqtt would keep the packet for the next connection,
+    // which end() would then wait for. That connection does not resubscribe.
+    if (topics.length === 0 || !mqttClient.connected) {
+      return;
+    }
+    try {
+      await mqttClient.unsubscribeAsync(topics);
+    } catch {
+      // The connection was lost before the broker answered. The next one does
+      // not resubscribe either.
+    }
   }
 
-  public getMessageHandler(pub: MqttClient): Function {
+  private getSubscriptionTopic(pattern: string, handler: MessageHandler) {
+    return handler.isEventHandler ? pattern : this.getRequestPattern(pattern);
+  }
+
+  public async createMqttClient(): Promise<MqttClient> {
+    const mqttPackage = await this.loadPackage(
+      'mqtt',
+      ServerMqtt.name,
+      () => import('mqtt'),
+    );
+    // mqtt stops reconnecting for good once the broker refuses a connection
+    // (CONNACK error), which would leave the server disconnected. Retry as
+    // after any other failed attempt, unless told otherwise.
+    return mqttPackage.connect(this.url, {
+      reconnectOnConnackError: true,
+      ...this.options,
+    } as any);
+  }
+
+  public getMessageHandler(pub: MqttClient) {
     return async (
       channel: string,
       buffer: Buffer,
       originalPacket?: Record<string, any>,
-    ) => this.handleMessage(channel, buffer, pub, originalPacket);
+    ) =>
+      this.handleMessage(channel, buffer, pub, originalPacket).catch(err =>
+        this.handleError(err),
+      );
   }
 
   public async handleMessage(
@@ -89,14 +215,18 @@ export class ServerMqtt extends Server implements CustomTransportStrategy {
     originalPacket?: Record<string, any>,
   ): Promise<any> {
     const rawPacket = this.parseMessage(buffer.toString());
-    const packet = this.deserializer.deserialize(rawPacket, { channel });
-    const mqttContext = new MqttContext([channel, originalPacket]);
+    if (this.isOwnReply(channel, rawPacket)) {
+      return;
+    }
+    const packet = await this.deserializer.deserialize(rawPacket, { channel });
+    const mqttContext = new MqttContext([channel, originalPacket!]);
     if (isUndefined((packet as IncomingRequest).id)) {
       return this.handleEvent(channel, packet, mqttContext);
     }
+    this.assertValidPacketId((packet as IncomingRequest).id);
     const publish = this.getPublisher(
       pub,
-      channel,
+      mqttContext,
       (packet as IncomingRequest).id,
     );
     const handler = this.getHandlerByPattern(channel);
@@ -110,20 +240,58 @@ export class ServerMqtt extends Server implements CustomTransportStrategy {
       };
       return publish(noHandlerPacket);
     }
-    const response$ = this.transformToObservable(
-      await handler(packet.data, mqttContext),
-    ) as Observable<any>;
-    response$ && this.send(response$, publish);
+    this.warnIfEventHandlerReplies(handler, channel);
+    return this.handleRequest(
+      mqttContext,
+      async () =>
+        this.transformToObservable(await handler(packet.data, mqttContext)),
+      publish,
+    );
   }
 
-  public getPublisher(client: MqttClient, pattern: any, id: string): any {
+  /**
+   * A filter that ends in "#" also matches the topic this server replies on
+   * ("orders/1/reply"), so the broker hands the server its own replies. Those
+   * are skipped unless a handler's filter targets reply topics.
+   */
+  private isOwnReply(topic: string, packet: Record<string, any>) {
+    const replySuffix = this.getReplyPattern('');
+    return (
+      topic.endsWith(replySuffix) &&
+      !isUndefined(packet?.id) &&
+      isUndefined(packet?.pattern) &&
+      ![...this.messageHandlers.keys()].some(key => {
+        const filter = this.removeHandlerKeySharedPrefix(key);
+        return (
+          filter.endsWith(replySuffix) && this.matchMqttPattern(filter, topic)
+        );
+      })
+    );
+  }
+
+  public getPublisher(
+    client: MqttClient,
+    context: MqttContext,
+    id: string,
+  ): any {
+    // Checked before the handler runs, as none of its replies could be sent
+    this.assertTopicLength(this.getReplyPattern(context.getTopic()));
+
     return (response: any) => {
       Object.assign(response, { id });
-      const outgoingResponse = this.serializer.serialize(response);
+
+      const options =
+        response.response instanceof MqttRecord
+          ? response.response.options
+          : {};
+
+      const outgoingResponse: string | Buffer =
+        this.serializer.serialize(response);
 
       return client.publish(
-        this.getReplyPattern(pattern),
-        JSON.stringify(outgoingResponse),
+        this.getReplyPattern(context.getTopic()),
+        outgoingResponse,
+        options,
       );
     };
   }
@@ -137,6 +305,13 @@ export class ServerMqtt extends Server implements CustomTransportStrategy {
   }
 
   public matchMqttPattern(pattern: string, topic: string) {
+    // MQTT 3.1.1 section 4.7.2 excludes $ topics from leading wildcards.
+    if (
+      topic.startsWith('$') &&
+      (pattern[0] === MQTT_WILDCARD_ALL || pattern[0] === MQTT_WILDCARD_SINGLE)
+    ) {
+      return false;
+    }
     const patternSegments = pattern.split(MQTT_SEPARATOR);
     const topicSegments = topic.split(MQTT_SEPARATOR);
 
@@ -149,10 +324,7 @@ export class ServerMqtt extends Server implements CustomTransportStrategy {
       const patternChar = currentPattern[0];
       const currentTopic = topicSegments[i];
 
-      if (!currentTopic && !currentPattern) {
-        continue;
-      }
-      if (!currentTopic && currentPattern !== MQTT_WILDCARD_ALL) {
+      if (isUndefined(currentTopic) && currentPattern !== MQTT_WILDCARD_ALL) {
         return false;
       }
       if (patternChar === MQTT_WILDCARD_ALL) {
@@ -169,23 +341,33 @@ export class ServerMqtt extends Server implements CustomTransportStrategy {
   }
 
   public getHandlerByPattern(pattern: string): MessageHandler | null {
-    const route = this.getRouteFromPattern(pattern);
+    // The topic is matched as the broker delivered it, which is what its ACLs
+    // checked: decoded as JSON, '"admin/reset"' would reach the handler of
+    // "admin/reset". Only the topic of an object pattern is decoded, so that
+    // its keys are sorted as the handler's are.
+    const route = pattern.startsWith('{')
+      ? this.getRouteFromPattern(pattern)
+      : pattern;
     if (this.messageHandlers.has(route)) {
       return this.messageHandlers.get(route) || null;
     }
 
+    // Wildcard filters are matched against the topic itself: decoding moves
+    // its levels around ('/' inside a JSON string is a level separator), so
+    // the decoded topic can match a filter that the topic does not.
     for (const [key, value] of this.messageHandlers) {
-      if (
-        key.indexOf(MQTT_WILDCARD_SINGLE) === -1 &&
-        key.indexOf(MQTT_WILDCARD_ALL) === -1
-      ) {
-        continue;
-      }
-      if (this.matchMqttPattern(key, route)) {
+      const keyWithoutSharedPrefix = this.removeHandlerKeySharedPrefix(key);
+      if (this.matchMqttPattern(keyWithoutSharedPrefix, pattern)) {
         return value;
       }
     }
     return null;
+  }
+
+  public removeHandlerKeySharedPrefix(handlerKey: string) {
+    return handlerKey && handlerKey.startsWith('$share/')
+      ? handlerKey.split('/').slice(2).join('/')
+      : handlerKey;
   }
 
   public getRequestPattern(pattern: string): string {
@@ -196,7 +378,99 @@ export class ServerMqtt extends Server implements CustomTransportStrategy {
     return `${pattern}/reply`;
   }
 
-  public handleError(stream: any) {
-    stream.on(ERROR_EVENT, (err: any) => this.logger.error(err));
+  /**
+   * A topic's length is encoded in two bytes, and "/reply" can take a topic
+   * the broker delivered past it. mqtt.js only fails on a longer topic once it
+   * has written the start of the packet, so the broker would read the packets
+   * sent after it as the rest of that packet.
+   */
+  protected assertTopicLength(topic: string) {
+    const length = Buffer.byteLength(topic);
+    if (length > MQTT_MAX_TOPIC_LENGTH) {
+      throw new MaxMqttTopicLengthExceededException(
+        length,
+        MQTT_MAX_TOPIC_LENGTH,
+      );
+    }
+  }
+
+  public registerErrorListener(
+    client: MqttClient,
+    callback?: (err?: unknown, ...optionalParams: unknown[]) => void,
+  ) {
+    client.on(MqttEventsMap.ERROR, (err: unknown) => {
+      this.logger.error(err);
+
+      const maxConnectionAttempts = this.getOptionsProp(
+        this.options,
+        'maxConnectionAttempts',
+        INFINITE_CONNECTION_ATTEMPTS,
+      );
+      // The limit bounds the initial connection only. Once the server has
+      // connected, mqtt.js reconnects indefinitely and errors are just logged,
+      // so a running microservice is never torn down by this option.
+      if (
+        maxConnectionAttempts === INFINITE_CONNECTION_ATTEMPTS ||
+        this.hasConnected
+      ) {
+        return;
+      }
+      if (++this.connectionAttempts === maxConnectionAttempts) {
+        // The failure that is reported is the connection one, not a close one
+        this.close().catch(closeErr => this.logger.error(closeErr));
+        callback?.(err ?? new Error(CONNECTION_FAILED_MESSAGE));
+      }
+    });
+  }
+
+  public registerReconnectListener(client: MqttClient) {
+    client.on(MqttEventsMap.RECONNECT, () => {
+      this._status$.next(MqttStatus.RECONNECTING);
+
+      this.logger.log('MQTT connection lost. Trying to reconnect...');
+    });
+  }
+
+  public registerDisconnectListener(client: MqttClient) {
+    client.on(MqttEventsMap.DISCONNECT, () => {
+      this._status$.next(MqttStatus.DISCONNECTED);
+    });
+  }
+
+  public registerCloseListener(client: MqttClient) {
+    client.on(MqttEventsMap.CLOSE, () => {
+      this._status$.next(MqttStatus.CLOSED);
+    });
+  }
+
+  public registerConnectListener(client: MqttClient) {
+    client.on(MqttEventsMap.CONNECT, () => {
+      this.hasConnected = true;
+      this._status$.next(MqttStatus.CONNECTED);
+    });
+  }
+
+  public unwrap<T>(): T {
+    if (!this.mqttClient) {
+      throw new Error(
+        'Not initialized. Please call the "listen"/"startAllMicroservices" method before accessing the server.',
+      );
+    }
+    return this.mqttClient as T;
+  }
+
+  public on<
+    EventKey extends keyof MqttEvents = keyof MqttEvents,
+    EventCallback extends MqttEvents[EventKey] = MqttEvents[EventKey],
+  >(event: EventKey, callback: EventCallback) {
+    if (this.mqttClient) {
+      this.mqttClient.on(event, callback as any);
+    } else {
+      this.pendingEventListeners.push({ event, callback });
+    }
+  }
+
+  protected initializeSerializer(options: MqttOptions['options']) {
+    this.serializer = options?.serializer ?? new MqttRecordSerializer();
   }
 }

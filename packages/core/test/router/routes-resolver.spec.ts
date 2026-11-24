@@ -1,15 +1,16 @@
-import { BadRequestException, Module, Post } from '@nestjs/common';
-import { MODULE_PATH } from '@nestjs/common/constants';
-import { expect } from 'chai';
-import * as sinon from 'sinon';
-import { Controller } from '../../../common/decorators/core/controller.decorator';
-import { Get } from '../../../common/decorators/http/request-mapping.decorator';
-import { ApplicationConfig } from '../../application-config';
-import { NestContainer } from '../../injector';
-import { Injector } from '../../injector/injector';
-import { InstanceWrapper } from '../../injector/instance-wrapper';
-import { RoutesResolver } from '../../router/routes-resolver';
-import { NoopHttpAdapter } from '../utils/noop-adapter.spec';
+import { Module, Post, RequestMethod, VersioningType } from '@nestjs/common';
+import { MODULE_PATH } from '@nestjs/common/constants.js';
+import { Controller } from '../../../common/decorators/core/controller.decorator.js';
+import { Get } from '../../../common/decorators/http/request-mapping.decorator.js';
+import { ApplicationConfig } from '../../application-config.js';
+import { NestContainer } from '../../injector/index.js';
+import { Injector } from '../../injector/injector.js';
+import { mapToExcludeRoute } from '../../middleware/utils.js';
+import { InstanceWrapper } from '../../injector/instance-wrapper.js';
+import { GraphInspector } from '../../inspector/graph-inspector.js';
+import { SerializedGraph } from '../../inspector/serialized-graph.js';
+import { RoutesResolver } from '../../router/routes-resolver.js';
+import { NoopHttpAdapter } from '../utils/noop-adapter.js';
 
 describe('RoutesResolver', () => {
   @Controller('global')
@@ -27,6 +28,12 @@ describe('RoutesResolver', () => {
     public getTest() {}
   }
 
+  @Controller({ version: '1' })
+  class TestVersionRoute {
+    @Get()
+    public getTest() {}
+  }
+
   @Module({
     controllers: [TestRoute],
   })
@@ -39,6 +46,7 @@ describe('RoutesResolver', () => {
 
   let router: any;
   let routesResolver: RoutesResolver;
+  let untypedRoutesResolver: any;
   let container: NestContainer;
   let modules: Map<string, any>;
   let applicationRef: any;
@@ -47,13 +55,14 @@ describe('RoutesResolver', () => {
     modules = new Map();
     applicationRef = {
       use: () => ({}),
-      setNotFoundHandler: sinon.spy(),
-      setErrorHandler: sinon.spy(),
+      setNotFoundHandler: vi.fn(),
+      setErrorHandler: vi.fn(),
     } as any;
     container = {
       getModules: () => modules,
       getModuleByKey: (key: string) => modules.get(key),
       getHttpAdapterRef: () => applicationRef,
+      serializedGraph: new SerializedGraph(),
     } as any;
     router = {
       get() {},
@@ -66,7 +75,9 @@ describe('RoutesResolver', () => {
       container,
       new ApplicationConfig(),
       new Injector(),
+      new GraphInspector(container),
     );
+    untypedRoutesResolver = routesResolver as any;
   });
 
   describe('registerRouters', () => {
@@ -79,21 +90,37 @@ describe('RoutesResolver', () => {
       routes.set('TestRoute', routeWrapper);
 
       const appInstance = new NoopHttpAdapter(router);
-      const exploreSpy = sinon.spy(
-        (routesResolver as any).routerExplorer,
+      const exploreSpy = vi.spyOn(
+        untypedRoutesResolver.routerExplorer,
         'explore',
       );
       const moduleName = '';
       modules.set(moduleName, {});
 
-      sinon
-        .stub((routesResolver as any).routerExplorer, 'extractRouterPath')
-        .callsFake(() => ['']);
-      routesResolver.registerRouters(routes, moduleName, '', appInstance);
+      vi.spyOn(
+        untypedRoutesResolver.routerExplorer,
+        'extractRouterPath',
+      ).mockImplementation(() => ['']);
+      routesResolver.registerRouters(routes, moduleName, '', '', appInstance);
 
-      expect(exploreSpy.called).to.be.true;
-      expect(exploreSpy.calledWith(routeWrapper, moduleName, appInstance, ''))
-        .to.be.true;
+      const routePathMetadata = {
+        ctrlPath: '',
+        modulePath: '',
+        globalPrefix: '',
+        controllerVersion: undefined,
+        versioningOptions: undefined,
+        methodVersion: undefined,
+        methodPath: '/another-test',
+      };
+      expect(exploreSpy).toHaveBeenCalled();
+      expect(exploreSpy).toHaveBeenCalledWith(
+        routeWrapper,
+        moduleName,
+        appInstance,
+        undefined,
+        routePathMetadata,
+        {},
+      );
     });
 
     it('should register with host when specified', () => {
@@ -105,28 +132,95 @@ describe('RoutesResolver', () => {
       routes.set('TestHostRoute', routeWrapper);
 
       const appInstance = new NoopHttpAdapter(router);
-      const exploreSpy = sinon.spy(
-        (routesResolver as any).routerExplorer,
+      const exploreSpy = vi.spyOn(
+        untypedRoutesResolver.routerExplorer,
         'explore',
       );
       const moduleName = '';
       modules.set(moduleName, {});
 
-      sinon
-        .stub((routesResolver as any).routerExplorer, 'extractRouterPath')
-        .callsFake(() => ['']);
-      routesResolver.registerRouters(routes, moduleName, '', appInstance);
+      vi.spyOn(
+        untypedRoutesResolver.routerExplorer,
+        'extractRouterPath',
+      ).mockImplementation(() => ['']);
+      routesResolver.registerRouters(routes, moduleName, '', '', appInstance);
 
-      expect(exploreSpy.called).to.be.true;
-      expect(
-        exploreSpy.calledWith(
-          routeWrapper,
-          moduleName,
-          appInstance,
-          '',
-          'api.example.com',
-        ),
-      ).to.be.true;
+      const routePathMetadata = {
+        ctrlPath: '',
+        modulePath: '',
+        globalPrefix: '',
+        controllerVersion: undefined,
+        versioningOptions: undefined,
+        methodVersion: undefined,
+        methodPath: '/',
+      };
+
+      expect(exploreSpy).toHaveBeenCalled();
+      expect(exploreSpy).toHaveBeenCalledWith(
+        routeWrapper,
+        moduleName,
+        appInstance,
+        'api.example.com',
+        routePathMetadata,
+        {},
+      );
+    });
+
+    it('should register with version when specified', () => {
+      const applicationConfig = new ApplicationConfig();
+      applicationConfig.enableVersioning({
+        type: VersioningType.URI,
+      });
+      routesResolver = new RoutesResolver(
+        container,
+        applicationConfig,
+        new Injector(),
+        new GraphInspector(container),
+      );
+      untypedRoutesResolver = routesResolver as any;
+
+      const routes = new Map();
+      const routeWrapper = new InstanceWrapper({
+        instance: new TestVersionRoute(),
+        metatype: TestVersionRoute,
+      });
+      routes.set('TestVersionRoute', routeWrapper);
+
+      const appInstance = new NoopHttpAdapter(router);
+      const exploreSpy = vi.spyOn(
+        untypedRoutesResolver.routerExplorer,
+        'explore',
+      );
+      const moduleName = '';
+      modules.set(moduleName, {});
+
+      vi.spyOn(
+        untypedRoutesResolver.routerExplorer,
+        'extractRouterPath',
+      ).mockImplementation(() => ['']);
+      routesResolver.registerRouters(routes, moduleName, '', '', appInstance);
+
+      const routePathMetadata = {
+        ctrlPath: '',
+        modulePath: '',
+        globalPrefix: '',
+        controllerVersion: '1',
+        versioningOptions: {
+          type: VersioningType.URI,
+        },
+        methodVersion: undefined,
+        methodPath: '/',
+      };
+
+      expect(exploreSpy).toHaveBeenCalled();
+      expect(exploreSpy).toHaveBeenCalledWith(
+        routeWrapper,
+        moduleName,
+        appInstance,
+        undefined,
+        routePathMetadata,
+        {},
+      );
     });
   });
 
@@ -140,15 +234,15 @@ describe('RoutesResolver', () => {
           metatype: TestRoute,
         }),
       );
-      modules.set('TestModule', { routes });
-      modules.set('TestModule2', { routes });
+      modules.set('TestModule', { routes, metatype: class {} });
+      modules.set('TestModule2', { routes, metatype: class {} });
 
-      const registerRoutersStub = sinon
-        .stub(routesResolver, 'registerRouters')
-        .callsFake(() => undefined);
+      const registerRoutersStub = vi
+        .spyOn(routesResolver, 'registerRouters')
+        .mockImplementation(() => undefined);
 
-      routesResolver.resolve({ use: sinon.spy() } as any, 'basePath');
-      expect(registerRoutersStub.calledTwice).to.be.true;
+      routesResolver.resolve({ use: vi.fn() } as any, 'basePath');
+      expect(registerRoutersStub).toHaveBeenCalledTimes(2);
     });
 
     describe('registerRouters', () => {
@@ -163,34 +257,15 @@ describe('RoutesResolver', () => {
         modules.set('TestModule', { routes, metatype: TestModule });
         modules.set('TestModule2', { routes, metatype: TestModule2 });
 
-        const spy = sinon
-          .stub(routesResolver, 'registerRouters')
-          .callsFake(() => undefined);
+        const spy = vi
+          .spyOn(routesResolver, 'registerRouters')
+          .mockImplementation(() => undefined);
 
         routesResolver.resolve(applicationRef, 'api/v1');
 
-        // with module path
-        expect(
-          spy
-            .getCall(0)
-            .calledWith(
-              sinon.match.any,
-              sinon.match.any,
-              'api/v1/test',
-              sinon.match.any,
-            ),
-        ).to.be.true;
-        // without module path
-        expect(
-          spy
-            .getCall(1)
-            .calledWith(
-              sinon.match.any,
-              sinon.match.any,
-              'api/v1',
-              sinon.match.any,
-            ),
-        ).to.be.true;
+        expect(spy.mock.calls[0][2]).toBe('api/v1');
+        expect(spy.mock.calls[0][3]).toBe('/test');
+        expect(spy.mock.calls[1][2]).toBe('api/v1');
       });
 
       it('should register each module with the module path if present', () => {
@@ -204,48 +279,17 @@ describe('RoutesResolver', () => {
         modules.set('TestModule', { routes, metatype: TestModule });
         modules.set('TestModule2', { routes, metatype: TestModule2 });
 
-        const spy = sinon
-          .stub(routesResolver, 'registerRouters')
-          .callsFake(() => undefined);
+        const spy = vi
+          .spyOn(routesResolver, 'registerRouters')
+          .mockImplementation(() => undefined);
 
         routesResolver.resolve(applicationRef, '');
 
-        // with module path
-        expect(
-          spy
-            .getCall(0)
-            .calledWith(
-              sinon.match.any,
-              sinon.match.any,
-              '/test',
-              sinon.match.any,
-            ),
-        ).to.be.true;
+        expect(spy.mock.calls[0][2]).toBe('');
+        expect(spy.mock.calls[0][3]).toBe('/test');
         // without module path
-        expect(
-          spy
-            .getCall(1)
-            .calledWith(sinon.match.any, sinon.match.any, '', sinon.match.any),
-        ).to.be.true;
-      });
-    });
-  });
-
-  describe('mapExternalExceptions', () => {
-    describe('when exception prototype is', () => {
-      describe('SyntaxError', () => {
-        it('should map to BadRequestException', () => {
-          const err = new SyntaxError();
-          const outputErr = routesResolver.mapExternalException(err);
-          expect(outputErr).to.be.instanceof(BadRequestException);
-        });
-      });
-      describe('other', () => {
-        it('should behave as an identity', () => {
-          const err = new Error();
-          const outputErr = routesResolver.mapExternalException(err);
-          expect(outputErr).to.be.eql(err);
-        });
+        expect(spy.mock.calls[1][2]).toBe('');
+        expect(spy.mock.calls[1][3]).toBeUndefined();
       });
     });
   });
@@ -254,7 +298,45 @@ describe('RoutesResolver', () => {
     it('should register not found handler', () => {
       routesResolver.registerNotFoundHandler();
 
-      expect(applicationRef.setNotFoundHandler.called).to.be.true;
+      expect(applicationRef.setNotFoundHandler).toHaveBeenCalled();
+    });
+
+    it('should pass the excluded routes as RouteInfo', () => {
+      const applicationConfig = new ApplicationConfig();
+      applicationConfig.setGlobalPrefix('api');
+      applicationConfig.setGlobalPrefixOptions({
+        exclude: mapToExcludeRoute([
+          'health',
+          { path: 'hello', method: RequestMethod.GET },
+        ]),
+      });
+      routesResolver = new RoutesResolver(
+        container,
+        applicationConfig,
+        new Injector(),
+        new GraphInspector(container),
+      );
+
+      routesResolver.registerNotFoundHandler();
+
+      expect(applicationRef.setNotFoundHandler).toHaveBeenCalledWith(
+        expect.any(Function),
+        'api',
+        [
+          { path: 'health', method: RequestMethod.ALL },
+          { path: 'hello', method: RequestMethod.GET },
+        ],
+      );
+    });
+
+    it('should pass no excluded routes when the prefix has no options', () => {
+      routesResolver.registerNotFoundHandler();
+
+      expect(applicationRef.setNotFoundHandler).toHaveBeenCalledWith(
+        expect.any(Function),
+        '',
+        [],
+      );
     });
   });
 
@@ -262,7 +344,7 @@ describe('RoutesResolver', () => {
     it('should register exception handler', () => {
       routesResolver.registerExceptionHandler();
 
-      expect(applicationRef.setErrorHandler.called).to.be.true;
+      expect(applicationRef.setErrorHandler).toHaveBeenCalled();
     });
   });
 });

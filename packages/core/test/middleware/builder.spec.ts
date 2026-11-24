@@ -1,51 +1,378 @@
-import { RequestMethod } from '@nestjs/common';
-import { expect } from 'chai';
-import { Controller, Get } from '../../../common';
-import { NestContainer } from '../../injector/container';
-import { MiddlewareBuilder } from '../../middleware/builder';
-import { RoutesMapper } from '../../middleware/routes-mapper';
-import { NoopHttpAdapter } from './../utils/noop-adapter.spec';
+import {
+  Controller,
+  Delete,
+  Get,
+  Head,
+  Options,
+  Patch,
+  Post,
+  Put,
+  RequestMethod,
+  Version,
+  VersioningType,
+} from '../../../common/index.js';
+import { MiddlewareConfigProxy } from '../../../common/interfaces/index.js';
+import { ApplicationConfig } from '../../application-config.js';
+import { NestContainer } from '../../injector/container.js';
+import { MiddlewareBuilder } from '../../middleware/builder.js';
+import { RouteInfoPathExtractor } from '../../middleware/route-info-path-extractor.js';
+import { RoutesMapper } from '../../middleware/routes-mapper.js';
+import { mapToExcludeRoute } from '../../middleware/utils.js';
+import { NoopHttpAdapter } from './../utils/noop-adapter.js';
 
 describe('MiddlewareBuilder', () => {
   let builder: MiddlewareBuilder;
 
   beforeEach(() => {
+    const container = new NestContainer();
+    const appConfig = new ApplicationConfig();
+    appConfig.enableVersioning({ type: VersioningType.URI });
     builder = new MiddlewareBuilder(
-      new RoutesMapper(new NestContainer()),
+      new RoutesMapper(container, appConfig),
       new NoopHttpAdapter({}),
+      new RouteInfoPathExtractor(appConfig),
     );
   });
   describe('apply', () => {
-    let configProxy;
-    beforeEach(() => {
-      configProxy = builder.apply([]);
-    });
     it('should return configuration proxy', () => {
+      const configProxy = builder.apply([]);
       const metatype = (MiddlewareBuilder as any).ConfigProxy;
-      expect(configProxy instanceof metatype).to.be.true;
+      expect(configProxy instanceof metatype).toBe(true);
     });
+
     describe('configuration proxy', () => {
       describe('when "forRoutes()" called', () => {
+        let configProxy: MiddlewareConfigProxy;
+        beforeEach(() => {
+          configProxy = builder.apply([]);
+        });
         @Controller('path')
         class Test {
           @Get('route')
           public getAll() {}
+
+          @Version('1')
+          @Get('versioned')
+          public getAllVersioned() {}
         }
-        const route = { path: '/test', method: 0 };
+        const route = { path: '/test', method: RequestMethod.GET };
+
         it('should store configuration passed as argument', () => {
           configProxy.forRoutes(route, Test);
 
-          expect(builder.build()).to.deep.equal([
+          expect(builder.build()).toEqual([
             {
               middleware: [],
               forRoutes: [
                 {
-                  method: 0,
+                  method: RequestMethod.GET,
                   path: route.path,
                 },
                 {
-                  method: 0,
+                  method: RequestMethod.GET,
                   path: '/path/route',
+                },
+                {
+                  method: RequestMethod.GET,
+                  path: '/path/versioned',
+                  version: '1',
+                },
+              ],
+            },
+          ]);
+        });
+
+        @Controller('users')
+        class UsersController {
+          @Head('rsvp')
+          hRsvp() {}
+
+          @Options('rsvp')
+          oRsvp() {}
+
+          @Get('rsvp')
+          gRsvp() {}
+
+          @Post('rsvp')
+          pRsvp() {}
+
+          @Put('rsvp')
+          puRsvp() {}
+
+          @Patch('rsvp')
+          ptRsvp() {}
+
+          @Delete('rsvp')
+          dRsvp() {}
+
+          @Post()
+          create() {}
+
+          @Get()
+          findAll() {}
+
+          @Get(':id')
+          findOne() {}
+
+          @Patch(':id')
+          update() {}
+
+          @Delete(':id')
+          remove() {}
+        }
+
+        it('should remove overlapping routes', () => {
+          configProxy.forRoutes(UsersController);
+
+          expect(builder.build()).toEqual([
+            {
+              middleware: [],
+              forRoutes: [
+                {
+                  method: RequestMethod.HEAD,
+                  path: '/users/rsvp',
+                },
+                {
+                  method: RequestMethod.OPTIONS,
+                  path: '/users/rsvp',
+                },
+                {
+                  method: RequestMethod.POST,
+                  path: '/users/rsvp',
+                },
+                {
+                  method: RequestMethod.PUT,
+                  path: '/users/rsvp',
+                },
+                {
+                  method: RequestMethod.POST,
+                  path: '/users/',
+                },
+                {
+                  method: RequestMethod.GET,
+                  path: '/users/',
+                },
+                {
+                  method: RequestMethod.GET,
+                  path: '/users/:id',
+                },
+                {
+                  method: RequestMethod.PATCH,
+                  path: '/users/:id',
+                },
+                {
+                  method: RequestMethod.DELETE,
+                  path: '/users/:id',
+                },
+                // Overlapping:
+                // {
+                //   method: RequestMethod.GET,
+                //   path: '/users/rsvp',
+                // },
+                // {
+                //   method: RequestMethod.PATCH,
+                //   path: '/users/rsvp',
+                // },
+                // {
+                //   method: RequestMethod.DELETE,
+                //   path: '/users/rsvp',
+                // },
+              ],
+            },
+          ]);
+        });
+
+        it('should not remove a route the parameterized one is not mounted on', () => {
+          const routes = [
+            { path: '/docs/:id.json', method: RequestMethod.GET },
+            { path: '/docs/admin', method: RequestMethod.GET },
+            { path: '/files/:id', method: RequestMethod.GET },
+            { path: '/files/{*path}', method: RequestMethod.GET },
+            { path: '/files/*path', method: RequestMethod.GET },
+            { path: '/projects/:id/files/*', method: RequestMethod.GET },
+            { path: '/projects/:id/files', method: RequestMethod.GET },
+            { path: '/reports/:id', method: RequestMethod.GET },
+            { path: '/reports/:slug', method: RequestMethod.GET },
+          ];
+          configProxy.forRoutes(...routes);
+
+          expect(builder.build()[0].forRoutes).toEqual(routes);
+        });
+
+        @Controller('invoices')
+        class InvoicesController {
+          @Get()
+          findAll() {}
+        }
+
+        it.each(['{*page}', '*', '{:page}'])(
+          'should not remove the root route of a controller next to ":tenant/%s"',
+          tail => {
+            // The root route is mounted on "/invoices/" and served at
+            // "/invoices", which the parameterized route only matches with
+            // the trailing slash
+            @Controller(':tenant')
+            class TenantPagesController {
+              @Get(tail)
+              findPage() {}
+            }
+            configProxy.forRoutes(InvoicesController, TenantPagesController);
+
+            expect(
+              builder.build()[0].forRoutes.map(({ path }: any) => path),
+            ).toEqual(['/invoices/', `/:tenant/${tail}`]);
+          },
+        );
+
+        it('should not remove the root route of a controller next to an optional parameter of its own', () => {
+          @Controller('a')
+          class AController {
+            @Get()
+            findAll() {}
+
+            @Get('{:id}')
+            findOne() {}
+          }
+          configProxy.forRoutes(AController);
+
+          expect(builder.build()[0].forRoutes).toEqual([
+            { path: '/a/', method: RequestMethod.GET },
+            { path: '/a/{:id}', method: RequestMethod.GET },
+          ]);
+        });
+
+        it('should remove the root route of a controller covered by the root route of a parameterized one', () => {
+          @Controller(':tenant')
+          class TenantController {
+            @Get()
+            findOne() {}
+          }
+          configProxy.forRoutes(InvoicesController, TenantController);
+
+          expect(builder.build()[0].forRoutes).toEqual([
+            { path: '/:tenant/', method: RequestMethod.GET },
+          ]);
+        });
+
+        it('should not remove a route of another version than the parameterized one', () => {
+          const routes = [
+            { path: '/accounts/:id', method: RequestMethod.GET, version: '1' },
+            { path: '/accounts/me', method: RequestMethod.GET, version: '2' },
+            {
+              path: '/accounts/:uuid',
+              method: RequestMethod.GET,
+              version: '3',
+            },
+          ];
+          configProxy.forRoutes(...routes);
+
+          expect(builder.build()[0].forRoutes).toEqual(routes);
+        });
+
+        it('should not remove a route excluded from the global prefix, unlike the parameterized one', () => {
+          const appConfig = new ApplicationConfig();
+          appConfig.setGlobalPrefix('api');
+          appConfig.setGlobalPrefixOptions({
+            exclude: mapToExcludeRoute(['users/me']),
+          });
+          builder = new MiddlewareBuilder(
+            new RoutesMapper(new NestContainer(), appConfig),
+            new NoopHttpAdapter({}),
+            new RouteInfoPathExtractor(appConfig),
+          );
+          const routes = [
+            { path: '/users/:id', method: RequestMethod.GET },
+            { path: '/users/me', method: RequestMethod.GET },
+          ];
+          builder.apply([]).forRoutes(...routes);
+
+          expect(builder.build()[0].forRoutes).toEqual(routes);
+        });
+
+        it('should remove a route of a specific method covered by an all-methods parameterized one', () => {
+          // A route passed to forRoutes() as a plain string is mounted for
+          // every method, so it serves "cats/me" declared for GET too:
+          // keeping both mounts would run the middleware twice for it
+          configProxy.forRoutes('cats/:id', {
+            path: 'cats/me',
+            method: RequestMethod.GET,
+          });
+
+          expect(builder.build()).toEqual([
+            {
+              middleware: [],
+              forRoutes: [
+                {
+                  method: -1,
+                  path: '/cats/:id',
+                },
+              ],
+            },
+          ]);
+        });
+
+        it('should not remove a plain string covered only by a parameterized RequestMethod.ALL route', () => {
+          // RequestMethod.ALL matches "cats/me" but not "cats/me/settings",
+          // while a plain string is mounted with use() and matches both
+          const routes = [
+            { path: '/cats/:id', method: RequestMethod.ALL },
+            { path: '/cats/me', method: -1 as any },
+          ];
+          configProxy.forRoutes(...routes);
+
+          expect(builder.build()[0].forRoutes).toEqual(routes);
+        });
+
+        it('should remove a plain string covered by a parameterized plain string', () => {
+          configProxy.forRoutes('cats/:id', 'cats/me');
+
+          expect(builder.build()[0].forRoutes).toEqual([
+            { path: '/cats/:id', method: -1 },
+          ]);
+        });
+
+        it('should remove a route of a specific method covered by a parameterized RequestMethod.ALL route', () => {
+          configProxy.forRoutes(
+            { path: 'cats/:id', method: RequestMethod.ALL },
+            { path: 'cats/me', method: RequestMethod.GET },
+          );
+
+          expect(builder.build()[0].forRoutes).toEqual([
+            { path: '/cats/:id', method: RequestMethod.ALL },
+          ]);
+        });
+
+        it('should not remove an all-methods route covered by a parameterized one of a specific method', () => {
+          // The parameterized route only serves GET requests, while the
+          // concrete route is mounted for every method: dropping it would
+          // leave its other methods (e.g. POST "cats/me") without middleware
+          const routes = [
+            { path: '/cats/:id', method: RequestMethod.GET },
+            { path: '/cats/me', method: -1 as any },
+          ];
+          configProxy.forRoutes(...routes);
+
+          expect(builder.build()[0].forRoutes).toEqual(routes);
+        });
+
+        it('should remove every route overlapping the same parameterized one', () => {
+          // The parameterized route's regex is reused for each candidate, so a
+          // stateful (global) regex would leave `lastIndex` past the end of the
+          // previous match and let every other concrete route through. #17334
+          configProxy.forRoutes(
+            { path: 'cats/:id', method: RequestMethod.GET },
+            { path: 'cats/1', method: RequestMethod.GET },
+            { path: 'cats/2', method: RequestMethod.GET },
+            { path: 'cats/3', method: RequestMethod.GET },
+          );
+
+          expect(builder.build()).toEqual([
+            {
+              middleware: [],
+              forRoutes: [
+                {
+                  method: RequestMethod.GET,
+                  path: '/cats/:id',
                 },
               ],
             },
@@ -60,11 +387,84 @@ describe('MiddlewareBuilder', () => {
       const path = '/test';
       const proxy: any = builder.apply().exclude(path);
 
-      expect(proxy.getExcludedRoutes()).to.be.eql([
+      expect(proxy.getExcludedRoutes()).toEqual([
         {
           path,
-          method: RequestMethod.ALL,
+          method: -1,
         },
+      ]);
+    });
+
+    it('should also exclude the routes excluded from the global prefix that a route covers', () => {
+      const appConfig = new ApplicationConfig();
+      appConfig.setGlobalPrefix('api');
+      appConfig.setGlobalPrefixOptions({
+        exclude: mapToExcludeRoute(['health', 'health/ready']),
+      });
+      builder = new MiddlewareBuilder(
+        new RoutesMapper(new NestContainer(), appConfig),
+        new NoopHttpAdapter({}),
+        new RouteInfoPathExtractor(appConfig),
+      );
+      const proxy: any = builder.apply().exclude('health/{*path}', 'health');
+
+      expect(proxy.getExcludedRoutes()).toEqual([
+        { path: '/api/health/{*path}', method: -1 },
+        { path: '/health/ready', method: -1 },
+        { path: '/health', method: -1 },
+      ]);
+    });
+
+    it('should not exclude the parent route of a wildcard, excluded from the global prefix with a trailing slash', () => {
+      const appConfig = new ApplicationConfig();
+      appConfig.setGlobalPrefix('api');
+      appConfig.setGlobalPrefixOptions({
+        exclude: mapToExcludeRoute(['webhooks/']),
+      });
+      builder = new MiddlewareBuilder(
+        new RoutesMapper(new NestContainer(), appConfig),
+        new NoopHttpAdapter({}),
+        new RouteInfoPathExtractor(appConfig),
+      );
+      const proxy: any = builder.apply().exclude('webhooks/{*path}');
+
+      expect(proxy.getExcludedRoutes()).toEqual([
+        { path: '/api/webhooks/{*path}', method: -1 },
+      ]);
+    });
+
+    it('should match the routes excluded from the global prefix with the case sensitivity of the router', () => {
+      const appConfig = new ApplicationConfig();
+      appConfig.setGlobalPrefix('api');
+      appConfig.setGlobalPrefixOptions({
+        exclude: mapToExcludeRoute(['health/ready']),
+      });
+      const createBuilder = (caseSensitive: boolean) => {
+        const httpAdapter = new NoopHttpAdapter({});
+        httpAdapter.getRouteMatchingOptions = () => ({
+          caseSensitive,
+          ignoreTrailingSlash: false,
+        });
+        return new MiddlewareBuilder(
+          new RoutesMapper(new NestContainer(), appConfig),
+          httpAdapter,
+          new RouteInfoPathExtractor(appConfig),
+        );
+      };
+
+      const sensitive: any = createBuilder(true)
+        .apply()
+        .exclude('HEALTH/:check');
+      expect(sensitive.getExcludedRoutes()).toEqual([
+        { path: '/api/HEALTH/:check', method: -1 },
+      ]);
+
+      const insensitive: any = createBuilder(false)
+        .apply()
+        .exclude('HEALTH/:check');
+      expect(insensitive.getExcludedRoutes()).toEqual([
+        { path: '/api/HEALTH/:check', method: -1 },
+        { path: '/health/ready', method: -1 },
       ]);
     });
   });

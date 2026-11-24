@@ -1,4 +1,4 @@
-import { ROUTE_ARGS_METADATA } from '@nestjs/common/constants';
+import { ROUTE_ARGS_METADATA } from '@nestjs/common/internal';
 
 export const MESSAGE_MAPPING_METADATA = 'websockets:message_mapping';
 export const MESSAGE_METADATA = 'message';
@@ -13,3 +13,6 @@ export const CONNECTION_EVENT = 'connection';
 export const DISCONNECT_EVENT = 'disconnect';
 export const CLOSE_EVENT = 'close';
 export const ERROR_EVENT = 'error';
+
+// How many messages of a client an adapter handles at the same time
+export const DEFAULT_MAX_CONCURRENT_MESSAGES = 1000;

@@ -1,60 +1,505 @@
-import { expect } from 'chai';
-import * as sinon from 'sinon';
-import { NO_MESSAGE_HANDLER } from '../../constants';
-import { BaseRpcContext } from '../../ctx-host/base-rpc.context';
-import { ServerMqtt } from '../../server/server-mqtt';
+import { EventEmitter } from 'events';
+import { of } from 'rxjs';
+import { MQTT_MAX_TOPIC_LENGTH, NO_MESSAGE_HANDLER } from '../../constants.js';
+import { BaseRpcContext } from '../../ctx-host/base-rpc.context.js';
+import { MqttContext } from '../../ctx-host/index.js';
+import { InvalidPacketIdException } from '../../errors/invalid-packet-id.exception.js';
+import { MaxMqttTopicLengthExceededException } from '../../errors/max-mqtt-topic-length-exceeded.exception.js';
+import { MqttRecordBuilder } from '../../record-builders/index.js';
+import { ServerMqtt } from '../../server/server-mqtt.js';
+import { objectToMap } from './utils/object-to-map.js';
 
 describe('ServerMqtt', () => {
   let server: ServerMqtt;
-
-  const objectToMap = obj =>
-    new Map(Object.keys(obj).map(key => [key, obj[key]]) as any);
+  let untypedServer: any;
 
   beforeEach(() => {
     server = new ServerMqtt({});
+    untypedServer = server as any;
   });
   describe('listen', () => {
-    let createMqttClient;
-    let onSpy: sinon.SinonSpy;
-    let client;
+    let onSpy: ReturnType<typeof vi.fn>;
+    let onceSpy: ReturnType<typeof vi.fn>;
+    let client: any;
+    let callbackSpy: ReturnType<typeof vi.fn>;
 
     beforeEach(() => {
-      onSpy = sinon.spy();
+      onSpy = vi.fn();
+      onceSpy = vi.fn();
       client = {
         on: onSpy,
+        once: onceSpy,
       };
-      createMqttClient = sinon
-        .stub(server, 'createMqttClient')
-        .callsFake(() => client);
+      vi.spyOn(server, 'createMqttClient').mockImplementation(() => client);
+      callbackSpy = vi.fn();
+    });
+    it('should bind "error" event to handler', async () => {
+      await server.listen(callbackSpy);
+      expect(onSpy.mock.calls[0][0]).toBe('error');
+    });
+    it('should bind "reconnect" event to handler', async () => {
+      await server.listen(callbackSpy);
+      expect(onSpy.mock.calls[1][0]).toBe('reconnect');
+    });
+    it('should bind "disconnect" event to handler', async () => {
+      await server.listen(callbackSpy);
+      expect(onSpy.mock.calls[2][0]).toBe('disconnect');
+    });
+    it('should bind "close" event to handler', async () => {
+      await server.listen(callbackSpy);
+      expect(onSpy.mock.calls[3][0]).toBe('close');
+    });
+    it('should bind "connect" event to handler', async () => {
+      await server.listen(callbackSpy);
+      expect(onSpy.mock.calls[4][0]).toBe('connect');
+    });
+    it('should bind "message" event to handler', async () => {
+      await server.listen(callbackSpy);
+      expect(onSpy.mock.calls[5][0]).toBe('message');
+    });
+    it('should route "handleMessage" rejections to "handleError" instead of leaving them unhandled', async () => {
+      const error = new Error('unexpected');
+      vi.spyOn(server, 'handleMessage').mockRejectedValue(error);
+      const handleErrorSpy = vi
+        .spyOn(untypedServer, 'handleError')
+        .mockImplementation(() => undefined);
 
-      server.listen(null);
+      await server.listen(callbackSpy);
+      const [, onMessage] = onSpy.mock.calls.find(
+        ([event]) => event === 'message',
+      )!;
+      await onMessage('topic', Buffer.from('{}'));
+
+      expect(handleErrorSpy).toHaveBeenCalledWith(error);
     });
-    it('should bind "error" event to handler', () => {
-      expect(onSpy.getCall(0).args[0]).to.be.equal('error');
+    it('should close the created client and skip startup when closed before createMqttClient resolves', async () => {
+      let resolveClient!: (value: any) => void;
+      const pendingClient = {
+        endAsync: vi.fn().mockResolvedValue(undefined),
+        on: vi.fn(),
+        once: vi.fn(),
+      };
+      vi.spyOn(server, 'createMqttClient').mockImplementation(
+        () =>
+          new Promise(resolve => {
+            resolveClient = resolve;
+          }),
+      );
+      const startSpy = vi.spyOn(server, 'start').mockImplementation(() => {});
+
+      const listenPromise = server.listen(callbackSpy);
+      await server.close();
+      resolveClient(pendingClient);
+      await listenPromise;
+
+      expect(pendingClient.endAsync).toHaveBeenCalledOnce();
+      expect(startSpy).not.toHaveBeenCalled();
+      expect(untypedServer.mqttClient).toBeNull();
+      expect(callbackSpy).toHaveBeenCalledWith(expect.any(Error));
     });
-    it('should bind "message" event to handler', () => {
-      expect(onSpy.getCall(1).args[0]).to.be.equal('message');
+    it('should bind the callback with "once"', async () => {
+      await server.listen(callbackSpy);
+
+      expect(onceSpy).toHaveBeenCalledWith('connect', expect.any(Function));
     });
-    it('should bind "connect" event to handler', () => {
-      expect(onSpy.getCall(2).args[0]).to.be.equal('connect');
+    it('should run the callback once, as mqtt reconnects on the same client', async () => {
+      // A real emitter, because mqtt re-emits "connect" on the same client
+      // after every reconnect.
+      const emitter: any = new EventEmitter();
+      vi.spyOn(server, 'createMqttClient').mockImplementation(() => emitter);
+
+      await server.listen(callbackSpy);
+      emitter.emit('connect');
+      emitter.emit('connect');
+      emitter.emit('connect');
+
+      expect(callbackSpy).toHaveBeenCalledExactlyOnceWith();
+    });
+    describe('when "maxConnectionAttempts" is configured', () => {
+      let emitter: any;
+      let endAsyncSpy: ReturnType<typeof vi.fn>;
+      let serverWithOptions: ServerMqtt;
+      let callbackSpy: ReturnType<typeof vi.fn>;
+
+      beforeEach(() => {
+        emitter = new EventEmitter();
+        endAsyncSpy = vi.fn().mockResolvedValue(undefined);
+        emitter.endAsync = endAsyncSpy;
+        serverWithOptions = new ServerMqtt({
+          maxConnectionAttempts: 2,
+        } as any);
+        vi.spyOn(serverWithOptions, 'createMqttClient').mockImplementation(
+          () => emitter,
+        );
+        callbackSpy = vi.fn();
+      });
+
+      it('should not call the callback when the error limit is not reached', async () => {
+        await serverWithOptions.listen(callbackSpy);
+        emitter.emit('error', new Error('first failure'));
+
+        expect(callbackSpy).not.toHaveBeenCalled();
+        expect(endAsyncSpy).not.toHaveBeenCalled();
+      });
+
+      it('should close the client and report the failure once the limit is reached', async () => {
+        const error = new Error('second failure');
+
+        await serverWithOptions.listen(callbackSpy);
+        emitter.emit('error', new Error('first failure'));
+        emitter.emit('error', error);
+
+        expect(endAsyncSpy).toHaveBeenCalledOnce();
+        expect(callbackSpy).toHaveBeenCalledExactlyOnceWith(error);
+      });
+
+      it('should not call the callback twice when the connection succeeds first', async () => {
+        await serverWithOptions.listen(callbackSpy);
+        emitter.emit('connect');
+        emitter.emit('error', new Error('post-connect failure'));
+        emitter.emit('error', new Error('post-connect failure'));
+
+        expect(callbackSpy).toHaveBeenCalledExactlyOnceWith();
+      });
+
+      it('should not close the client when errors occur after a successful connection', async () => {
+        await serverWithOptions.listen(callbackSpy);
+        emitter.emit('connect');
+        emitter.emit('error', new Error('first runtime failure'));
+        emitter.emit('error', new Error('second runtime failure'));
+        emitter.emit('error', new Error('third runtime failure'));
+
+        expect(endAsyncSpy).not.toHaveBeenCalled();
+      });
+
+      it('should apply the limit again when the server is restarted', async () => {
+        await serverWithOptions.listen(callbackSpy);
+        emitter.emit('connect');
+        await serverWithOptions.close();
+
+        const restartEmitter: any = new EventEmitter();
+        restartEmitter.endAsync = vi.fn();
+        vi.spyOn(serverWithOptions, 'createMqttClient').mockImplementation(
+          () => restartEmitter,
+        );
+        const restartCallbackSpy = vi.fn();
+
+        await serverWithOptions.listen(restartCallbackSpy);
+        restartEmitter.emit('error', new Error('first failure'));
+        restartEmitter.emit('error', new Error('second failure'));
+
+        expect(restartEmitter.endAsync).toHaveBeenCalledOnce();
+        expect(restartCallbackSpy).toHaveBeenCalledOnce();
+      });
+
+      it('should keep retrying when maxConnectionAttempts is not set', async () => {
+        const serverWithoutLimit = new ServerMqtt({} as any);
+        vi.spyOn(serverWithoutLimit, 'createMqttClient').mockImplementation(
+          () => emitter,
+        );
+
+        await serverWithoutLimit.listen(callbackSpy);
+        emitter.emit('error', new Error('failure'));
+
+        expect(callbackSpy).not.toHaveBeenCalled();
+        expect(endAsyncSpy).not.toHaveBeenCalled();
+      });
+    });
+    describe('when "start" throws an exception', () => {
+      it('should call callback with a thrown error as an argument', async () => {
+        const error = new Error('random error');
+
+        vi.spyOn(server, 'start').mockImplementation(() => {
+          throw error;
+        });
+        await server.listen(callbackSpy);
+        expect(callbackSpy).toHaveBeenCalledWith(error);
+      });
     });
   });
   describe('close', () => {
-    const mqttClient = { end: sinon.spy() };
+    let endAsync: ReturnType<typeof vi.fn>;
+    let mqttClient: { endAsync: ReturnType<typeof vi.fn> };
+
     beforeEach(() => {
-      (server as any).mqttClient = mqttClient;
+      endAsync = vi.fn().mockResolvedValue(undefined);
+      mqttClient = { endAsync };
+      untypedServer.mqttClient = mqttClient;
     });
-    it('should end mqttClient', () => {
-      server.close();
-      expect(mqttClient.end.called).to.be.true;
+
+    it('should end mqttClient', async () => {
+      await server.close();
+      expect(endAsync).toHaveBeenCalledOnce();
+    });
+
+    it('should settle only once the connection is closed', async () => {
+      let endConnection!: () => void;
+      endAsync.mockReturnValue(
+        new Promise<void>(resolve => (endConnection = resolve)),
+      );
+
+      let closed = false;
+      const closing = server.close().then(() => {
+        closed = true;
+      });
+
+      await Promise.resolve();
+      // mqtt ends the connection on a later tick: a close() that does not wait
+      // for it resolves here, with the connection still open
+      expect(closed).toBe(false);
+
+      endConnection();
+      await closing;
+      expect(closed).toBe(true);
+    });
+
+    it('should reset the state so a listener waits for the next listen', async () => {
+      const callback = vi.fn();
+
+      await server.close();
+      server.on('message', callback);
+
+      expect(untypedServer.mqttClient).toBeNull();
+      expect(untypedServer.pendingEventListeners).toEqual([
+        { event: 'message', callback },
+      ]);
+    });
+
+    it('should reset the state when ending the connection fails', async () => {
+      const callback = vi.fn();
+      endAsync.mockRejectedValue(new Error('end failed'));
+      untypedServer.pendingEventListeners = [{ event: 'message', callback }];
+
+      await expect(server.close()).rejects.toThrow('end failed');
+
+      expect(untypedServer.mqttClient).toBeNull();
+      expect(untypedServer.pendingEventListeners).toEqual([]);
+    });
+
+    it('should not unsubscribe nor wait without "gracefulShutdown"', async () => {
+      const unsubscribeAsync = vi.fn();
+      Object.assign(mqttClient, { connected: true, unsubscribeAsync });
+      untypedServer.messageHandlers = objectToMap({ test: vi.fn() });
+      const waitSpy = vi.spyOn(untypedServer, 'waitForHandlersInFlight');
+
+      await server.close();
+
+      expect(unsubscribeAsync).not.toHaveBeenCalled();
+      expect(waitSpy).not.toHaveBeenCalled();
+    });
+
+    describe('with "gracefulShutdown"', () => {
+      function createGracefulServer(
+        options: Record<string, unknown> = {},
+        ServerClass: typeof ServerMqtt = ServerMqtt,
+      ) {
+        const gracefulServer = new ServerClass({
+          gracefulShutdown: true,
+          ...options,
+        });
+        const client = {
+          connected: true,
+          options: { resubscribe: true },
+          on: vi.fn(),
+          subscribe: vi.fn(),
+          unsubscribeAsync: vi.fn().mockResolvedValue(undefined),
+          endAsync: vi.fn().mockResolvedValue(undefined),
+        };
+        Object.assign(gracefulServer, {
+          mqttClient: client,
+          messageHandlers: objectToMap({
+            'orders/create': vi.fn(),
+            'orders/created': Object.assign(vi.fn(), { isEventHandler: true }),
+            '$share/workers/jobs/+': Object.assign(vi.fn(), {
+              isEventHandler: true,
+            }),
+          }),
+        });
+        const waitSpy = vi
+          .spyOn(gracefulServer as any, 'waitForHandlersInFlight')
+          .mockResolvedValue(undefined);
+        return { gracefulServer, client, waitSpy };
+      }
+
+      it('should stop receiving messages, wait for the handlers in flight, then end the connection', async () => {
+        const { gracefulServer, client, waitSpy } = createGracefulServer();
+
+        await gracefulServer.close();
+
+        const [unsubscribed] = client.unsubscribeAsync.mock.invocationCallOrder;
+        const [waited] = waitSpy.mock.invocationCallOrder;
+        const [ended] = client.endAsync.mock.invocationCallOrder;
+        expect(unsubscribed).toBeLessThan(waited);
+        expect(waited).toBeLessThan(ended);
+      });
+
+      it('should unsubscribe from every topic it subscribed to', async () => {
+        class PrefixedServerMqtt extends ServerMqtt {
+          public getRequestPattern(pattern: string) {
+            return `requests/${pattern}`;
+          }
+        }
+        const { gracefulServer, client } = createGracefulServer(
+          {},
+          PrefixedServerMqtt,
+        );
+        gracefulServer.bindEvents(client);
+        const subscribed = client.subscribe.mock.calls.map(([topic]) => topic);
+
+        await gracefulServer.close();
+
+        expect(subscribed).toEqual([
+          'requests/orders/create',
+          'orders/created',
+          '$share/workers/jobs/+',
+        ]);
+        expect(client.unsubscribeAsync).toHaveBeenCalledExactlyOnceWith(
+          subscribed,
+        );
+      });
+
+      it('should keep the connection open while handlers are in flight', async () => {
+        const { gracefulServer, client, waitSpy } = createGracefulServer();
+        let finish!: () => void;
+        waitSpy.mockReturnValue(new Promise<void>(res => (finish = res)));
+
+        const closing = gracefulServer.close();
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(client.endAsync).not.toHaveBeenCalled();
+
+        finish();
+        await closing;
+
+        expect(client.endAsync).toHaveBeenCalledOnce();
+      });
+
+      it('should reset the state before it waits, so a listener waits for the next listen', async () => {
+        const { gracefulServer, waitSpy } = createGracefulServer();
+        let finish!: () => void;
+        waitSpy.mockReturnValue(new Promise<void>(res => (finish = res)));
+        const callback = vi.fn();
+
+        const closing = gracefulServer.close();
+        gracefulServer.on('message', callback);
+
+        expect((gracefulServer as any).mqttClient).toBeNull();
+        expect((gracefulServer as any).pendingEventListeners).toEqual([
+          { event: 'message', callback },
+        ]);
+
+        finish();
+        await closing;
+      });
+
+      it('should wait for "gracePeriod" at most', async () => {
+        const { gracefulServer, waitSpy } = createGracefulServer({
+          gracePeriod: 500,
+        });
+
+        await gracefulServer.close();
+
+        expect(waitSpy).toHaveBeenCalledExactlyOnceWith(500);
+      });
+
+      it('should still end the connection when it is lost before the broker answers', async () => {
+        const { gracefulServer, client, waitSpy } = createGracefulServer();
+        client.unsubscribeAsync.mockRejectedValue(
+          new Error('Connection closed'),
+        );
+
+        await expect(gracefulServer.close()).resolves.toBeUndefined();
+
+        expect(waitSpy).toHaveBeenCalledOnce();
+        expect(client.endAsync).toHaveBeenCalledOnce();
+      });
+
+      it('should not unsubscribe while disconnected, as mqtt would hold the packet and never end', async () => {
+        const { gracefulServer, client, waitSpy } = createGracefulServer();
+        client.connected = false;
+
+        await gracefulServer.close();
+
+        expect(client.unsubscribeAsync).not.toHaveBeenCalled();
+        expect(waitSpy).toHaveBeenCalledOnce();
+        expect(client.endAsync).toHaveBeenCalledOnce();
+      });
+
+      it('should keep mqtt from resubscribing on a reconnect when closed while disconnected', async () => {
+        const { gracefulServer, client } = createGracefulServer();
+        client.connected = false;
+
+        await gracefulServer.close();
+
+        expect(client.options.resubscribe).toBe(false);
+        expect(client.unsubscribeAsync).not.toHaveBeenCalled();
+      });
+
+      it('should not unsubscribe when there is no handler', async () => {
+        const { gracefulServer, client } = createGracefulServer();
+        Object.assign(gracefulServer, { messageHandlers: new Map() });
+
+        await gracefulServer.close();
+
+        expect(client.unsubscribeAsync).not.toHaveBeenCalled();
+        expect(client.endAsync).toHaveBeenCalledOnce();
+      });
+
+      it('should close a server that never listened', async () => {
+        const neverListened = new ServerMqtt({ gracefulShutdown: true });
+        const waitSpy = vi.spyOn(
+          neverListened as any,
+          'waitForHandlersInFlight',
+        );
+
+        await expect(neverListened.close()).resolves.toBeUndefined();
+
+        expect(waitSpy).not.toHaveBeenCalled();
+      });
+    });
+  });
+  describe('createMqttClient', () => {
+    let connect: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+      connect = vi.fn();
+    });
+
+    // Otherwise mqtt makes no further attempt after a CONNACK error, which
+    // leaves the server disconnected for good
+    it('should have mqtt reconnect after the broker refuses a connection', async () => {
+      vi.spyOn(untypedServer, 'loadPackage').mockResolvedValue({ connect });
+      await server.createMqttClient();
+
+      expect(connect).toHaveBeenCalledWith(
+        'mqtt://localhost:1883',
+        expect.objectContaining({ reconnectOnConnackError: true }),
+      );
+    });
+
+    it('should keep "reconnectOnConnackError" when it is set', async () => {
+      const serverWithOption = new ServerMqtt({
+        reconnectOnConnackError: false,
+      });
+      vi.spyOn(serverWithOption as any, 'loadPackage').mockResolvedValue({
+        connect,
+      });
+      await serverWithOption.createMqttClient();
+
+      expect(connect).toHaveBeenCalledWith(
+        'mqtt://localhost:1883',
+        expect.objectContaining({ reconnectOnConnackError: false }),
+      );
     });
   });
   describe('bindEvents', () => {
-    let onSpy: sinon.SinonSpy, subscribeSpy: sinon.SinonSpy, mqttClient;
+    let onSpy: ReturnType<typeof vi.fn>,
+      subscribeSpy: ReturnType<typeof vi.fn>,
+      mqttClient;
 
     beforeEach(() => {
-      onSpy = sinon.spy();
-      subscribeSpy = sinon.spy();
+      onSpy = vi.fn();
+      subscribeSpy = vi.fn();
       mqttClient = {
         on: onSpy,
         subscribe: subscribeSpy,
@@ -62,179 +507,803 @@ describe('ServerMqtt', () => {
     });
     it('should subscribe to each pattern', () => {
       const pattern = 'test';
-      const handler = sinon.spy();
-      (server as any).messageHandlers = objectToMap({
+      const handler = vi.fn();
+      untypedServer.messageHandlers = objectToMap({
         [pattern]: handler,
       });
       server.bindEvents(mqttClient);
-      expect(subscribeSpy.calledWith(pattern)).to.be.true;
+      expect(subscribeSpy).toHaveBeenCalledWith(pattern, undefined);
+    });
+
+    describe('per-handler QoS via extras.qos', () => {
+      it('should use extras.qos=2 when handler specifies qos 2', () => {
+        const pattern = 'alerts/critical';
+        const handler = Object.assign(vi.fn(), { extras: { qos: 2 } });
+        untypedServer.messageHandlers = objectToMap({
+          [pattern]: handler,
+        });
+        server.bindEvents(mqttClient);
+        expect(subscribeSpy).toHaveBeenCalledOnce();
+        expect(subscribeSpy.mock.calls[0][0]).toBe(pattern);
+        expect(subscribeSpy.mock.calls[0][1]).toEqual({ qos: 2 });
+      });
+
+      it('should use extras.qos=0 when handler specifies qos 0', () => {
+        const pattern = 'telemetry/data';
+        const handler = Object.assign(vi.fn(), { extras: { qos: 0 } });
+        untypedServer.messageHandlers = objectToMap({
+          [pattern]: handler,
+        });
+        server.bindEvents(mqttClient);
+        expect(subscribeSpy).toHaveBeenCalledOnce();
+        expect(subscribeSpy.mock.calls[0][0]).toBe(pattern);
+        expect(subscribeSpy.mock.calls[0][1]).toEqual({ qos: 0 });
+      });
+
+      it('should use global subscribeOptions when extras.qos is undefined', () => {
+        const globalQos = 1;
+        const serverWithOptions = new ServerMqtt({
+          subscribeOptions: { qos: globalQos },
+        });
+        const untypedServerWithOptions = serverWithOptions as any;
+        const pattern = 'events/general';
+        const handler = Object.assign(vi.fn(), { extras: {} });
+        untypedServerWithOptions.messageHandlers = objectToMap({
+          [pattern]: handler,
+        });
+        serverWithOptions.bindEvents(mqttClient);
+        expect(subscribeSpy).toHaveBeenCalledOnce();
+        expect(subscribeSpy.mock.calls[0][0]).toBe(pattern);
+        expect(subscribeSpy.mock.calls[0][1]).toEqual({
+          qos: globalQos,
+        });
+      });
+
+      it('should override only qos while preserving other global subscribeOptions', () => {
+        const serverWithOptions = new ServerMqtt({
+          subscribeOptions: { qos: 1, nl: true, rap: false },
+        });
+        const untypedServerWithOptions = serverWithOptions as any;
+        const pattern = 'commands/run';
+        const handler = Object.assign(vi.fn(), { extras: { qos: 2 } });
+        untypedServerWithOptions.messageHandlers = objectToMap({
+          [pattern]: handler,
+        });
+        serverWithOptions.bindEvents(mqttClient);
+        expect(subscribeSpy).toHaveBeenCalledOnce();
+        expect(subscribeSpy.mock.calls[0][1]).toEqual({
+          qos: 2,
+          nl: true,
+          rap: false,
+        });
+      });
+
+      it('should apply different qos per handler when multiple handlers exist', () => {
+        const serverWithOptions = new ServerMqtt({
+          subscribeOptions: { qos: 1 },
+        });
+        const untypedServerWithOptions = serverWithOptions as any;
+
+        const handler0 = Object.assign(vi.fn(), { extras: { qos: 0 } });
+        const handler1 = Object.assign(vi.fn(), { extras: {} });
+        const handler2 = Object.assign(vi.fn(), { extras: { qos: 2 } });
+
+        untypedServerWithOptions.messageHandlers = objectToMap({
+          'telemetry/+': handler0,
+          'events/#': handler1,
+          'alerts/critical': handler2,
+        });
+
+        serverWithOptions.bindEvents(mqttClient);
+
+        expect(subscribeSpy).toHaveBeenCalledTimes(3);
+
+        const calls = subscribeSpy.mock.calls;
+        const callMap = new Map(calls.map(c => [c[0], c[1]]));
+
+        expect(callMap.get('telemetry/+')).toEqual({ qos: 0 });
+        expect(callMap.get('events/#')).toEqual({ qos: 1 });
+        expect(callMap.get('alerts/critical')).toEqual({ qos: 2 });
+      });
     });
   });
   describe('getMessageHandler', () => {
     it(`should return function`, () => {
-      expect(
-        typeof server.getMessageHandler((server as any).mqttClient),
-      ).to.be.eql('function');
+      expect(typeof server.getMessageHandler(untypedServer.mqttClient)).toEqual(
+        'function',
+      );
     });
     describe('handler', () => {
       it('should call "handleMessage"', async () => {
-        const handleMessageStub = sinon
-          .stub(server, 'handleMessage')
-          .callsFake(() => null);
-        (await server.getMessageHandler((server as any).mqttClient))(null);
-        expect(handleMessageStub.called).to.be.true;
+        const handleMessageStub = vi
+          .spyOn(server, 'handleMessage')
+          .mockResolvedValue(undefined as any);
+        await server.getMessageHandler(untypedServer.mqttClient)(
+          null!,
+          null!,
+          null!,
+        );
+        expect(handleMessageStub).toHaveBeenCalled();
+      });
+      it('should neither run the handler nor reply when the reply topic would be too long', async () => {
+        const handler = vi.fn();
+        const publish = vi.fn();
+        const loggerErrorSpy = vi
+          .spyOn(untypedServer.logger, 'error')
+          .mockImplementation(() => {});
+        untypedServer.messageHandlers = objectToMap({ '#': handler });
+
+        // The broker delivers topics up to the limit, "/reply" is added to it
+        await server.getMessageHandler({ publish })(
+          'a'.repeat(MQTT_MAX_TOPIC_LENGTH),
+          Buffer.from(JSON.stringify({ id: '1', data: 'test' })),
+        );
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(handler).not.toHaveBeenCalled();
+        expect(publish).not.toHaveBeenCalled();
+        expect(loggerErrorSpy).toHaveBeenCalledWith(
+          expect.any(MaxMqttTopicLengthExceededException),
+        );
       });
     });
   });
   describe('handleMessage', () => {
-    let getPublisherSpy: sinon.SinonSpy;
+    let getPublisherSpy: ReturnType<typeof vi.fn>;
 
     const channel = 'test';
     const data = 'test';
     const id = '3';
 
     beforeEach(() => {
-      getPublisherSpy = sinon.spy();
-      sinon.stub(server, 'getPublisher').callsFake(() => getPublisherSpy);
+      getPublisherSpy = vi.fn();
+      vi.spyOn(server, 'getPublisher').mockImplementation(
+        () => getPublisherSpy,
+      );
     });
-    it('should call "handleEvent" if identifier is not present', () => {
-      const handleEventSpy = sinon.spy(server, 'handleEvent');
-      server.handleMessage(
+    it('should call "handleEvent" if identifier is not present', async () => {
+      const handleEventSpy = vi.spyOn(server, 'handleEvent');
+      await server.handleMessage(
         channel,
-        new Buffer(JSON.stringify({ pattern: '', data })),
+        Buffer.from(JSON.stringify({ pattern: '', data })),
         null,
       );
-      expect(handleEventSpy.called).to.be.true;
+      expect(handleEventSpy).toHaveBeenCalled();
     });
-    it(`should publish NO_MESSAGE_HANDLER if pattern not exists in messageHandlers object`, () => {
-      server.handleMessage(
+    it('should dispatch empty topic levels to a wildcard event handler', async () => {
+      const handler = vi.fn().mockResolvedValue(undefined);
+      const originalPacket = { qos: 1 };
+      server.addHandler('sport/+', handler, true);
+
+      await server.handleMessage(
+        'sport/',
+        Buffer.from(JSON.stringify({ data })),
+        null,
+        originalPacket,
+      );
+
+      expect(handler).toHaveBeenCalledExactlyOnceWith(
+        data,
+        expect.any(MqttContext),
+      );
+      const context = handler.mock.calls[0][1] as MqttContext;
+      expect(context.getTopic()).toBe('sport/');
+      expect(context.getPacket()).toBe(originalPacket);
+    });
+    it('should expose the MQTT 5 user properties as packet metadata on the context', async () => {
+      const handler = vi.fn().mockResolvedValue(undefined);
+      server.addHandler(channel, handler, true);
+
+      await server.handleMessage(
         channel,
-        new Buffer(JSON.stringify({ id, pattern: '', data })),
+        Buffer.from(JSON.stringify({ pattern: channel, data })),
+        null,
+        { properties: { userProperties: { 'x-request-id': 'trace-1' } } },
+      );
+
+      const context = handler.mock.calls[0][1] as MqttContext;
+      expect(context.getMetadata()).toEqual({ 'x-request-id': 'trace-1' });
+    });
+    it('should dispatch system topics to the explicit system event handler', async () => {
+      const wildcardHandler = vi.fn().mockResolvedValue(undefined);
+      const systemHandler = vi.fn().mockResolvedValue(undefined);
+      const topic = '$SYS/broker/uptime';
+      const originalPacket = { qos: 1 };
+      server.addHandler('#', wildcardHandler, true);
+      server.addHandler('$SYS/#', systemHandler, true);
+
+      await server.handleMessage(
+        topic,
+        Buffer.from(JSON.stringify({ data })),
+        null,
+        originalPacket,
+      );
+
+      expect(wildcardHandler).not.toHaveBeenCalled();
+      expect(systemHandler).toHaveBeenCalledExactlyOnceWith(
+        data,
+        expect.any(MqttContext),
+      );
+      const context = systemHandler.mock.calls[0][1] as MqttContext;
+      expect(context.getTopic()).toBe(topic);
+      expect(context.getPacket()).toBe(originalPacket);
+    });
+    it(`should publish NO_MESSAGE_HANDLER if pattern not exists in messageHandlers object`, async () => {
+      await server.handleMessage(
+        channel,
+        Buffer.from(JSON.stringify({ id, pattern: '', data })),
         null,
       );
-      expect(
-        getPublisherSpy.calledWith({
-          id,
-          status: 'error',
-          err: NO_MESSAGE_HANDLER,
-        }),
-      ).to.be.true;
+      expect(getPublisherSpy).toHaveBeenCalledWith({
+        id,
+        status: 'error',
+        err: NO_MESSAGE_HANDLER,
+      });
     });
-    it(`should call handler with expected arguments`, () => {
-      const handler = sinon.spy();
-      (server as any).messageHandlers = objectToMap({
+    it(`should call handler with expected arguments`, async () => {
+      const handler = vi.fn();
+      untypedServer.messageHandlers = objectToMap({
         [channel]: handler,
       });
 
-      server.handleMessage(
+      await server.handleMessage(
         channel,
-        new Buffer(JSON.stringify({ pattern: '', data, id: '2' })),
+        Buffer.from(JSON.stringify({ pattern: '', data, id: '2' })),
         null,
       );
-      expect(handler.calledWith(data)).to.be.true;
+      expect(handler).toHaveBeenCalledWith(data, expect.any(MqttContext));
+    });
+    it('should still reply with an event handler, but warn once that this is deprecated', async () => {
+      const handler = Object.assign(async () => 'stored', {
+        isEventHandler: true,
+      });
+      untypedServer.messageHandlers = objectToMap({ [channel]: handler });
+      const warnSpy = vi
+        .spyOn(untypedServer.logger, 'warn')
+        .mockImplementation(() => {});
+      const request = Buffer.from(JSON.stringify({ pattern: '', data, id }));
+
+      await server.handleMessage(channel, request, null);
+      await server.handleMessage(channel, request, null);
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(getPublisherSpy).toHaveBeenCalledTimes(2);
+      expect(getPublisherSpy).toHaveBeenCalledWith({
+        response: 'stored',
+        isDisposed: true,
+      });
+      expect(warnSpy).toHaveBeenCalledOnce();
+      expect(warnSpy.mock.calls[0][0]).toMatch(
+        /^DEPRECATED! .* Pattern: test$/,
+      );
+    });
+    it('should drop a request whose id is neither a number nor a short string', async () => {
+      // Every reply carries the id, so it would be serialized for each of them
+      const handler = vi.fn();
+      untypedServer.messageHandlers = objectToMap({
+        [channel]: handler,
+      });
+
+      const error = await server
+        .handleMessage(
+          channel,
+          Buffer.from(JSON.stringify({ pattern: '', data, id: [[['a']]] })),
+          null,
+        )
+        .catch(err => err);
+
+      expect(handler).not.toHaveBeenCalled();
+      expect(getPublisherSpy).not.toHaveBeenCalled();
+      expect(error).toBeInstanceOf(InvalidPacketIdException);
+    });
+    describe('and the server receives its own reply', () => {
+      // The broker hands the server the reply it published whenever one of its
+      // filters (here "orders/#") also matches the reply topic
+      const replyTopic = 'orders/1/reply';
+      const reply = Buffer.from(
+        JSON.stringify({ id, response: data, isDisposed: true }),
+      );
+
+      it.each([
+        ['a message handler', false],
+        ['an event handler', true],
+      ])('should not dispatch it to %s of "orders/#"', async (_, isEvent) => {
+        const handler = vi.fn().mockResolvedValue(data);
+        server.addHandler('orders/#', handler, isEvent);
+
+        await server.handleMessage(replyTopic, reply, null);
+
+        expect(handler).not.toHaveBeenCalled();
+        expect(getPublisherSpy).not.toHaveBeenCalled();
+      });
+      it('should not dispatch it to a shared "orders/#" subscription', async () => {
+        const handler = vi.fn().mockResolvedValue(data);
+        server.addHandler('$share/group/orders/#', handler, false);
+
+        await server.handleMessage(replyTopic, reply, null);
+
+        expect(handler).not.toHaveBeenCalled();
+      });
+      it('should still dispatch a request to "orders/#"', async () => {
+        const handler = vi.fn().mockResolvedValue(data);
+        server.addHandler('orders/#', handler, false);
+
+        await server.handleMessage(
+          'orders/1',
+          Buffer.from(JSON.stringify({ id, pattern: 'orders/1', data })),
+          null,
+        );
+
+        expect(handler).toHaveBeenCalledExactlyOnceWith(
+          data,
+          expect.any(MqttContext),
+        );
+      });
+      it('should still dispatch a request published to a reply topic', async () => {
+        const handler = vi.fn().mockResolvedValue(data);
+        server.addHandler('orders/#', handler, false);
+
+        await server.handleMessage(
+          replyTopic,
+          Buffer.from(JSON.stringify({ id, pattern: replyTopic, data })),
+          null,
+        );
+
+        expect(handler).toHaveBeenCalledTimes(1);
+      });
+      it.each(['orders/+/reply', 'orders/1/reply', '+/+/reply'])(
+        'should dispatch it to a handler on the reply filter "%s"',
+        async filter => {
+          const handler = vi.fn().mockResolvedValue(undefined);
+          server.addHandler(filter, handler, true);
+
+          await server.handleMessage(replyTopic, reply, null);
+
+          expect(handler).toHaveBeenCalledTimes(1);
+        },
+      );
+      it('should dispatch it to a shared subscription on a reply filter', async () => {
+        const handler = vi.fn().mockResolvedValue(undefined);
+        server.addHandler('$share/group/orders/+/reply', handler, true);
+
+        await server.handleMessage(replyTopic, reply, null);
+
+        expect(handler).toHaveBeenCalledTimes(1);
+      });
+      it('should not dispatch it to "users/#" because "orders/+/reply" has a handler', async () => {
+        const users = vi.fn();
+        server.addHandler('users/#', users, false);
+        server.addHandler('orders/+/reply', vi.fn(), true);
+
+        await server.handleMessage('users/1/reply', reply, null);
+
+        expect(users).not.toHaveBeenCalled();
+      });
+      it('should dispatch an event without an id published to a reply topic', async () => {
+        const handler = vi.fn().mockResolvedValue(undefined);
+        server.addHandler('orders/#', handler, true);
+
+        await server.handleMessage(
+          replyTopic,
+          Buffer.from(JSON.stringify({ data })),
+          null,
+        );
+
+        expect(handler).toHaveBeenCalledTimes(1);
+      });
+      it('should not dispatch it to "orders/+" nor to the exact topic of the request', async () => {
+        const plus = vi.fn();
+        const exact = vi.fn();
+        server.addHandler('orders/+', plus, false);
+        server.addHandler('orders/1', exact, false);
+
+        await server.handleMessage(replyTopic, reply, null);
+
+        expect(plus).not.toHaveBeenCalled();
+        expect(exact).not.toHaveBeenCalled();
+      });
+    });
+  });
+
+  describe('processing end hook', () => {
+    const channel = 'test';
+    const id = '3';
+    let publishSpy: ReturnType<typeof vi.fn>;
+    let endHook: ReturnType<typeof vi.fn>;
+
+    const bindHandler = (handler: () => unknown) => {
+      publishSpy = vi.fn();
+      vi.spyOn(server, 'getPublisher').mockImplementation(() => publishSpy);
+      endHook = vi.fn();
+      untypedServer.onProcessingStartHook = (
+        _transportId: unknown,
+        _ctx: unknown,
+        fn: () => Promise<void>,
+      ) => fn();
+      untypedServer.onProcessingEndHook = endHook;
+      untypedServer.messageHandlers = objectToMap({
+        [channel]: (async () => handler()) as any,
+      });
+    };
+    const handleMessage = () =>
+      server.handleMessage(
+        channel,
+        Buffer.from(JSON.stringify({ id, pattern: channel, data: 'test' })),
+        null!,
+      );
+    const flush = () => new Promise(resolve => setImmediate(resolve));
+
+    it('should run the hook once when the response stream emits several values', async () => {
+      bindHandler(() => of('first', 'second', 'third'));
+
+      await handleMessage();
+      await flush();
+
+      expect(publishSpy).toHaveBeenCalledTimes(3);
+      expect(endHook).toHaveBeenCalledOnce();
+    });
+    it('should run the hook when the handler rejects', async () => {
+      bindHandler(() => {
+        throw new Error('handler failed');
+      });
+
+      await expect(handleMessage()).rejects.toThrow('handler failed');
+
+      expect(endHook).toHaveBeenCalledOnce();
     });
   });
   describe('getPublisher', () => {
-    let publisherSpy: sinon.SinonSpy;
+    let publisherSpy: ReturnType<typeof vi.fn>;
     let pub, publisher;
 
     const id = '1';
     const pattern = 'test';
+    const context = new MqttContext([pattern, {}]);
 
     beforeEach(() => {
-      publisherSpy = sinon.spy();
+      publisherSpy = vi.fn();
       pub = {
         publish: publisherSpy,
       };
-      publisher = server.getPublisher(pub, pattern, id);
+      publisher = server.getPublisher(pub, context, id);
     });
     it(`should return function`, () => {
-      expect(typeof server.getPublisher(null, null, id)).to.be.eql('function');
+      expect(typeof server.getPublisher(null, context, id)).toEqual('function');
+    });
+    it(`should throw if the reply topic would exceed the maximum topic length`, () => {
+      const longestTopic = 'a'.repeat(MQTT_MAX_TOPIC_LENGTH - '/reply'.length);
+
+      expect(() =>
+        server.getPublisher(pub, new MqttContext([`${longestTopic}a`, {}]), id),
+      ).toThrow(MaxMqttTopicLengthExceededException);
+      expect(() =>
+        server.getPublisher(pub, new MqttContext([longestTopic, {}]), id),
+      ).not.toThrow();
     });
     it(`should call "publish" with expected arguments`, () => {
-      const respond = 'test';
-      publisher({ respond, id });
-      expect(
-        publisherSpy.calledWith(
+      const response = 'test';
+      publisher({ response, isDisposed: true });
+      expect(publisherSpy).toHaveBeenCalledWith(
+        `${pattern}/reply`,
+        JSON.stringify({ response, isDisposed: true, id }),
+        {},
+      );
+    });
+    it(`should publish a plain object that looks like a record as is, with empty options`, () => {
+      const response = { data: 'x', options: { qos: 1 } };
+      publisher({ response, isDisposed: true });
+      expect(publisherSpy).toHaveBeenCalledWith(
+        `${pattern}/reply`,
+        JSON.stringify({ response, isDisposed: true, id }),
+        {},
+      );
+    });
+    describe('when the response is a record', () => {
+      const flush = () => new Promise(resolve => setImmediate(resolve));
+      const options = {
+        qos: 1 as const,
+        retain: true,
+        properties: { userProperties: { key: 'value' } },
+      };
+
+      it(`should publish the record data as "response" with the record options`, () => {
+        const record = new MqttRecordBuilder({ value: 'test' })
+          .setQoS(options.qos)
+          .setRetain(options.retain)
+          .setProperties(options.properties)
+          .build();
+
+        publisher({ response: record, isDisposed: true });
+
+        expect(publisherSpy).toHaveBeenCalledWith(
           `${pattern}/reply`,
-          JSON.stringify({ respond, id }),
-        ),
-      ).to.be.true;
+          JSON.stringify({
+            response: { value: 'test' },
+            isDisposed: true,
+            id,
+          }),
+          options,
+        );
+      });
+      it(`should publish the record sent through "send" unwrapped, with its options, once disposed`, async () => {
+        const record = new MqttRecordBuilder({ value: 'test' })
+          .setQoS(options.qos)
+          .setRetain(options.retain)
+          .setProperties(options.properties)
+          .build();
+
+        server.send(of(record), publisher);
+        await flush();
+
+        expect(publisherSpy).toHaveBeenCalledExactlyOnceWith(
+          `${pattern}/reply`,
+          JSON.stringify({
+            response: { value: 'test' },
+            isDisposed: true,
+            id,
+          }),
+          options,
+        );
+      });
+      it(`should not change the record`, () => {
+        const record = new MqttRecordBuilder({ value: 'test' })
+          .setQoS(options.qos)
+          .setRetain(options.retain)
+          .setProperties(options.properties)
+          .build();
+
+        publisher({ response: record });
+
+        expect(record.data).toEqual({ value: 'test' });
+        expect(record.options).toEqual(options);
+      });
     });
   });
   describe('getRequestPattern', () => {
     const test = 'test';
-    it(`should leave patern as it is`, () => {
-      expect(server.getRequestPattern(test)).to.equal(test);
+    it(`should leave pattern as it is`, () => {
+      expect(server.getRequestPattern(test)).toBe(test);
     });
   });
   describe('getReplyPattern', () => {
     const test = 'test';
     it(`should append "/reply" to string`, () => {
       const expectedResult = test + '/reply';
-      expect(server.getReplyPattern(test)).to.equal(expectedResult);
+      expect(server.getReplyPattern(test)).toBe(expectedResult);
     });
   });
   describe('parseMessage', () => {
     it(`should return parsed json`, () => {
       const obj = { test: 'test' };
-      expect(server.parseMessage(obj)).to.deep.equal(
-        JSON.parse(JSON.stringify(obj)),
-      );
+      expect(server.parseMessage(obj)).toEqual(JSON.parse(JSON.stringify(obj)));
     });
     it(`should not parse argument if it is not an object`, () => {
       const content = 'test';
-      expect(server.parseMessage(content)).to.equal(content);
+      expect(server.parseMessage(content)).toBe(content);
     });
   });
   describe('handleEvent', () => {
     const channel = 'test';
     const data = 'test';
 
-    it('should call handler with expected arguments', () => {
-      const handler = sinon.spy();
-      (server as any).messageHandlers = objectToMap({
+    it('should call handler with expected arguments', async () => {
+      const handler = vi.fn();
+      untypedServer.messageHandlers = objectToMap({
         [channel]: handler,
       });
 
-      server.handleEvent(
+      await server.handleEvent(
         channel,
         { pattern: '', data },
         new BaseRpcContext([]),
       );
-      expect(handler.calledWith(data)).to.be.true;
+      expect(handler).toHaveBeenCalledWith(data, expect.any(BaseRpcContext));
     });
   });
   describe('matchMqttPattern', () => {
+    it.each([
+      ['#', '$SYS'],
+      ['#', '$SYS/broker/uptime'],
+      ['+', '$SYS'],
+      ['+/broker/uptime', '$SYS/broker/uptime'],
+      ['#', '$custom'],
+      ['+/#', '$custom/events'],
+    ])(
+      'should not match a leading wildcard in %s against the system topic %s',
+      (pattern, topic) => {
+        expect(server.matchMqttPattern(pattern, topic)).toBe(false);
+      },
+    );
+
+    it.each([
+      ['$SYS/#', '$SYS'],
+      ['$SYS/#', '$SYS/broker/uptime'],
+      ['$SYS/+/uptime', '$SYS/broker/uptime'],
+      ['$custom/#', '$custom/events'],
+      ['devices/+/status', 'devices/$sensor/status'],
+      ['+/#', '/$SYS/broker/uptime'],
+    ])(
+      'should preserve explicit dollar-prefixed filters and later dollar signs in %s against %s',
+      (pattern, topic) => {
+        expect(server.matchMqttPattern(pattern, topic)).toBe(true);
+      },
+    );
+
+    it.each([
+      ['sport/+', 'sport/'],
+      ['sport/+/score', 'sport//score'],
+      ['+/score', '/score'],
+      ['+/+', '/'],
+      ['sport/+/+', 'sport//'],
+    ])(
+      'should match an empty topic level in %s against %s',
+      (pattern, topic) => {
+        expect(server.matchMqttPattern(pattern, topic)).toBe(true);
+      },
+    );
+
+    it.each([
+      ['sport/+', 'sport'],
+      ['sport/+/score', 'sport/score'],
+      ['sport/+', 'sport//'],
+      ['a//#', 'a'],
+      ['/+//#', '/'],
+    ])(
+      'should reject a different number of topic levels in %s against %s',
+      (pattern, topic) => {
+        expect(server.matchMqttPattern(pattern, topic)).toBe(false);
+      },
+    );
+
+    it.each([
+      ['sport/+', 'sport/tennis'],
+      ['sport/#', 'sport'],
+      ['sport/#', 'sport/'],
+      ['sport/', 'sport/'],
+    ])('should preserve matching for %s against %s', (pattern, topic) => {
+      expect(server.matchMqttPattern(pattern, topic)).toBe(true);
+    });
+
     it('should return true when topic matches with provided pattern', () => {
-      expect(server.matchMqttPattern('root/valid/+', 'root/valid/child')).to.be
-        .true;
-      expect(server.matchMqttPattern('root/valid/#', 'root/valid/child')).to.be
-        .true;
+      expect(server.matchMqttPattern('root/valid/+', 'root/valid/child')).toBe(
+        true,
+      );
+      expect(server.matchMqttPattern('root/valid/#', 'root/valid/child')).toBe(
+        true,
+      );
       expect(
         server.matchMqttPattern('root/valid/#', 'root/valid/child/grandchild'),
-      ).to.be.true;
-      expect(server.matchMqttPattern('root/+/child', 'root/valid/child')).to.be
-        .true;
+      ).toBe(true);
+      expect(server.matchMqttPattern('root/+/child', 'root/valid/child')).toBe(
+        true,
+      );
     });
 
     it('should return false when topic does not matches with provided pattern', () => {
-      expect(server.matchMqttPattern('root/test/+', 'root/invalid/child')).to.be
-        .false;
-      expect(server.matchMqttPattern('root/test/#', 'root/invalid/child')).to.be
-        .false;
+      expect(server.matchMqttPattern('root/test/+', 'root/invalid/child')).toBe(
+        false,
+      );
+      expect(server.matchMqttPattern('root/test/#', 'root/invalid/child')).toBe(
+        false,
+      );
       expect(
         server.matchMqttPattern(
           'root/#/grandchild',
           'root/invalid/child/grandchild',
         ),
-      ).to.be.false;
+      ).toBe(false);
       expect(
         server.matchMqttPattern(
           'root/+/grandchild',
           'root/invalid/child/grandchild',
         ),
-      ).to.be.false;
+      ).toBe(false);
+    });
+  });
+  describe('getHandlerByPattern', () => {
+    it.each(['$SYS/#', '$share/workers/$SYS/#'])(
+      'should select %s over an earlier catch-all filter for a system topic',
+      pattern => {
+        const wildcardHandler = vi.fn();
+        const systemHandler = vi.fn();
+        server.addHandler('#', wildcardHandler, true);
+        server.addHandler(pattern, systemHandler, true);
+
+        expect(server.getHandlerByPattern('$SYS/broker/uptime')).toBe(
+          systemHandler,
+        );
+      },
+    );
+
+    it.each(['$shared/devices/#', '$shareware/devices/#'])(
+      'should treat %s as a literal filter rather than a shared subscription',
+      pattern => {
+        const literalHandler = vi.fn();
+        const telemetryHandler = vi.fn();
+        server.addHandler(pattern, literalHandler, true);
+        server.addHandler('telemetry/#', telemetryHandler, true);
+
+        expect(server.getHandlerByPattern(pattern.replace('#', 'status'))).toBe(
+          literalHandler,
+        );
+        expect(server.getHandlerByPattern('telemetry/temperature')).toBe(
+          telemetryHandler,
+        );
+      },
+    );
+
+    it.each([
+      ['$share/workers/devices/status', 'devices/status'],
+      ['$share/workers/devices/+', 'devices/status'],
+    ])(
+      'should continue matching the shared subscription %s against %s',
+      (pattern, topic) => {
+        const handler = vi.fn();
+        server.addHandler(pattern, handler, true);
+
+        expect(server.getHandlerByPattern(topic)).toBe(handler);
+      },
+    );
+
+    // A broker takes '"admin/reset"' for a topic of its own, which an ACL
+    // that denies "admin/#" lets through
+    it('should not route a quoted topic to the handler of the unquoted one', () => {
+      server.addHandler('admin/reset', vi.fn());
+
+      expect(server.getHandlerByPattern('"admin/reset"')).toBeNull();
+    });
+    it('should not match a quoted topic against wildcard patterns as unquoted', () => {
+      server.addHandler('admin/+', vi.fn());
+
+      expect(server.getHandlerByPattern('"admin/reset"')).toBeNull();
+    });
+    it('should not route a number written differently to its handler', () => {
+      server.addHandler(1000, vi.fn());
+
+      expect(server.getHandlerByPattern('1e3')).toBeNull();
+    });
+    it('should route the topic of an object pattern to its handler', () => {
+      const handler = vi.fn();
+      server.addHandler({ cmd: 'sum', role: 'math' }, handler);
+
+      expect(server.getHandlerByPattern('{"cmd":"sum","role":"math"}')).toBe(
+        handler,
+      );
+      expect(
+        server.getHandlerByPattern('{ "role": "math", "cmd": "sum" }'),
+      ).toBe(handler);
+    });
+    describe('when the topic of an object pattern also matches a wildcard filter', () => {
+      // A broker ACL that lets a peer publish on "+/telemetry/#" only
+      let telemetryHandler: ReturnType<typeof vi.fn>;
+      let adminHandler: ReturnType<typeof vi.fn>;
+
+      beforeEach(() => {
+        telemetryHandler = vi.fn();
+        adminHandler = vi.fn();
+        server.addHandler('+/admin/#', adminHandler);
+        server.addHandler('+/telemetry/#', telemetryHandler);
+      });
+
+      it.each([
+        ['with its keys out of order', '{"b":"/telemetry/","a":"/admin/"}'],
+        [
+          'with escaped "/" characters',
+          '{"b":"/telemetry/","a":"\\u002fadmin\\u002f"}',
+        ],
+        ['with a duplicate key', '{"a":"/telemetry/","b":"/admin/","a":"x"}'],
+      ])('should match the topic %s as the broker delivered it', (_, topic) => {
+        expect(server.getHandlerByPattern(topic)).toBe(telemetryHandler);
+      });
+
+      it('should still route the topic to the handler of its object pattern', () => {
+        const objectHandler = vi.fn();
+        server.addHandler({ b: '/telemetry/', a: '/admin/' }, objectHandler);
+
+        expect(
+          server.getHandlerByPattern('{"b":"/telemetry/","a":"/admin/"}'),
+        ).toBe(objectHandler);
+      });
     });
   });
 });

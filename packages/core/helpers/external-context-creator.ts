@@ -1,29 +1,33 @@
-import { ForbiddenException, ParamData } from '@nestjs/common';
-import { CUSTOM_ROUTE_AGRS_METADATA } from '@nestjs/common/constants';
+import type { ContextType, PipeTransform } from '@nestjs/common';
 import {
-  ContextType,
-  Controller,
-  PipeTransform,
-} from '@nestjs/common/interfaces';
-import { isEmpty, isFunction } from '@nestjs/common/utils/shared.utils';
-import { ExternalExceptionFilterContext } from '../exceptions/external-exception-filter-context';
-import { FORBIDDEN_MESSAGE } from '../guards/constants';
-import { GuardsConsumer } from '../guards/guards-consumer';
-import { GuardsContextCreator } from '../guards/guards-context-creator';
-import { STATIC_CONTEXT } from '../injector/constants';
-import { NestContainer } from '../injector/container';
-import { ContextId } from '../injector/instance-wrapper';
-import { Module } from '../injector/module';
-import { ModulesContainer } from '../injector/modules-container';
-import { InterceptorsConsumer } from '../interceptors/interceptors-consumer';
-import { InterceptorsContextCreator } from '../interceptors/interceptors-context-creator';
-import { PipesConsumer } from '../pipes/pipes-consumer';
-import { PipesContextCreator } from '../pipes/pipes-context-creator';
-import { ContextUtils, ParamProperties } from './context-utils';
-import { ExternalErrorProxy } from './external-proxy';
-import { HandlerMetadataStorage } from './handler-metadata-storage';
-import { ExternalHandlerMetadata } from './interfaces/external-handler-metadata.interface';
-import { ParamsMetadata } from './interfaces/params-metadata.interface';
+  ArgumentMetadata,
+  ForbiddenException,
+  type ParamData,
+} from '@nestjs/common';
+import {
+  CUSTOM_ROUTE_ARGS_METADATA,
+  type Controller,
+  isEmptyArray,
+} from '@nestjs/common/internal';
+import { isObservable, lastValueFrom } from 'rxjs';
+import { ExternalExceptionFilterContext } from '../exceptions/external-exception-filter-context.js';
+import { FORBIDDEN_MESSAGE } from '../guards/constants.js';
+import { GuardsConsumer, GuardsContextCreator } from '../guards/index.js';
+import { STATIC_CONTEXT } from '../injector/constants.js';
+import { NestContainer } from '../injector/container.js';
+import { ContextId, InstanceWrapper } from '../injector/instance-wrapper.js';
+import { ModulesContainer } from '../injector/modules-container.js';
+import {
+  InterceptorsConsumer,
+  InterceptorsContextCreator,
+} from '../interceptors/index.js';
+import { PipesConsumer, PipesContextCreator } from '../pipes/index.js';
+import { getClassRef } from './class-ref-registry.js';
+import { ContextUtils, ParamProperties } from './context-utils.js';
+import { ExternalErrorProxy } from './external-proxy.js';
+import { HandlerMetadataStorage } from './handler-metadata-storage.js';
+import { ExternalHandlerMetadata } from './interfaces/external-handler-metadata.interface.js';
+import { ParamsMetadata } from './interfaces/params-metadata.interface.js';
 
 export interface ParamsFactory {
   exchangeKeyForValue(type: number, data: ParamData, args: any): any;
@@ -35,10 +39,16 @@ export interface ExternalContextOptions {
   filters?: boolean;
 }
 
+const isThenable = (value: unknown): value is PromiseLike<unknown> =>
+  value !== null &&
+  (typeof value === 'object' || typeof value === 'function') &&
+  typeof (value as PromiseLike<unknown>).then === 'function';
+
 export class ExternalContextCreator {
   private readonly contextUtils = new ContextUtils();
   private readonly externalErrorProxy = new ExternalErrorProxy();
-  private readonly handlerMetadataStorage = new HandlerMetadataStorage<ExternalHandlerMetadata>();
+  private readonly handlerMetadataStorage =
+    new HandlerMetadataStorage<ExternalHandlerMetadata>();
   private container: NestContainer;
 
   constructor(
@@ -89,7 +99,7 @@ export class ExternalContextCreator {
 
   public create<
     TParamsMetadata extends ParamsMetadata = ParamsMetadata,
-    TContext extends string = ContextType
+    TContext extends string = ContextType,
   >(
     instance: Controller,
     callback: (...args: unknown[]) => unknown,
@@ -105,7 +115,21 @@ export class ExternalContextCreator {
     },
     contextType: TContext = 'http' as TContext,
   ) {
-    const module = this.getContextModuleName(instance.constructor);
+    const classRef = getClassRef(instance);
+    // Several modules may provide the class, each with its own host and its
+    // own enhancers, so the module that holds this host comes first. The
+    // lookup by class is left for a host that cannot be identified (e.g., a
+    // contextual instance passed without an inquirer id).
+    const moduleKey =
+      this.getHostModuleKey(instance, classRef, inquirerId) ||
+      this.getContextModuleKey(classRef);
+    // Transient enhancers are created per host, so those of a static entry
+    // provider can only be found with that provider as the inquirer.
+    inquirerId ??= this.modulesContainer
+      .get(moduleKey)
+      ?.entryProviders.find(
+        item => item.token === classRef || item.instance === instance,
+      )?.id;
     const { argsLength, paramtypes, getParamsMetadata } = this.getMetadata<
       TParamsMetadata,
       TContext
@@ -113,21 +137,21 @@ export class ExternalContextCreator {
     const pipes = this.pipesContextCreator.create(
       instance,
       callback,
-      module,
+      moduleKey,
       contextId,
       inquirerId,
     );
     const guards = this.guardsContextCreator.create(
       instance,
       callback,
-      module,
+      moduleKey,
       contextId,
       inquirerId,
     );
     const exceptionFilter = this.filtersContextCreator.create(
       instance,
-      callback,
-      module,
+      callback as (...args: any[]) => any,
+      moduleKey,
       contextId,
       inquirerId,
     );
@@ -135,31 +159,38 @@ export class ExternalContextCreator {
       ? this.interceptorsContextCreator.create(
           instance,
           callback,
-          module,
+          moduleKey,
           contextId,
           inquirerId,
         )
       : [];
 
-    const paramsMetadata = getParamsMetadata(module, contextId, inquirerId);
+    const paramsMetadata = getParamsMetadata(moduleKey, contextId, inquirerId);
     const paramsOptions = paramsMetadata
       ? this.contextUtils.mergeParamsMetatypes(paramsMetadata, paramtypes)
       : [];
+    this.contextUtils.warnOnMissingParamtypes(
+      instance,
+      methodName,
+      paramtypes,
+      pipes,
+      paramsOptions,
+    );
 
     const fnCanActivate = options.guards
       ? this.createGuardsFn(guards, instance, callback, contextType)
       : null;
     const fnApplyPipes = this.createPipesFn(pipes, paramsOptions);
-    const handler = (
-      initialArgs: unknown[],
-      ...args: unknown[]
-    ) => async () => {
-      if (fnApplyPipes) {
-        await fnApplyPipes(initialArgs, ...args);
-        return callback.apply(instance, initialArgs);
-      }
-      return callback.apply(instance, args);
-    };
+    const handler =
+      (initialArgs: unknown[], ...args: unknown[]) =>
+      async () => {
+        if (fnApplyPipes) {
+          const pendingPipes = fnApplyPipes(initialArgs, ...args);
+          pendingPipes && (await pendingPipes);
+          return callback.apply(instance, initialArgs);
+        }
+        return callback.apply(instance, args);
+      };
 
     const target = async (...args: any[]) => {
       const initialArgs = this.contextUtils.createNullArray(argsLength);
@@ -191,7 +222,11 @@ export class ExternalContextCreator {
     paramsFactory?: ParamsFactory,
     contextType?: TContext,
   ): ExternalHandlerMetadata {
-    const cacheMetadata = this.handlerMetadataStorage.get(instance, methodName);
+    // The metadata is built for one context type (the `ExecutionContext` that
+    // param decorators receive) and one metadata key, and two libraries may
+    // wrap the same method with different ones: cache an entry for each.
+    const cacheKey = `${contextType ?? ''}:${metadataKey ?? ''}:${methodName}`;
+    const cacheMetadata = this.handlerMetadataStorage.get(instance, cacheKey);
     if (cacheMetadata) {
       return cacheMetadata;
     }
@@ -208,7 +243,7 @@ export class ExternalContextCreator {
       methodName,
     );
     const contextFactory = this.contextUtils.getContextFactory<TContext>(
-      contextType,
+      contextType!,
       instance,
       instance[methodName],
     );
@@ -232,32 +267,68 @@ export class ExternalContextCreator {
     const handlerMetadata: ExternalHandlerMetadata = {
       argsLength,
       paramtypes,
-      getParamsMetadata,
+      getParamsMetadata: getParamsMetadata as any,
     };
-    this.handlerMetadataStorage.set(instance, methodName, handlerMetadata);
+    this.handlerMetadataStorage.set(instance, cacheKey, handlerMetadata);
     return handlerMetadata;
   }
 
-  public getContextModuleName(constructor: Function): string {
-    const defaultModuleName = '';
-    const className = constructor.name;
-    if (!className) {
-      return defaultModuleName;
+  public getContextModuleKey(moduleCtor: Function | undefined): string {
+    const emptyModuleKey = '';
+    if (!moduleCtor) {
+      return emptyModuleKey;
     }
-    for (const [key, module] of [...this.modulesContainer.entries()]) {
-      if (this.getProviderByClassName(module, className)) {
+    const moduleContainerEntries = this.modulesContainer.entries();
+    for (const [key, moduleRef] of moduleContainerEntries) {
+      if (moduleRef.hasProvider(moduleCtor)) {
         return key;
       }
     }
-    return defaultModuleName;
+    return emptyModuleKey;
   }
 
-  public getProviderByClassName(module: Module, className: string): boolean {
-    const { providers } = module;
-    const hasProvider = [...providers.keys()].some(
-      provider => provider === className,
-    );
-    return hasProvider;
+  /**
+   * Returns the key of the module whose providers hold the host: the provider
+   * with the given inquirer id or, without one, the provider of the given
+   * instance. A factory or value provider of another module may return the
+   * same instance, so a provider that Nest created from its class wins.
+   */
+  private getHostModuleKey(
+    instance: object,
+    classRef: Function,
+    inquirerId?: string,
+  ): string {
+    const isHost = (
+      wrapper: InstanceWrapper | undefined,
+    ): wrapper is InstanceWrapper =>
+      !!wrapper &&
+      (inquirerId
+        ? wrapper.id === inquirerId
+        : !wrapper.isAlias && wrapper.instance === instance);
+
+    // Hosts are usually provided under their class, so look there first (a
+    // scoped host gets here on every request).
+    for (const [key, moduleRef] of this.modulesContainer.entries()) {
+      const wrapper = moduleRef.providers.get(classRef);
+      if (isHost(wrapper) && !wrapper.isNotMetatype) {
+        return key;
+      }
+    }
+    // Otherwise the host is provided under another token (e.g.,
+    // `{ provide: 'TOKEN', useClass: Resolver }`).
+    let moduleKey = '';
+    for (const [key, moduleRef] of this.modulesContainer.entries()) {
+      for (const wrapper of moduleRef.providers.values()) {
+        if (!isHost(wrapper)) {
+          continue;
+        }
+        if (!wrapper.isNotMetatype) {
+          return key;
+        }
+        moduleKey ||= key;
+      }
+    }
+    return moduleKey;
   }
 
   public exchangeKeysForValues<TMetadata = any>(
@@ -272,7 +343,7 @@ export class ExternalContextCreator {
     this.pipesContextCreator.setModuleContext(moduleContext);
 
     return keys.map(key => {
-      const { index, data, pipes: pipesCollection } = metadata[key];
+      const { index, data, pipes: pipesCollection, schema } = metadata[key];
       const pipes = this.pipesContextCreator.createConcreteContext(
         pipesCollection,
         contextId,
@@ -280,67 +351,108 @@ export class ExternalContextCreator {
       );
       const type = this.contextUtils.mapParamType(key);
 
-      if (key.includes(CUSTOM_ROUTE_AGRS_METADATA)) {
+      if (key.includes(CUSTOM_ROUTE_ARGS_METADATA)) {
         const { factory } = metadata[key];
         const customExtractValue = this.contextUtils.getCustomFactory(
           factory,
           data,
           contextFactory,
         );
-        return { index, extractValue: customExtractValue, type, data, pipes };
+        return {
+          index,
+          extractValue: customExtractValue,
+          type,
+          data,
+          pipes,
+          schema,
+        };
       }
       const numericType = Number(type);
       const extractValue = (...args: unknown[]) =>
         paramsFactory.exchangeKeyForValue(numericType, data, args);
 
-      return { index, extractValue, type: numericType, data, pipes };
+      return { index, extractValue, type: numericType, data, pipes, schema };
     });
   }
 
   public createPipesFn(
     pipes: PipeTransform[],
     paramsOptions: (ParamProperties & { metatype?: unknown })[],
-  ) {
-    const pipesFn = async (args: unknown[], ...params: unknown[]) => {
-      const resolveParamValue = async (
-        param: ParamProperties & { metatype?: unknown },
-      ) => {
-        const {
-          index,
-          extractValue,
-          type,
-          data,
-          metatype,
-          pipes: paramPipes,
-        } = param;
-        const value = extractValue(...params);
+  ):
+    | ((args: unknown[], ...params: unknown[]) => Promise<unknown> | undefined)
+    | null {
+    if (!paramsOptions.length) {
+      return null;
+    }
+    // Which pipes a param runs through is fixed for the handler, so it is
+    // worked out once here rather than on every call.
+    const params = paramsOptions.map(
+      ({
+        index,
+        extractValue,
+        type,
+        data,
+        metatype,
+        pipes: paramPipes,
+        schema,
+      }) => ({
+        index,
+        extractValue,
+        metadata: { metatype, type, data, schema } as ArgumentMetadata,
+        pipes: pipes.concat(paramPipes),
+      }),
+    );
 
-        args[index] = await this.getParamValue(
-          value,
-          { metatype, type, data },
-          pipes.concat(paramPipes),
-        );
-      };
-      await Promise.all(paramsOptions.map(resolveParamValue));
+    const applyPipes = async (
+      args: unknown[],
+      param: (typeof params)[number],
+      value: unknown,
+    ) => {
+      args[param.index] = await this.getParamValue(
+        value,
+        param.metadata,
+        param.pipes,
+      );
     };
-    return paramsOptions.length ? pipesFn : null;
+
+    return (args: unknown[], ...extractArgs: unknown[]) => {
+      // A value no pipe runs on is final once extracted and needs no promise,
+      // unless it is a thenable, which getParamValue() has always settled.
+      // The rest, and any extractor that throws, go through one
+      // Promise.all() in param order, as before.
+      let pending: Promise<void>[] | undefined;
+      for (let i = 0; i < params.length; i++) {
+        const param = params[i];
+        try {
+          const value = param.extractValue(...extractArgs);
+          if (param.pipes.length > 0 || isThenable(value)) {
+            (pending ??= []).push(applyPipes(args, param, value));
+          } else {
+            args[param.index] = value;
+          }
+        } catch (err) {
+          (pending ??= []).push(Promise.reject(err));
+        }
+      }
+      return pending && Promise.all(pending);
+    };
   }
 
   public async getParamValue<T>(
     value: T,
-    { metatype, type, data }: { metatype: any; type: any; data: any },
+    metadata: ArgumentMetadata,
     pipes: PipeTransform[],
   ): Promise<any> {
-    return isEmpty(pipes)
+    return isEmptyArray(pipes)
       ? value
-      : this.pipesConsumer.apply(value, { metatype, type, data }, pipes);
+      : this.pipesConsumer.apply(value, metadata, pipes);
   }
 
-  public async transformToResult(resultOrDeffered: any) {
-    if (resultOrDeffered && isFunction(resultOrDeffered.subscribe)) {
-      return resultOrDeffered.toPromise();
+  public async transformToResult(resultOrDeferred: any) {
+    if (isObservable(resultOrDeferred)) {
+      return lastValueFrom(resultOrDeferred);
     }
-    return resultOrDeffered;
+    return resultOrDeferred;
   }
 
   public createGuardsFn<TContext extends string = ContextType>(

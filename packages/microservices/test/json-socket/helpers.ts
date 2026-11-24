@@ -4,8 +4,7 @@ import {
   Server,
   Socket,
 } from 'net';
-import { ERROR_EVENT } from '../../constants';
-import { JsonSocket } from '../../helpers/json-socket';
+import { JsonSocket } from '../../helpers/json-socket.js';
 
 export const ip = '127.0.0.1';
 
@@ -17,7 +16,7 @@ export function createServer(callback: (err?: any, server?: Server) => void) {
     callback(null, server);
   });
 
-  server.on(ERROR_EVENT, (err: any) => {
+  server.on('error', (err: any) => {
     callback(err);
   });
 }
@@ -40,7 +39,7 @@ export function createClient(
 
   clientSocket.connect(port, ip);
 
-  clientSocket.on(ERROR_EVENT, (err: any) => {
+  clientSocket.on('error', (err: any) => {
     callback(err);
   });
 
@@ -63,7 +62,7 @@ export function createServerAndClient(
       return callback(serverErr);
     }
 
-    createClient(server, (clientErr, clientSocket, serverSocket) => {
+    createClient(server!, (clientErr, clientSocket, serverSocket) => {
       if (clientErr) {
         return callback(clientErr);
       }
@@ -74,7 +73,7 @@ export function createServerAndClient(
 }
 
 export function range(start: number, end: number) {
-  const r = [];
+  const r = [] as number[];
   for (let i = start; i <= end; i++) {
     r.push(i);
   }

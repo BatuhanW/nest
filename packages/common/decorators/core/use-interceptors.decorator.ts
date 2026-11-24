@@ -1,8 +1,8 @@
-import { INTERCEPTORS_METADATA } from '../../constants';
-import { NestInterceptor } from '../../interfaces';
-import { extendArrayMetadata } from '../../utils/extend-metadata.util';
-import { isFunction } from '../../utils/shared.utils';
-import { validateEach } from '../../utils/validate-each.util';
+import { INTERCEPTORS_METADATA } from '../../constants.js';
+import { NestInterceptor } from '../../interfaces/index.js';
+import { extendArrayMetadata } from '../../utils/extend-metadata.util.js';
+import { isFunction } from '../../utils/shared.utils.js';
+import { validateEach } from '../../utils/validate-each.util.js';
 
 /**
  * Decorator that binds interceptors to the scope of the controller or method,
@@ -37,8 +37,7 @@ export function UseInterceptors(
       interceptor: T,
     ) =>
       interceptor &&
-      (isFunction(interceptor) ||
-        isFunction((interceptor as Record<string, any>).intercept));
+      (isFunction(interceptor) || isFunction(interceptor.intercept));
 
     if (descriptor) {
       validateEach(

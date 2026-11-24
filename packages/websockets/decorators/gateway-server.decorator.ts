@@ -1,7 +1,9 @@
-import { GATEWAY_SERVER_METADATA } from '../constants';
+import { GATEWAY_SERVER_METADATA } from '../constants.js';
 
 /**
  * Attaches native Web Socket Server to a given property.
+ *
+ * @publicApi
  */
 export const WebSocketServer = (): PropertyDecorator => {
   return (target: object, propertyKey: string | symbol) => {

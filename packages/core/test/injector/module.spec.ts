@@ -1,17 +1,19 @@
-import { Controller, Scope } from '@nestjs/common';
-import { expect } from 'chai';
-import * as sinon from 'sinon';
-import { Injectable } from '../../../common';
-import { Module as ModuleDecorator } from '../../../common/decorators/modules/module.decorator';
-import { RuntimeException } from '../../errors/exceptions/runtime.exception';
-import { UnknownElementException } from '../../errors/exceptions/unknown-element.exception';
-import { UnknownExportException } from '../../errors/exceptions/unknown-export.exception';
-import { NestContainer } from '../../injector/container';
-import { InstanceWrapper } from '../../injector/instance-wrapper';
-import { Module } from '../../injector/module';
+import { Controller, Scope, SetMetadata } from '@nestjs/common';
+import { ENTRY_PROVIDER_WATERMARK } from '@nestjs/common/constants.js';
+import { Module as ModuleDecorator } from '../../../common/decorators/modules/module.decorator.js';
+import { Injectable } from '../../../common/index.js';
+import { InvalidProviderException } from '../../errors/exceptions/invalid-provider.exception.js';
+import { RuntimeException } from '../../errors/exceptions/runtime.exception.js';
+import { UnknownElementException } from '../../errors/exceptions/unknown-element.exception.js';
+import { UnknownExportException } from '../../errors/exceptions/unknown-export.exception.js';
+import { STATIC_CONTEXT } from '../../injector/constants.js';
+import { NestContainer } from '../../injector/container.js';
+import { InstanceWrapper } from '../../injector/instance-wrapper.js';
+import { Module } from '../../injector/module.js';
 
 describe('Module', () => {
-  let module: Module;
+  let moduleRef: Module;
+  let untypedModuleRef: any;
   let container: NestContainer;
 
   @ModuleDecorator({})
@@ -22,292 +24,427 @@ describe('Module', () => {
 
   beforeEach(() => {
     container = new NestContainer();
-    module = new Module(TestModule, container);
+    moduleRef = new Module(TestModule, container);
+    untypedModuleRef = moduleRef as any;
   });
 
   it('should add controller', () => {
     const collection = new Map();
-    const setSpy = sinon.spy(collection, 'set');
-    (module as any)._controllers = collection;
+    const setSpy = vi.spyOn(collection, 'set');
+    untypedModuleRef._controllers = collection;
 
-    @Controller({ scope: Scope.REQUEST })
+    @Controller({ scope: Scope.REQUEST, durable: true })
     class Test {}
 
-    module.addController(Test);
+    moduleRef.addController(Test);
+    expect(setSpy).toHaveBeenCalledOnce();
+    const [key, wrapper] = setSpy.mock.calls[0];
+    expect(key).toBe(Test);
+    expect(wrapper).toBeInstanceOf(InstanceWrapper);
+    expect(wrapper.token).toBe(Test);
+    expect(wrapper.name).toBe('Test');
+    expect(wrapper.scope).toBe(Scope.REQUEST);
+    expect(wrapper.metatype).toBe(Test);
+    expect(wrapper.durable).toBe(true);
+    expect(wrapper.instance).toBeNull();
     expect(
-      setSpy.calledWith(
-        'Test',
-        new InstanceWrapper({
-          host: module,
-          name: 'Test',
-          scope: Scope.REQUEST,
-          metatype: Test,
-          instance: null,
-          isResolved: false,
-        }),
-      ),
-    ).to.be.true;
+      wrapper.getInstanceByContextId(STATIC_CONTEXT).isResolved,
+    ).toBeFalsy();
   });
 
   it('should add injectable', () => {
     const collection = new Map();
-    const setSpy = sinon.spy(collection, 'set');
-    (module as any)._injectables = collection;
+    const setSpy = vi.spyOn(collection, 'set');
+    untypedModuleRef._injectables = collection;
 
-    module.addInjectable(TestProvider, TestModule);
+    moduleRef.addInjectable(TestProvider, 'interceptor', TestModule);
+    expect(setSpy).toHaveBeenCalledOnce();
+    const [key, wrapper] = setSpy.mock.calls[0];
+    expect(key).toBe(TestProvider);
+    expect(wrapper).toBeInstanceOf(InstanceWrapper);
+    expect(wrapper.name).toBe('TestProvider');
+    expect(wrapper.token).toBe(TestProvider);
+    expect(wrapper.metatype).toBe(TestProvider);
+    expect(wrapper.instance).toBeNull();
     expect(
-      setSpy.calledWith(
-        'TestProvider',
-        new InstanceWrapper({
-          host: module,
-          name: 'TestProvider',
-          scope: undefined,
-          metatype: TestProvider,
-          instance: null,
-          isResolved: false,
-        }),
-      ),
-    ).to.be.true;
+      wrapper.getInstanceByContextId(STATIC_CONTEXT).isResolved,
+    ).toBeFalsy();
+    expect(wrapper.subtype).toBe('interceptor');
   });
 
   describe('when injectable is custom provided', () => {
     it('should call `addCustomProvider`', () => {
-      const addCustomProviderSpy = sinon.spy(module, 'addCustomProvider');
+      const addCustomProviderSpy = vi.spyOn(moduleRef, 'addCustomProvider');
 
-      module.addInjectable({ provide: 'test' } as any);
-      expect(addCustomProviderSpy.called).to.be.true;
+      moduleRef.addInjectable(
+        { provide: 'test', useValue: 'test' } as any,
+        'guard',
+      );
+      expect(addCustomProviderSpy).toHaveBeenCalled();
+    });
+
+    it('should throw when a custom injectable does not define a valid "use*" property', () => {
+      expect(() =>
+        moduleRef.addInjectable(
+          { provide: 'test', useClass: undefined } as any,
+          'guard',
+        ),
+      ).toThrow(InvalidProviderException);
     });
   });
 
   it('should add provider', () => {
     const collection = new Map();
-    const setSpy = sinon.spy(collection, 'set');
-    (module as any)._providers = collection;
+    const setSpy = vi.spyOn(collection, 'set');
+    untypedModuleRef._providers = collection;
 
-    module.addProvider(TestProvider);
+    moduleRef.addProvider(TestProvider);
+    expect(setSpy).toHaveBeenCalledOnce();
+    const [key, wrapper] = setSpy.mock.calls[0];
+    expect(key).toBe(TestProvider);
+    expect(wrapper).toBeInstanceOf(InstanceWrapper);
+    expect(wrapper.name).toBe('TestProvider');
+    expect(wrapper.token).toBe(TestProvider);
+    expect(wrapper.metatype).toBe(TestProvider);
+    expect(wrapper.instance).toBeNull();
     expect(
-      setSpy.calledWith(
-        'TestProvider',
-        new InstanceWrapper({
-          host: module,
-          name: 'TestProvider',
-          scope: undefined,
-          metatype: TestProvider,
-          instance: null,
-          isResolved: false,
-        }),
-      ),
-    ).to.be.true;
+      wrapper.getInstanceByContextId(STATIC_CONTEXT).isResolved,
+    ).toBeFalsy();
+  });
+
+  it('should add a class provider to the entry providers when its class is an entry provider', () => {
+    @SetMetadata(ENTRY_PROVIDER_WATERMARK, true)
+    class EntryProvider {}
+
+    moduleRef.addProvider({ provide: 'ENTRY', useClass: EntryProvider });
+    expect(moduleRef.entryProviders).toEqual([
+      moduleRef.providers.get('ENTRY'),
+    ]);
   });
 
   it('should call "addCustomProvider" when "provide" property exists', () => {
-    const addCustomProvider = sinon.spy();
-    module.addCustomProvider = addCustomProvider;
+    const addCustomProvider = vi.fn();
+    moduleRef.addCustomProvider = addCustomProvider;
 
     const provider = { provide: 'test', useValue: 'test' };
 
-    module.addProvider(provider as any);
-    expect((addCustomProvider as sinon.SinonSpy).called).to.be.true;
+    moduleRef.addProvider(provider as any);
+    expect(addCustomProvider).toHaveBeenCalled();
   });
 
   it('should call "addCustomClass" when "useClass" property exists', () => {
-    const addCustomClass = sinon.spy();
-    module.addCustomClass = addCustomClass;
+    const addCustomClass = vi.fn();
+    moduleRef.addCustomClass = addCustomClass;
 
     const provider = { provide: 'test', useClass: () => null };
 
-    module.addCustomProvider(provider as any, new Map());
-    expect((addCustomClass as sinon.SinonSpy).called).to.be.true;
+    moduleRef.addCustomProvider(provider as any, new Map());
+    expect(addCustomClass).toHaveBeenCalled();
   });
 
   it('should call "addCustomValue" when "useValue" property exists', () => {
-    const addCustomValue = sinon.spy();
-    module.addCustomValue = addCustomValue;
+    const addCustomValue = vi.fn();
+    moduleRef.addCustomValue = addCustomValue;
 
     const provider = { provide: 'test', useValue: () => null };
 
-    module.addCustomProvider(provider as any, new Map());
-    expect((addCustomValue as sinon.SinonSpy).called).to.be.true;
+    moduleRef.addCustomProvider(provider as any, new Map());
+    expect(addCustomValue).toHaveBeenCalled();
+  });
+
+  it('should call "addCustomValue" when "useValue" property exists but its value is `undefined`', () => {
+    const addCustomValue = vi.fn();
+    moduleRef.addCustomValue = addCustomValue;
+
+    const provider = { provide: 'test', useValue: undefined };
+
+    moduleRef.addCustomProvider(provider as any, new Map());
+    expect(addCustomValue).toHaveBeenCalled();
   });
 
   it('should call "addCustomFactory" when "useFactory" property exists', () => {
-    const addCustomFactory = sinon.spy();
-    module.addCustomFactory = addCustomFactory;
+    const addCustomFactory = vi.fn();
+    moduleRef.addCustomFactory = addCustomFactory;
 
     const provider = { provide: 'test', useFactory: () => null };
 
-    module.addCustomProvider(provider as any, new Map());
-    expect((addCustomFactory as sinon.SinonSpy).called).to.be.true;
+    moduleRef.addCustomProvider(provider as any, new Map());
+    expect(addCustomFactory).toHaveBeenCalled();
   });
 
   it('should call "addCustomUseExisting" when "useExisting" property exists', () => {
-    const addCustomUseExisting = sinon.spy();
-    module.addCustomUseExisting = addCustomUseExisting;
+    const addCustomUseExisting = vi.fn();
+    moduleRef.addCustomUseExisting = addCustomUseExisting;
 
     const provider = { provide: 'test', useExisting: () => null };
 
-    module.addCustomUseExisting(provider as any, new Map());
-    expect((addCustomUseExisting as sinon.SinonSpy).called).to.be.true;
+    moduleRef.addCustomUseExisting(provider as any, new Map());
+    expect(addCustomUseExisting).toHaveBeenCalled();
+  });
+
+  describe('when custom provider does not define a valid "useClass", "useValue", "useFactory" or "useExisting"', () => {
+    const expectInvalidProvider = (provider: object) => {
+      const addCustomProvider = () =>
+        moduleRef.addCustomProvider(provider as any, new Map());
+
+      expect(addCustomProvider).toThrow(InvalidProviderException);
+      expect(addCustomProvider).toThrow(
+        'The provider "test" in the TestModule "providers" array',
+      );
+    };
+
+    it('should throw when "useClass" is undefined', () => {
+      expectInvalidProvider({ provide: 'test', useClass: undefined });
+    });
+
+    it('should throw when "useClass" is null', () => {
+      expectInvalidProvider({ provide: 'test', useClass: null });
+    });
+
+    it('should throw when "useExisting" is undefined', () => {
+      expectInvalidProvider({ provide: 'test', useExisting: undefined });
+    });
+
+    it('should throw when "useFactory" is null', () => {
+      expectInvalidProvider({ provide: 'test', useFactory: null });
+    });
+
+    it('should throw when none of them is set', () => {
+      expectInvalidProvider({ provide: 'test' });
+    });
   });
 
   describe('addCustomClass', () => {
     const type = { name: 'TypeTest' };
-    const provider = { provide: type, useClass: type, name: 'test' };
-    let setSpy;
+    const provider = { provide: type, useClass: type, durable: true };
+    let setSpy: ReturnType<typeof vi.fn>;
 
     beforeEach(() => {
       const collection = new Map();
-      setSpy = sinon.spy(collection, 'set');
-      (module as any)._providers = collection;
+      setSpy = vi.spyOn(collection, 'set');
+      untypedModuleRef._providers = collection;
     });
     it('should store provider', () => {
-      module.addCustomClass(provider as any, (module as any)._providers);
+      moduleRef.addCustomClass(provider as any, untypedModuleRef._providers);
+      expect(setSpy).toHaveBeenCalledOnce();
+      const [key, wrapper] = setSpy.mock.calls[0];
+      expect(key).toBe(provider.provide);
+      expect(wrapper).toBeInstanceOf(InstanceWrapper);
+      expect(wrapper.token).toBe(type);
+      expect(wrapper.name).toBe(provider.provide.name);
+      expect(wrapper.metatype).toBe(type);
+      expect(wrapper.durable).toBe(true);
+      expect(wrapper.instance).toBeNull();
       expect(
-        setSpy.calledWith(
-          provider.name,
-          new InstanceWrapper({
-            host: module,
-            name: provider.name,
-            scope: undefined,
-            metatype: type as any,
-            instance: null,
-            isResolved: false,
-          }),
-        ),
-      ).to.be.true;
+        wrapper.getInstanceByContextId(STATIC_CONTEXT).isResolved,
+      ).toBeFalsy();
     });
   });
 
   describe('addCustomValue', () => {
-    let setSpy;
+    let setSpy: ReturnType<typeof vi.fn>;
     const value = () => ({});
-    const name = 'test';
-    const provider = { provide: value, name, useValue: value };
+    const provider = { provide: value, useValue: value };
 
     beforeEach(() => {
       const collection = new Map();
-      setSpy = sinon.spy(collection, 'set');
-      (module as any)._providers = collection;
+      setSpy = vi.spyOn(collection, 'set');
+      untypedModuleRef._providers = collection;
     });
 
     it('should store provider', () => {
-      module.addCustomValue(provider as any, (module as any)._providers);
+      moduleRef.addCustomValue(provider as any, untypedModuleRef._providers);
+      expect(setSpy).toHaveBeenCalledOnce();
+      const [key, wrapper] = setSpy.mock.calls[0];
+      expect(key).toBe(provider.provide);
+      expect(wrapper).toBeInstanceOf(InstanceWrapper);
+      expect(wrapper.token).toBe(provider.provide);
+      expect(wrapper.name).toBe(provider.provide.name);
+      expect(wrapper.scope).toBe(Scope.DEFAULT);
+      expect(wrapper.metatype).toBeNull();
+      expect(wrapper.instance).toBe(value);
       expect(
-        setSpy.calledWith(
-          name,
-          new InstanceWrapper({
-            host: module,
-            name,
-            scope: Scope.DEFAULT,
-            metatype: null,
-            instance: value,
-            isResolved: true,
-            async: false,
-          }),
-        ),
-      ).to.be.true;
+        wrapper.getInstanceByContextId(STATIC_CONTEXT).isResolved,
+      ).toBeTruthy();
+    });
+
+    it('should store the original value when the instance decorator throws', () => {
+      // Mimics nestjs-cls proxy providers whose "get" trap throws for any
+      // property access performed by the decorator at bootstrap time
+      const hostileProxy = new Proxy(
+        {},
+        {
+          get: () => {
+            throw new Error('does not exist in the CLS');
+          },
+        },
+      );
+      const instrumentedContainer = new NestContainer(undefined, {
+        instrument: {
+          instanceDecorator: (instance: any) => {
+            void instance.decorate;
+            return instance;
+          },
+        },
+      });
+      const instrumentedModuleRef = new Module(
+        TestModule,
+        instrumentedContainer,
+      );
+      const collection = new Map();
+      const proxyProvider = { provide: 'PROXY', useValue: hostileProxy };
+
+      instrumentedModuleRef.addCustomValue(proxyProvider as any, collection);
+
+      expect(collection.get('PROXY')!.instance).toBe(hostileProxy);
     });
   });
 
   describe('addCustomFactory', () => {
     const type = { name: 'TypeTest' };
     const inject = [1, 2, 3];
-    const provider = { provide: type, useFactory: type, name: 'test', inject };
+    const provider = { provide: type, useFactory: type, inject, durable: true };
 
-    let setSpy;
+    let setSpy: ReturnType<typeof vi.fn>;
     beforeEach(() => {
       const collection = new Map();
-      setSpy = sinon.spy(collection, 'set');
-      (module as any)._providers = collection;
+      setSpy = vi.spyOn(collection, 'set');
+      untypedModuleRef._providers = collection;
     });
     it('should store provider', () => {
-      module.addCustomFactory(provider as any, (module as any)._providers);
+      moduleRef.addCustomFactory(provider as any, untypedModuleRef._providers);
+
+      expect(setSpy).toHaveBeenCalledOnce();
+      const [key, wrapper] = setSpy.mock.calls[0];
+      expect(key).toBe(provider.provide);
+      expect(wrapper).toBeInstanceOf(InstanceWrapper);
+      expect(wrapper.token).toBe(provider.provide);
+      expect(wrapper.name).toBe(provider.provide.name);
+      expect(wrapper.metatype).toBe(type);
+      expect(wrapper.durable).toBe(true);
+      expect(wrapper.instance).toBeNull();
       expect(
-        setSpy.calledWith(
-          provider.name,
-          new InstanceWrapper({
-            host: module,
-            name: provider.name,
-            scope: undefined,
-            metatype: type as any,
-            instance: null,
-            isResolved: false,
-            inject: inject as any,
-          }),
-        ),
-      ).to.be.true;
+        wrapper.getInstanceByContextId(STATIC_CONTEXT).isResolved,
+      ).toBeFalsy();
+      expect(wrapper.inject).toEqual(inject);
     });
   });
 
   describe('addCustomUseExisting', () => {
     const type = { name: 'TypeTest' };
-    const provider = { provide: type, useExisting: type, name: 'test' };
+    const provider = { provide: type, useExisting: type };
 
-    let setSpy;
+    let setSpy: ReturnType<typeof vi.fn>;
     beforeEach(() => {
       const collection = new Map();
-      setSpy = sinon.spy(collection, 'set');
-      (module as any)._providers = collection;
+      setSpy = vi.spyOn(collection, 'set');
+      untypedModuleRef._providers = collection;
     });
     it('should store provider', () => {
-      module.addCustomUseExisting(provider as any, (module as any)._providers);
-      const factoryFn = (module as any)._providers.get(provider.name).metatype;
+      moduleRef.addCustomUseExisting(
+        provider as any,
+        untypedModuleRef._providers,
+      );
+      const factoryFn = untypedModuleRef._providers.get(
+        provider.provide,
+      ).metatype;
+
+      const token = provider.provide as any;
+      expect(setSpy).toHaveBeenCalledOnce();
+      const [key, wrapper] = setSpy.mock.calls[0];
+      expect(key).toBe(token);
+      expect(wrapper).toBeInstanceOf(InstanceWrapper);
+      expect(wrapper.token).toBe(token);
+      expect(wrapper.name).toBe(provider.provide.name);
+      expect(wrapper.metatype).toBe(factoryFn);
+      expect(wrapper.instance).toBeNull();
+      expect(wrapper.inject).toEqual([provider.useExisting]);
       expect(
-        setSpy.calledWith(
-          provider.name,
-          new InstanceWrapper({
-            host: module,
-            name: provider.name,
-            metatype: factoryFn,
-            instance: null,
-            inject: [provider.useExisting as any],
-            isResolved: false,
-            isAlias: true,
-          }),
-        ),
-      ).to.be.true;
-      expect(factoryFn(provider.useExisting)).to.be.eql(type);
+        wrapper.getInstanceByContextId(STATIC_CONTEXT).isResolved,
+      ).toBeFalsy();
+      expect(wrapper.isAlias).toBe(true);
+      expect(factoryFn(provider.useExisting)).toEqual(type);
+    });
+  });
+
+  describe('isCustomClass', () => {
+    it('should return true when useClass is defined', () => {
+      expect(moduleRef.isCustomClass({ useClass: TestProvider })).toBe(true);
+    });
+    it('should return false when useClass is null', () => {
+      expect(moduleRef.isCustomClass({ useClass: null })).toBe(false);
+    });
+    it('should return false when useClass is undefined', () => {
+      expect(moduleRef.isCustomClass({})).toBe(false);
+    });
+  });
+
+  describe('isCustomFactory', () => {
+    it('should return true when useFactory is defined', () => {
+      expect(moduleRef.isCustomFactory({ useFactory: () => ({}) })).toBe(true);
+    });
+    it('should return false when useFactory is null', () => {
+      expect(moduleRef.isCustomFactory({ useFactory: null })).toBe(false);
+    });
+    it('should return false when useFactory is undefined', () => {
+      expect(moduleRef.isCustomFactory({})).toBe(false);
+    });
+  });
+
+  describe('isCustomUseExisting', () => {
+    it('should return true when useExisting is defined', () => {
+      expect(moduleRef.isCustomUseExisting({ useExisting: TestProvider })).toBe(
+        true,
+      );
+    });
+    it('should return false when useExisting is null', () => {
+      expect(moduleRef.isCustomUseExisting({ useExisting: null })).toBe(false);
+    });
+    it('should return false when useExisting is undefined', () => {
+      expect(moduleRef.isCustomUseExisting({})).toBe(false);
     });
   });
 
   describe('when get instance', () => {
     describe('when metatype does not exists in providers collection', () => {
       beforeEach(() => {
-        sinon.stub((module as any)._providers, 'has').returns(false);
+        vi.spyOn(untypedModuleRef._providers, 'has').mockReturnValue(false);
       });
-      it('should throws RuntimeException', () => {
-        expect(() => module.instance).to.throws(RuntimeException);
+      it('should throw RuntimeException', () => {
+        expect(() => moduleRef.instance).toThrow(RuntimeException);
       });
     });
     describe('when metatype exists in providers collection', () => {
-      it('should returns null', () => {
-        expect(module.instance).to.be.eql(null);
+      it('should return null', () => {
+        expect(moduleRef.instance).toEqual(null);
       });
     });
   });
 
   describe('when exported provider is custom provided', () => {
     beforeEach(() => {
-      sinon.stub(module, 'validateExportedProvider').callsFake(o => o);
+      vi.spyOn(moduleRef, 'validateExportedProvider').mockImplementation(
+        o => o,
+      );
     });
     it('should call `addCustomExportedProvider`', () => {
-      const addCustomExportedProviderSpy = sinon.spy(
-        module,
+      const addCustomExportedProviderSpy = vi.spyOn(
+        moduleRef,
         'addCustomExportedProvider',
       );
 
-      module.addExportedProvider({ provide: 'test' } as any);
-      expect(addCustomExportedProviderSpy.called).to.be.true;
+      moduleRef.addExportedProviderOrModule({ provide: 'test' } as any);
+      expect(addCustomExportedProviderSpy).toHaveBeenCalled();
     });
     it('should support symbols', () => {
-      const addCustomExportedProviderSpy = sinon.spy(
-        module,
+      const addCustomExportedProviderSpy = vi.spyOn(
+        moduleRef,
         'addCustomExportedProvider',
       );
       const symb = Symbol('test');
-      module.addExportedProvider({ provide: symb } as any);
-      expect(addCustomExportedProviderSpy.called).to.be.true;
-      expect((module as any)._exports.has(symb)).to.be.true;
+      moduleRef.addExportedProviderOrModule({ provide: symb } as any);
+      expect(addCustomExportedProviderSpy).toHaveBeenCalled();
+      expect(untypedModuleRef._exports.has(symb)).toBe(true);
     });
   });
 
@@ -315,26 +452,30 @@ describe('Module', () => {
     describe('when provider', () => {
       it('should call `mergeWith`', () => {
         const wrapper = {
-          mergeWith: sinon.spy(),
+          mergeWith: vi.fn(),
         };
-        sinon.stub(module, 'hasProvider').callsFake(() => true);
-        sinon.stub(module.providers, 'get').callsFake(() => wrapper as any);
+        vi.spyOn(moduleRef, 'hasProvider').mockImplementation(() => true);
+        vi.spyOn(moduleRef.providers, 'get').mockImplementation(
+          () => wrapper as any,
+        );
 
-        module.replace(null, { isProvider: true });
-        expect(wrapper.mergeWith.called).to.be.true;
+        moduleRef.replace(null!, { isProvider: true });
+        expect(wrapper.mergeWith).toHaveBeenCalled();
       });
     });
     describe('when guard', () => {
       it('should call `mergeWith`', () => {
         const wrapper = {
-          mergeWith: sinon.spy(),
+          mergeWith: vi.fn(),
           isProvider: true,
         };
-        sinon.stub(module, 'hasInjectable').callsFake(() => true);
-        sinon.stub(module.injectables, 'get').callsFake(() => wrapper as any);
+        vi.spyOn(moduleRef, 'hasInjectable').mockImplementation(() => true);
+        vi.spyOn(moduleRef.injectables, 'get').mockImplementation(
+          () => wrapper as any,
+        );
 
-        module.replace(null, {});
-        expect(wrapper.mergeWith.called).to.be.true;
+        moduleRef.replace(null!, {});
+        expect(wrapper.mergeWith).toHaveBeenCalled();
       });
     });
   });
@@ -342,66 +483,98 @@ describe('Module', () => {
   describe('imports', () => {
     it('should return relatedModules', () => {
       const test = ['test'];
-      (module as any)._imports = test;
+      untypedModuleRef._imports = test;
 
-      expect(module.imports).to.be.eql(test);
-      expect(module.relatedModules).to.be.eql(test);
+      expect(moduleRef.imports).toEqual(test);
     });
   });
 
   describe('injectables', () => {
     it('should return injectables', () => {
       const test = ['test'];
-      (module as any)._injectables = test;
-      expect(module.injectables).to.be.eql(test);
+      untypedModuleRef._injectables = test;
+      expect(moduleRef.injectables).toEqual(test);
     });
   });
 
   describe('controllers', () => {
     it('should return controllers', () => {
       const test = ['test'];
-      (module as any)._controllers = test;
+      untypedModuleRef._controllers = test;
 
-      expect(module.controllers).to.be.eql(test);
-      expect(module.routes).to.be.eql(test);
+      expect(moduleRef.controllers).toEqual(test);
     });
   });
 
   describe('exports', () => {
     it('should return exports', () => {
       const test = ['test'];
-      (module as any)._exports = test;
+      untypedModuleRef._exports = test;
 
-      expect(module.exports).to.be.eql(test);
+      expect(moduleRef.exports).toEqual(test);
     });
   });
 
   describe('providers', () => {
     it('should return providers', () => {
       const test = ['test'];
-      (module as any)._providers = test;
+      untypedModuleRef._providers = test;
 
-      expect(module.providers).to.be.eql(test);
-      expect(module.components).to.be.eql(test);
+      expect(moduleRef.providers).toEqual(test);
     });
   });
 
   describe('createModuleReferenceType', () => {
-    let moduleRef;
-
-    class SimpleClass {}
+    let customModuleRef: any;
 
     beforeEach(() => {
-      const Class = module.createModuleReferenceType();
-      moduleRef = new Class();
+      const Class = moduleRef.createModuleReferenceType();
+      customModuleRef = new Class();
     });
 
     it('should return metatype with "get" method', () => {
-      expect(!!moduleRef.get).to.be.true;
+      expect(!!customModuleRef.get).toBe(true);
     });
     describe('get', () => {
       it('should throw exception if not exists', () => {
-        expect(() => moduleRef.get('fail')).to.throws(UnknownElementException);
+        expect(() => customModuleRef.get('fail')).toThrow(
+          UnknownElementException,
+        );
+      });
+      it('should leave the options object it is given untouched', () => {
+        const find = vi.spyOn(customModuleRef, 'find').mockReturnValue('value');
+        const options = Object.freeze({ strict: false });
+
+        expect(customModuleRef.get('token', options)).toBe('value');
+        expect(find).toHaveBeenCalledWith('token', {
+          strict: false,
+          each: false,
+        });
+        expect(options).toEqual({ strict: false });
+      });
+    });
+    describe('resolve', () => {
+      it('should leave the options object it is given untouched', async () => {
+        const resolvePerContext = vi
+          .spyOn(customModuleRef, 'resolvePerContext')
+          .mockResolvedValue('value');
+        const options = Object.freeze({ each: true });
+        const contextId = { id: 1 };
+
+        const result = await customModuleRef.resolve(
+          'token',
+          contextId,
+          options,
+        );
+
+        expect(result).toBe('value');
+        expect(resolvePerContext).toHaveBeenCalledWith(
+          'token',
+          moduleRef,
+          contextId,
+          { strict: true, each: true },
+        );
+        expect(options).toEqual({ each: true });
       });
     });
   });
@@ -410,22 +583,22 @@ describe('Module', () => {
 
     describe('when unit exists in provider collection', () => {
       it('should behave as identity', () => {
-        (module as any)._providers = new Map([[token, true]]);
-        expect(module.validateExportedProvider(token)).to.be.eql(token);
+        untypedModuleRef._providers = new Map([[token, true]]);
+        expect(moduleRef.validateExportedProvider(token)).toEqual(token);
       });
     });
     describe('when unit exists in related modules collection', () => {
       it('should behave as identity', () => {
-        const metatype = { name: token };
-        (module as any)._imports = new Set([
-          new Module(metatype as any, new NestContainer()),
+        class Random {}
+        untypedModuleRef._imports = new Set([
+          new Module(Random, new NestContainer()),
         ]);
-        expect(module.validateExportedProvider(token)).to.be.eql(token);
+        expect(moduleRef.validateExportedProvider(Random)).toEqual(Random);
       });
     });
     describe('when unit does not exist in both provider and related modules collections', () => {
       it('should throw UnknownExportException', () => {
-        expect(() => module.validateExportedProvider(token)).to.throws(
+        expect(() => moduleRef.validateExportedProvider(token)).toThrow(
           UnknownExportException,
         );
       });
@@ -436,13 +609,13 @@ describe('Module', () => {
     describe('when module has provider', () => {
       it('should return true', () => {
         const token = 'test';
-        module.providers.set(token, new InstanceWrapper());
-        expect(module.hasProvider(token)).to.be.true;
+        moduleRef.providers.set(token, new InstanceWrapper());
+        expect(moduleRef.hasProvider(token)).toBe(true);
       });
     });
     describe('otherwise', () => {
       it('should return false', () => {
-        expect(module.hasProvider('_')).to.be.false;
+        expect(moduleRef.hasProvider('_')).toBe(false);
       });
     });
   });
@@ -451,33 +624,33 @@ describe('Module', () => {
     describe('when module has injectable', () => {
       it('should return true', () => {
         const token = 'test';
-        module.injectables.set(token, new InstanceWrapper());
-        expect(module.hasInjectable(token)).to.be.true;
+        moduleRef.injectables.set(token, new InstanceWrapper());
+        expect(moduleRef.hasInjectable(token)).toBe(true);
       });
     });
     describe('otherwise', () => {
       it('should return false', () => {
-        expect(module.hasInjectable('_')).to.be.false;
+        expect(moduleRef.hasInjectable('_')).toBe(false);
       });
     });
   });
 
   describe('getter "id"', () => {
     it('should return module id', () => {
-      expect(module.id).to.be.equal(module['_id']);
+      expect(moduleRef.id).toBe(moduleRef['_id']);
     });
   });
 
   describe('getProviderByKey', () => {
     describe('when does not exist', () => {
       it('should return undefined', () => {
-        expect(module.getProviderByKey('test')).to.be.undefined;
+        expect(moduleRef.getProviderByKey('test')).toBeUndefined();
       });
     });
     describe('otherwise', () => {
       it('should return instance wrapper', () => {
-        module.addProvider(TestProvider);
-        expect(module.getProviderByKey('TestProvider')).to.not.be.undefined;
+        moduleRef.addProvider(TestProvider);
+        expect(moduleRef.getProviderByKey(TestProvider)).not.toBeUndefined();
       });
     });
   });

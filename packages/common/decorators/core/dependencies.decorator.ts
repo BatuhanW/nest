@@ -1,14 +1,18 @@
-import { PARAMTYPES_METADATA } from '../../constants';
+import { PARAMTYPES_METADATA } from '../../constants.js';
 
 export function flatten<T extends Array<unknown> = any>(
   arr: T,
 ): T extends Array<infer R> ? R : never {
-  const flat = [].concat(...arr);
-  return flat.some(Array.isArray) ? flatten(flat) : flat;
+  const flat = ([] as any[]).concat(...arr);
+  return flat.some(Array.isArray)
+    ? flatten(flat)
+    : (flat as T extends Array<infer R> ? R : never);
 }
 
 /**
  * Decorator that sets required dependencies (required with a vanilla JavaScript objects)
+ *
+ * @publicApi
  */
 export const Dependencies = (
   ...dependencies: Array<unknown>

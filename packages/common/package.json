@@ -1,7 +1,16 @@
 {
   "name": "@nestjs/common",
-  "version": "7.6.11",
-  "description": "Nest - modern, fast, powerful node.js web framework (@common)",
+  "version": "12.6.0",
+  "description": "Decorators, pipes, exceptions and utilities for NestJS applications: @Controller(), @Injectable(), @Body(), ValidationPipe, HttpException and more.",
+  "keywords": [
+    "nestjs",
+    "nest",
+    "framework",
+    "typescript",
+    "decorators",
+    "validation",
+    "backend"
+  ],
   "author": "Kamil Mysliwiec",
   "homepage": "https://nestjs.com",
   "funding": {
@@ -10,34 +19,43 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/nestjs/nest"
+    "url": "https://github.com/nestjs/nest.git",
+    "directory": "packages/common"
   },
   "publishConfig": {
     "access": "public"
   },
   "license": "MIT",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json",
+    "./internal": "./internal.js",
+    "./*.js": "./*.js",
+    "./*": "./*.js"
+  },
   "dependencies": {
-    "axios": "0.21.1",
+    "@standard-schema/spec": "1.1.0",
+    "file-type": "22.3.0",
     "iterare": "1.2.1",
-    "tslib": "2.1.0",
-    "uuid": "8.3.2"
+    "load-esm": "1.0.3",
+    "tslib": "2.9.1",
+    "uid": "2.0.2"
   },
   "peerDependencies": {
-    "cache-manager": "*",
-    "class-transformer": "*",
-    "class-validator": "*",
-    "reflect-metadata": "^0.1.12",
-    "rxjs": "^6.0.0"
+    "class-transformer": ">=0.4.1",
+    "class-validator": ">=0.13.2",
+    "reflect-metadata": "^0.1.12 || ^0.2.0",
+    "rxjs": "^7.1.0"
   },
   "peerDependenciesMeta": {
-    "cache-manager": {
-      "optional": true
-    },
     "class-validator": {
       "optional": true
     },
     "class-transformer": {
       "optional": true
     }
-  }
+  },
+  "gitHead": "ab3fb3d5ca7d51d078835e44a8db1b354f8b651b"
 }

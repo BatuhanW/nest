@@ -5,17 +5,22 @@ import {
   Injectable,
   MiddlewareConsumer,
   Module,
+  RequestMethod,
 } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import * as request from 'supertest';
-import { ApplicationModule } from '../src/app.module';
+import { Response } from 'express';
+import request from 'supertest';
+import { AppModule } from '../src/app.module.js';
+import { listenOnLoopback } from '../../_support/listen-on-loopback.js';
 
+const INCLUDED_VALUE = 'test_included';
 const RETURN_VALUE = 'test';
+const WILDCARD_VALUE = 'test_wildcard';
 
 @Injectable()
 class Middleware {
   use(req, res, next) {
-    res.send(RETURN_VALUE);
+    res.send(WILDCARD_VALUE);
   }
 }
 
@@ -23,17 +28,21 @@ class Middleware {
 class TestController {
   @Get('test')
   test() {
-    return 'test';
+    return RETURN_VALUE;
   }
 }
 
 @Module({
-  imports: [ApplicationModule],
+  imports: [AppModule],
   controllers: [TestController],
 })
 class TestModule {
   configure(consumer: MiddlewareConsumer) {
-    consumer.apply(Middleware).forRoutes('*');
+    consumer
+      .apply((req, res: Response, next) => res.status(201).end(INCLUDED_VALUE))
+      .forRoutes({ path: 'tests/included', method: RequestMethod.POST })
+      .apply(Middleware)
+      .forRoutes('*');
   }
 }
 
@@ -47,11 +56,31 @@ describe('Middleware (class)', () => {
       }).compile()
     ).createNestApplication();
 
-    await app.init();
+    await listenOnLoopback(app);
   });
 
   it(`forRoutes(*)`, () => {
-    return request(app.getHttpServer()).get('/hello').expect(200, RETURN_VALUE);
+    return request(app.getHttpServer())
+      .get('/hello')
+      .expect(200, WILDCARD_VALUE);
+  });
+
+  it(`/test forRoutes(*)`, () => {
+    return request(app.getHttpServer())
+      .get('/test')
+      .expect(200, WILDCARD_VALUE);
+  });
+
+  it(`GET forRoutes(POST tests/included)`, () => {
+    return request(app.getHttpServer())
+      .get('/tests/included')
+      .expect(200, WILDCARD_VALUE);
+  });
+
+  it(`POST forRoutes(POST tests/included)`, () => {
+    return request(app.getHttpServer())
+      .post('/tests/included')
+      .expect(201, INCLUDED_VALUE);
   });
 
   afterEach(async () => {

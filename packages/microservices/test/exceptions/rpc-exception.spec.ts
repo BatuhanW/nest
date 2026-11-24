@@ -1,5 +1,4 @@
-import { expect } from 'chai';
-import { RpcException } from '../../exceptions/rpc-exception';
+import { RpcException } from '../../exceptions/rpc-exception.js';
 
 describe('RpcException', () => {
   describe('when string passed', () => {
@@ -7,10 +6,10 @@ describe('RpcException', () => {
     const instance = new RpcException(error);
 
     it('should return error message as string', () => {
-      expect(instance.getError()).to.be.eql(error);
+      expect(instance.getError()).toEqual(error);
     });
     it('should set the message property', () => {
-      expect(instance.message).to.be.eql(error);
+      expect(instance.message).toEqual(error);
     });
   });
 
@@ -20,10 +19,19 @@ describe('RpcException', () => {
       const instance = new RpcException(error);
 
       it('should return error as object', () => {
-        expect(instance.getError()).to.be.eql(error);
+        expect(instance.getError()).toEqual(error);
       });
       it('should fallback error message to class name', () => {
-        expect(instance.message).to.be.eql('Rpc Exception');
+        expect(instance.message).toEqual('Rpc Exception');
+      });
+    });
+    describe('and class name cannot be split into words', () => {
+      class RPC extends RpcException {}
+      const error = { test: true };
+      const instance = new RPC(error);
+
+      it('should fallback error message to "Error"', () => {
+        expect(instance.message).toEqual('Error');
       });
     });
     describe('and message property is not undefined', () => {
@@ -31,10 +39,10 @@ describe('RpcException', () => {
       const instance = new RpcException(error);
 
       it('should return error as object', () => {
-        expect(instance.getError()).to.be.eql(error);
+        expect(instance.getError()).toEqual(error);
       });
       it('should return error message as the extracted "message" string', () => {
-        expect(instance.message).to.be.eql(error.message);
+        expect(instance.message).toEqual(error.message);
       });
     });
   });

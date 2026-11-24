@@ -1,1 +1,1 @@
-export * from './clients-module.interface';
+export type * from './clients-module.interface.js';

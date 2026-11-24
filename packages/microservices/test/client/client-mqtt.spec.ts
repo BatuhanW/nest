@@ -1,43 +1,51 @@
-import { expect } from 'chai';
-import { empty } from 'rxjs';
-import * as sinon from 'sinon';
-import { ClientMqtt } from '../../client/client-mqtt';
-import { ERROR_EVENT } from '../../constants';
+import { EventEmitter } from 'events';
+import { EMPTY } from 'rxjs';
+import { ClientMqtt } from '../../client/client-mqtt.js';
+import { MQTT_MAX_TOPIC_LENGTH } from '../../constants.js';
+import { InvalidMqttTopicNameException } from '../../errors/invalid-mqtt-topic-name.exception.js';
+import { MaxMqttTopicLengthExceededException } from '../../errors/max-mqtt-topic-length-exceeded.exception.js';
+import { ReadPacket } from '../../interfaces/index.js';
+import { MqttRecord } from '../../record-builders/index.js';
 
 describe('ClientMqtt', () => {
   const test = 'test';
-  const client = new ClientMqtt({});
+  let client: ClientMqtt = new ClientMqtt({});
+  let untypedClient = client as any;
 
   describe('getRequestPattern', () => {
     it(`should leave pattern as it is`, () => {
-      expect(client.getRequestPattern(test)).to.equal(test);
+      expect(client.getRequestPattern(test)).toBe(test);
     });
   });
   describe('getResponsePattern', () => {
     it(`should append "/reply" to string`, () => {
       const expectedResult = test + '/reply';
-      expect(client.getResponsePattern(test)).to.equal(expectedResult);
+      expect(client.getResponsePattern(test)).toBe(expectedResult);
     });
   });
   describe('publish', () => {
     const pattern = 'test';
-    const msg = { pattern, data: 'data' };
-    let subscribeSpy: sinon.SinonSpy,
-      publishSpy: sinon.SinonSpy,
-      onSpy: sinon.SinonSpy,
-      removeListenerSpy: sinon.SinonSpy,
-      unsubscribeSpy: sinon.SinonSpy,
-      connectSpy: sinon.SinonStub,
-      assignStub: sinon.SinonStub,
-      mqttClient;
+    let msg: ReadPacket;
+    let subscribeSpy: ReturnType<typeof vi.fn>,
+      publishSpy: ReturnType<typeof vi.fn>,
+      onSpy: ReturnType<typeof vi.fn>,
+      removeListenerSpy: ReturnType<typeof vi.fn>,
+      unsubscribeSpy: ReturnType<typeof vi.fn>,
+      connectSpy: ReturnType<typeof vi.fn>,
+      assignStub: ReturnType<typeof vi.fn>,
+      mqttClient: any;
 
     const id = '1';
     beforeEach(() => {
-      subscribeSpy = sinon.spy((name, fn) => fn());
-      publishSpy = sinon.spy();
-      onSpy = sinon.spy();
-      removeListenerSpy = sinon.spy();
-      unsubscribeSpy = sinon.spy();
+      client = new ClientMqtt({});
+      untypedClient = client as any;
+
+      msg = { pattern, data: 'data' };
+      subscribeSpy = vi.fn((name, fn) => fn());
+      publishSpy = vi.fn();
+      onSpy = vi.fn();
+      removeListenerSpy = vi.fn();
+      unsubscribeSpy = vi.fn();
 
       mqttClient = {
         subscribe: subscribeSpy,
@@ -47,72 +55,489 @@ describe('ClientMqtt', () => {
         publish: publishSpy,
         addListener: () => ({}),
       };
-      (client as any).mqttClient = mqttClient;
-      connectSpy = sinon.stub(client, 'connect');
-      assignStub = sinon
-        .stub(client, 'assignPacketId' as any)
-        .callsFake(packet => Object.assign(packet, { id }));
+      untypedClient.mqttClient = mqttClient;
+      connectSpy = vi
+        .spyOn(client, 'connect')
+        .mockImplementation(() => ({}) as any);
+      assignStub = vi
+        .spyOn(client, 'assignPacketId' as any)
+        .mockImplementation(packet => Object.assign(packet as object, { id }));
     });
     afterEach(() => {
-      connectSpy.restore();
-      assignStub.restore();
+      connectSpy.mockRestore();
+      assignStub.mockRestore();
     });
     it('should subscribe to response pattern name', async () => {
-      await client['publish'](msg, () => {});
-      expect(subscribeSpy.calledWith(`${pattern}/reply`)).to.be.true;
+      client['publish'](msg, () => {});
+      expect(subscribeSpy.mock.calls[0][0]).toEqual(`${pattern}/reply`);
     });
     it('should publish stringified message to request pattern name', async () => {
-      await client['publish'](msg, () => {});
-      expect(publishSpy.calledWith(pattern, JSON.stringify(msg))).to.be.true;
+      client['publish'](msg, () => {});
+      expect(publishSpy.mock.calls[0][0]).toEqual(pattern);
+      expect(publishSpy.mock.calls[0][1]).toEqual(JSON.stringify(msg));
     });
     it('should add callback to routing map', async () => {
-      await client['publish'](msg, () => {});
-      expect(client['routingMap'].has(id)).to.be.true;
+      client['publish'](msg, () => {});
+      expect(client['routingMap'].has(id)).toBe(true);
+    });
+    it('should not keep a count for the reply topics no request waits on', () => {
+      // Patterns may be built from request data, e.g. one per device
+      for (const device of ['a', 'b', 'c']) {
+        const dispose = client['publish'](
+          { pattern: `devices/${device}`, data: 'data' },
+          () => {},
+        );
+        dispose();
+      }
+
+      expect(client['subscriptionsCount'].size).toBe(0);
     });
     describe('on error', () => {
       beforeEach(() => {
-        assignStub.callsFake(() => {
+        assignStub.mockImplementation(() => {
           throw new Error();
         });
       });
 
       it('should call callback', () => {
-        const callback = sinon.spy();
+        const callback = vi.fn();
         client['publish'](msg, callback);
 
-        expect(callback.called).to.be.true;
-        expect(callback.getCall(0).args[0].err).to.be.instanceof(Error);
+        expect(callback).toHaveBeenCalled();
+        expect(callback.mock.calls[0][0].err).toBeInstanceOf(Error);
+      });
+    });
+    describe('when subscribing to the response pattern fails', () => {
+      it('should call callback with the error and not publish', () => {
+        const error = new Error('client disconnecting');
+        subscribeSpy.mockImplementation((name, fn) => fn(error));
+        const callback = vi.fn();
+
+        client['publish'](msg, callback);
+
+        expect(callback).toHaveBeenCalledWith({ err: error });
+        expect(publishSpy).not.toHaveBeenCalled();
+        expect(client['routingMap'].size).toBe(0);
+        expect(client['subscriptionsCount'].has(`${pattern}/reply`)).toBe(
+          false,
+        );
+      });
+    });
+    describe('when a topic would hold a wildcard or the null character', () => {
+      // A pattern built from request data, such as `devices/${id}/status`
+      it.each([
+        'devices/+/status',
+        'devices/#',
+        'devices/a+b',
+        'devices/\u0000',
+      ])(
+        'should fail the request on %j without subscribing or publishing',
+        pattern => {
+          const callback = vi.fn();
+
+          client['publish']({ pattern, data: 'data' }, callback);
+
+          expect(callback).toHaveBeenCalledWith({
+            err: expect.any(InvalidMqttTopicNameException),
+          });
+          expect(subscribeSpy).not.toHaveBeenCalled();
+          expect(publishSpy).not.toHaveBeenCalled();
+          expect(client['routingMap'].size).toBe(0);
+          expect(client['subscriptionsCount'].size).toBe(0);
+        },
+      );
+    });
+    describe('when a topic would exceed the maximum topic length', () => {
+      // A pattern that leaves just enough room for "/reply"
+      const longestPattern = 'a'.repeat(
+        MQTT_MAX_TOPIC_LENGTH - '/reply'.length,
+      );
+
+      it('should fail the request without subscribing or publishing', () => {
+        const callback = vi.fn();
+
+        client['publish'](
+          { pattern: `${longestPattern}a`, data: 'data' },
+          callback,
+        );
+
+        expect(callback).toHaveBeenCalledWith({
+          err: expect.any(MaxMqttTopicLengthExceededException),
+        });
+        expect(subscribeSpy).not.toHaveBeenCalled();
+        expect(publishSpy).not.toHaveBeenCalled();
+        expect(client['routingMap'].size).toBe(0);
+        expect(client['subscriptionsCount'].size).toBe(0);
+      });
+      it('should count the length in bytes', () => {
+        const callback = vi.fn();
+
+        // "é" takes two bytes
+        client['publish'](
+          { pattern: `${longestPattern.slice(1)}é`, data: 'data' },
+          callback,
+        );
+
+        expect(callback).toHaveBeenCalledWith({
+          err: expect.any(MaxMqttTopicLengthExceededException),
+        });
+        expect(subscribeSpy).not.toHaveBeenCalled();
+      });
+      it('should send a request whose topics fit', () => {
+        const callback = vi.fn();
+
+        client['publish']({ pattern: longestPattern, data: 'data' }, callback);
+
+        expect(callback).not.toHaveBeenCalled();
+        expect(subscribeSpy.mock.calls[0][0]).toBe(`${longestPattern}/reply`);
+        expect(publishSpy.mock.calls[0][0]).toBe(longestPattern);
+      });
+    });
+    describe('when disposed before the subscription is confirmed', () => {
+      it('should not publish and give the subscription up again', () => {
+        let confirmSubscription: () => void = () => {};
+        subscribeSpy.mockImplementation((name, fn) => {
+          confirmSubscription = () => fn();
+        });
+        const callback = vi.fn();
+
+        const dispose = client['publish'](msg, callback);
+        dispose();
+        confirmSubscription();
+
+        expect(publishSpy).not.toHaveBeenCalled();
+        expect(client['routingMap'].size).toBe(0);
+        expect(client['subscriptionsCount'].has(`${pattern}/reply`)).toBe(
+          false,
+        );
+        expect(unsubscribeSpy).toHaveBeenCalledExactlyOnceWith(
+          `${pattern}/reply`,
+        );
+        expect(callback).not.toHaveBeenCalled();
+      });
+    });
+    describe('when a request finishes while another waits for the subscription', () => {
+      it('should keep the response pattern subscribed for the waiting one', () => {
+        // Like mqtt.js, confirm a topic that is already being subscribed to
+        // right away, and the first subscription once the broker answers
+        const topics = new Set<string>();
+        let confirmSubscription: () => void = () => {};
+        subscribeSpy.mockImplementation((name, fn) => {
+          if (topics.has(name)) {
+            return fn();
+          }
+          topics.add(name);
+          confirmSubscription = () => fn();
+        });
+        unsubscribeSpy.mockImplementation(name => topics.delete(name));
+
+        client['publish'](msg, vi.fn());
+        const disposeOther = client['publish'](msg, vi.fn());
+        disposeOther();
+        confirmSubscription();
+
+        expect(unsubscribeSpy).not.toHaveBeenCalled();
+        expect(publishSpy).toHaveBeenCalledTimes(2);
+        expect(client['subscriptionsCount'].get(`${pattern}/reply`)).toBe(1);
+      });
+
+      it('should fail a request that waits for the acknowledgement on close', async () => {
+        let confirmSubscription: (err?: Error) => void = () => {};
+        subscribeSpy.mockImplementation((name, fn) => {
+          confirmSubscription = err => fn(err);
+        });
+        const error = vi.fn();
+        client.send(pattern, 'data').subscribe({ error });
+        await vi.waitFor(() => expect(subscribeSpy).toHaveBeenCalled());
+
+        client.handleClose();
+        // mqtt.js still answers the subscription (or fails it) afterwards
+        confirmSubscription();
+        confirmSubscription(new Error('Connection closed'));
+
+        expect(error).toHaveBeenCalledExactlyOnceWith(
+          expect.objectContaining({ message: 'Connection closed' }),
+        );
+        expect(publishSpy).not.toHaveBeenCalled();
+        expect(client['routingMap'].size).toBe(0);
+        expect(client['subscriptionsCount'].size).toBe(0);
+        expect(unsubscribeSpy).toHaveBeenCalledExactlyOnceWith(
+          `${pattern}/reply`,
+        );
       });
     });
     describe('dispose callback', () => {
-      let getResponsePatternStub: sinon.SinonStub;
-      let callback: sinon.SinonSpy, subscription;
+      let getResponsePatternStub: ReturnType<typeof vi.fn>;
+      let callback: ReturnType<typeof vi.fn>, subscription;
 
       const channel = 'channel';
 
       beforeEach(async () => {
-        callback = sinon.spy();
+        callback = vi.fn();
 
-        getResponsePatternStub = sinon
-          .stub(client, 'getResponsePattern')
-          .callsFake(() => channel);
-        subscription = await client['publish'](msg, callback);
+        getResponsePatternStub = vi
+          .spyOn(client, 'getResponsePattern')
+          .mockImplementation(() => channel);
+        subscription = client['publish'](msg, callback);
         subscription(channel, JSON.stringify({ isDisposed: true, id }));
       });
       afterEach(() => {
-        getResponsePatternStub.restore();
+        getResponsePatternStub.mockRestore();
       });
 
       it('should unsubscribe to response pattern name', () => {
-        expect(unsubscribeSpy.calledWith(channel)).to.be.true;
+        expect(unsubscribeSpy).toHaveBeenCalledWith(channel);
       });
-      it('should remove callback from routin map', () => {
-        expect(client['routingMap'].has(id)).to.be.false;
+      it('should remove callback from routing map', () => {
+        expect(client['routingMap'].has(id)).toBe(false);
+      });
+    });
+    describe('headers', () => {
+      it('should not generate headers if none are configured', async () => {
+        client['publish'](msg, () => {});
+        expect(publishSpy.mock.calls[0][2]).toBeUndefined();
+      });
+      it('should send packet headers', async () => {
+        const requestHeaders = { '1': '123' };
+        msg.data = new MqttRecord('data', {
+          properties: { userProperties: requestHeaders },
+        });
+
+        client['publish'](msg, () => {});
+        expect(publishSpy.mock.calls[0][2].properties.userProperties).toEqual(
+          requestHeaders,
+        );
+      });
+      it('should combine packet and static headers', async () => {
+        const staticHeaders = { 'client-id': 'some-client-id' };
+        untypedClient.options.userProperties = staticHeaders;
+
+        const requestHeaders = { '1': '123' };
+        msg.data = new MqttRecord('data', {
+          properties: { userProperties: requestHeaders },
+        });
+
+        client['publish'](msg, () => {});
+        expect(publishSpy.mock.calls[0][2].properties.userProperties).toEqual({
+          ...staticHeaders,
+          ...requestHeaders,
+        });
+      });
+      it('should prefer packet headers over static headers', async () => {
+        const staticHeaders = { 'client-id': 'some-client-id' };
+        untypedClient.options.headers = staticHeaders;
+
+        const requestHeaders = { 'client-id': 'override-client-id' };
+        msg.data = new MqttRecord('data', {
+          properties: { userProperties: requestHeaders },
+        });
+
+        client['publish'](msg, () => {});
+        expect(publishSpy.mock.calls[0][2].properties.userProperties).toEqual(
+          requestHeaders,
+        );
+      });
+    });
+
+    describe('packet metadata', () => {
+      it('should send it as MQTT 5 user properties, and not in the payload', () => {
+        untypedClient.options.protocolVersion = 5;
+        msg.metadata = { 'x-request-id': 'trace-1' };
+
+        client['publish'](msg, () => {});
+
+        const [, payload, options] = publishSpy.mock.calls[0];
+        expect(options).toEqual({
+          properties: { userProperties: { 'x-request-id': 'trace-1' } },
+        });
+        expect(JSON.parse(payload)).toEqual({ pattern, data: 'data', id });
+      });
+
+      it('should let the record and the static user properties win', () => {
+        untypedClient.options.protocolVersion = 5;
+        untypedClient.options.userProperties = { tenant: 'from-options' };
+        msg.data = new MqttRecord('data', {
+          qos: 1,
+          properties: { userProperties: { 'x-request-id': 'from-record' } },
+        });
+        msg.metadata = {
+          'x-request-id': 'trace-1',
+          tenant: 'acme',
+          locale: 'pl',
+        };
+
+        client['publish'](msg, () => {});
+
+        expect(publishSpy.mock.calls[0][2]).toEqual({
+          qos: 1,
+          properties: {
+            userProperties: {
+              'x-request-id': 'from-record',
+              tenant: 'from-options',
+              locale: 'pl',
+            },
+          },
+        });
+      });
+
+      it('should not send it over MQTT 3, which has no user properties', () => {
+        msg.metadata = { 'x-request-id': 'trace-1' };
+
+        client['publish'](msg, () => {});
+
+        const [, payload, options] = publishSpy.mock.calls[0];
+        expect(options).toBeUndefined();
+        expect(JSON.parse(payload)).toEqual({ pattern, data: 'data', id });
+      });
+
+      it('should not add empty user properties for empty metadata', () => {
+        untypedClient.options.protocolVersion = 5;
+        msg.metadata = {};
+
+        client['publish'](msg, () => {});
+
+        expect(publishSpy.mock.calls[0][2]).toBeUndefined();
+      });
+    });
+
+    describe('when publishing throws', () => {
+      const responseChannel = `${pattern}/reply`;
+
+      beforeEach(() => {
+        client['subscriptionsCount'].clear();
+        client['routingMap'].clear();
+        publishSpy.mockImplementation(() => {
+          throw new Error('Send error');
+        });
+      });
+
+      it('should undo what the request had already set up', () => {
+        client['publish'](msg, vi.fn());
+
+        expect(client['routingMap'].size).toBe(0);
+        expect(client['subscriptionsCount'].has(responseChannel)).toBe(false);
+      });
+
+      it('should undo it as well when the subscription is acknowledged later', () => {
+        let acknowledge = () => {};
+        subscribeSpy.mockImplementation((_channel, done) => {
+          acknowledge = () => done();
+        });
+        const callback = vi.fn();
+
+        client['publish'](msg, callback);
+        acknowledge();
+
+        expect(client['routingMap'].size).toBe(0);
+        expect(client['subscriptionsCount'].has(responseChannel)).toBe(false);
+        expect(callback).toHaveBeenCalledWith({
+          err: expect.objectContaining({ message: 'Send error' }),
+        });
+      });
+
+      it('should leave the response channel subscribed', () => {
+        // A concurrent request on this pattern may still be waiting for its
+        // own subscribe reply, so the subscription is left to self-heal.
+        client['publish'](msg, vi.fn());
+
+        expect(unsubscribeSpy).not.toHaveBeenCalled();
+      });
+
+      it('should undo the bookkeeping once', () => {
+        const teardown = client['publish'](msg, vi.fn());
+
+        teardown();
+
+        expect(client['routingMap'].size).toBe(0);
+        expect(client['subscriptionsCount'].has(responseChannel)).toBe(false);
+        expect(unsubscribeSpy).not.toHaveBeenCalled();
+      });
+
+      it('should keep the count of the requests already using the channel', () => {
+        client['subscriptionsCount'].set(responseChannel, 1);
+
+        const teardown = client['publish'](msg, vi.fn());
+        teardown();
+
+        expect(subscribeSpy).not.toHaveBeenCalled();
+        expect(client['routingMap'].size).toBe(0);
+        expect(client['subscriptionsCount'].get(responseChannel)).toBe(1);
+        expect(unsubscribeSpy).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('when publishing fails later', () => {
+      const responseChannel = `${pattern}/reply`;
+      const publishError = new Error('Publish error: Not authorized');
+
+      beforeEach(() => {
+        client['subscriptionsCount'].clear();
+        client['routingMap'].clear();
+        // mqtt.js reports a rejected publish through its callback only
+        publishSpy.mockImplementation((_topic, _message, _options, done) =>
+          setImmediate(() => done(publishError)),
+        );
+      });
+
+      it('should fail the request and undo what it had set up', async () => {
+        const callback = vi.fn();
+
+        client['publish'](msg, callback);
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(callback).toHaveBeenCalledWith({ err: publishError });
+        expect(client['routingMap'].size).toBe(0);
+        expect(client['subscriptionsCount'].has(responseChannel)).toBe(false);
+      });
+
+      it('should not fail a request again once it is torn down', async () => {
+        // Another request already uses the channel, so a second undo would
+        // show up in the count
+        client['subscriptionsCount'].set(responseChannel, 1);
+        const callback = vi.fn();
+
+        const teardown = client['publish'](msg, callback);
+        teardown();
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(callback).not.toHaveBeenCalled();
+        expect(client['routingMap'].size).toBe(0);
+        expect(client['subscriptionsCount'].get(responseChannel)).toBe(1);
+        expect(unsubscribeSpy).not.toHaveBeenCalled();
+      });
+
+      it('should undo the bookkeeping once when the failure is reported synchronously', () => {
+        client['subscriptionsCount'].set(responseChannel, 1);
+        publishSpy.mockImplementation((_topic, _message, _options, done) =>
+          done(publishError),
+        );
+        const callback = vi.fn();
+
+        const teardown = client['publish'](msg, callback);
+        teardown();
+
+        expect(callback).toHaveBeenCalledExactlyOnceWith({ err: publishError });
+        expect(client['routingMap'].size).toBe(0);
+        expect(client['subscriptionsCount'].get(responseChannel)).toBe(1);
+      });
+
+      it('should keep the request pending when the publish succeeds', async () => {
+        publishSpy.mockImplementation((_topic, _message, _options, done) =>
+          setImmediate(() => done()),
+        );
+        const callback = vi.fn();
+
+        client['publish'](msg, callback);
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(callback).not.toHaveBeenCalled();
+        expect(client['routingMap'].has(id)).toBe(true);
+        expect(client['subscriptionsCount'].get(responseChannel)).toBe(1);
       });
     });
   });
   describe('createResponseCallback', () => {
-    let callback: sinon.SinonSpy, subscription;
+    let callback: ReturnType<typeof vi.fn>, subscription;
     const responseMessage = {
       response: 'test',
       id: '1',
@@ -120,24 +545,22 @@ describe('ClientMqtt', () => {
 
     describe('not completed', () => {
       beforeEach(async () => {
-        callback = sinon.spy();
+        callback = vi.fn();
         subscription = client.createResponseCallback();
 
         client['routingMap'].set(responseMessage.id, callback);
         subscription('channel', Buffer.from(JSON.stringify(responseMessage)));
       });
       it('should call callback with expected arguments', () => {
-        expect(
-          callback.calledWith({
-            err: undefined,
-            response: responseMessage.response,
-          }),
-        ).to.be.true;
+        expect(callback).toHaveBeenCalledWith({
+          err: undefined,
+          response: responseMessage.response,
+        });
       });
     });
     describe('disposed and "id" is correct', () => {
       beforeEach(async () => {
-        callback = sinon.spy();
+        callback = vi.fn();
         subscription = client.createResponseCallback();
 
         client['routingMap'].set(responseMessage.id, callback);
@@ -153,19 +576,16 @@ describe('ClientMqtt', () => {
       });
 
       it('should call callback with dispose param', () => {
-        expect(callback.called).to.be.true;
-        expect(
-          callback.calledWith({
-            isDisposed: true,
-            response: responseMessage.response,
-            err: undefined,
-          }),
-        ).to.be.true;
+        expect(callback).toHaveBeenCalledWith({
+          isDisposed: true,
+          response: responseMessage.response,
+          err: undefined,
+        });
       });
     });
     describe('disposed and "id" is incorrect', () => {
       beforeEach(async () => {
-        callback = sinon.spy();
+        callback = vi.fn();
         subscription = client.createResponseCallback();
 
         client['routingMap'].set('3', callback);
@@ -173,73 +593,300 @@ describe('ClientMqtt', () => {
       });
 
       it('should not call callback', () => {
-        expect(callback.called).to.be.false;
+        expect(callback).not.toHaveBeenCalled();
+      });
+    });
+    describe('message is not in json format', () => {
+      it('should not throw and pass the raw content to the deserializer', async () => {
+        callback = vi.fn();
+        const bufferMessage = Buffer.from(
+          `${responseMessage.id}|${responseMessage.response}`,
+        );
+        vi.spyOn(
+          Reflect.get(client, 'deserializer'),
+          'deserialize',
+        ).mockResolvedValue(responseMessage as any);
+        subscription = client.createResponseCallback();
+
+        client['routingMap'].set(responseMessage.id, callback);
+        await subscription('channel', bufferMessage);
+
+        expect(callback).toHaveBeenCalledWith({
+          err: undefined,
+          response: responseMessage.response,
+        });
+      });
+    });
+    describe('response that cannot be deserialized', () => {
+      const error = new TypeError('Cannot read properties of undefined');
+      const buffer = Buffer.from(JSON.stringify(responseMessage));
+      let mqttClient: ClientMqtt;
+      let logError: ReturnType<typeof vi.spyOn>;
+      let pendingCallback: ReturnType<typeof vi.fn>;
+
+      const createResponseCallbackWith = (
+        deserialize: () => unknown,
+      ): ReturnType<ClientMqtt['createResponseCallback']> => {
+        mqttClient = new ClientMqtt({});
+        Object.assign(mqttClient, { deserializer: { deserialize } });
+        logError = vi
+          .spyOn(Reflect.get(mqttClient, 'logger'), 'error')
+          .mockImplementation(() => {});
+        pendingCallback = vi.fn();
+        Reflect.get(mqttClient, 'routingMap').set(
+          responseMessage.id,
+          pendingCallback,
+        );
+        return mqttClient.createResponseCallback();
+      };
+
+      it('should log the error and resolve when the deserializer throws', async () => {
+        const subscription = createResponseCallbackWith(() => {
+          throw error;
+        });
+
+        await expect(subscription('channel', buffer)).resolves.toBeUndefined();
+
+        expect(logError).toHaveBeenCalledTimes(1);
+        expect(logError).toHaveBeenCalledWith(
+          `Dropped a response that the deserializer failed on: ${error}`,
+          error.stack,
+        );
+      });
+
+      it('should log the error and resolve when the deserializer rejects', async () => {
+        const subscription = createResponseCallbackWith(() =>
+          Promise.reject(error),
+        );
+
+        await expect(subscription('channel', buffer)).resolves.toBeUndefined();
+
+        expect(logError).toHaveBeenCalledTimes(1);
+        expect(logError).toHaveBeenCalledWith(
+          `Dropped a response that the deserializer failed on: ${error}`,
+          error.stack,
+        );
+      });
+
+      it('should leave the pending request untouched', async () => {
+        const subscription = createResponseCallbackWith(() =>
+          Promise.reject(error),
+        );
+
+        await subscription('channel', buffer);
+
+        expect(pendingCallback).not.toHaveBeenCalled();
+        expect(
+          Reflect.get(mqttClient, 'routingMap').get(responseMessage.id),
+        ).toBe(pendingCallback);
+      });
+
+      it('should not report a failing callback as an undecodable response', async () => {
+        const callbackError = new Error('callback failed');
+        const subscription = createResponseCallbackWith(() => responseMessage);
+        pendingCallback.mockImplementation(() => {
+          throw callbackError;
+        });
+
+        await expect(subscription('channel', buffer)).rejects.toBe(
+          callbackError,
+        );
+
+        expect(logError).not.toHaveBeenCalled();
       });
     });
   });
   describe('close', () => {
-    let endSpy: sinon.SinonSpy;
+    let endSpy: ReturnType<typeof vi.fn>;
     beforeEach(() => {
-      endSpy = sinon.spy();
-      (client as any).mqttClient = { end: endSpy };
+      endSpy = vi.fn();
+      untypedClient.mqttClient = { endAsync: endSpy };
     });
-    it('should close "pub" when it is not null', () => {
-      client.close();
-      expect(endSpy.called).to.be.true;
+    afterEach(() => {
+      vi.restoreAllMocks();
     });
-    it('should not close "pub" when it is null', () => {
-      (client as any).mqttClient = null;
-      client.close();
-      expect(endSpy.called).to.be.false;
+    it('should close "pub" when it is not null', async () => {
+      await client.close();
+      expect(endSpy).toHaveBeenCalled();
+    });
+    it('should not close "pub" when it is null', async () => {
+      untypedClient.mqttClient = null;
+      await client.close();
+      expect(endSpy).not.toHaveBeenCalled();
+    });
+
+    it('should reset connection state for a subsequent connection', async () => {
+      untypedClient.isInitialConnection = true;
+      untypedClient.subscriptionsCount.set('response/reply', 1);
+
+      await client.close();
+
+      expect(untypedClient.isInitialConnection).toBe(false);
+      expect(untypedClient.subscriptionsCount.size).toBe(0);
+    });
+
+    it('should reset the client state when ending the connection fails', async () => {
+      endSpy.mockRejectedValue(new Error('end failed'));
+      untypedClient.connectionPromise = Promise.resolve();
+      untypedClient.isInitialConnection = true;
+      untypedClient.subscriptionsCount.set('response/reply', 1);
+      untypedClient.pendingEventListeners = [{ event: 'x', callback: vi.fn() }];
+
+      await expect(client.close()).rejects.toThrow('end failed');
+
+      expect(untypedClient.mqttClient).toBeNull();
+      expect(untypedClient.connectionPromise).toBeNull();
+      expect(untypedClient.isInitialConnection).toBe(false);
+      expect(untypedClient.subscriptionsCount.size).toBe(0);
+      expect(untypedClient.pendingEventListeners).toEqual([]);
+    });
+
+    it('should fail pending requests with a connection closed error', async () => {
+      const callback = vi.fn();
+      untypedClient.routingMap.set('some id', callback);
+
+      await client.close();
+
+      expect(untypedClient.routingMap.size).toBe(0);
+      expect(callback).toHaveBeenCalledWith({
+        err: expect.objectContaining({ message: 'Connection closed' }),
+      });
+    });
+
+    it('should fail every pending request when a callback throws', async () => {
+      const loggerErrorSpy = vi
+        .spyOn(untypedClient.logger, 'error')
+        .mockImplementation(() => {});
+      const throwingCallback = vi.fn().mockImplementation(() => {
+        throw new Error('Callback error');
+      });
+      let pendingDuringFlush: number | undefined;
+      const callback = vi.fn(() => {
+        pendingDuringFlush = untypedClient.routingMap.size;
+      });
+      untypedClient.routingMap.set('some id', throwingCallback);
+      untypedClient.routingMap.set('some other id', callback);
+
+      await client.close();
+
+      expect(throwingCallback).toHaveBeenCalledTimes(1);
+      expect(callback).toHaveBeenCalledWith({
+        err: expect.objectContaining({ message: 'Connection closed' }),
+      });
+      expect(loggerErrorSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ message: 'Callback error' }),
+      );
+      expect(pendingDuringFlush).toBe(0);
+      expect(endSpy).toHaveBeenCalled();
+      expect(untypedClient.routingMap.size).toBe(0);
+    });
+
+    it('should register the response listener after close and reconnect', async () => {
+      const firstClient = { endAsync: vi.fn() };
+      const secondClient = { on: vi.fn() };
+      untypedClient.mqttClient = firstClient;
+      untypedClient.isInitialConnection = true;
+
+      await client.close();
+      client.registerConnectListener(secondClient);
+
+      const connectHandler = secondClient.on.mock.calls[0][1];
+      connectHandler();
+
+      expect(secondClient.on).toHaveBeenCalledWith(
+        'message',
+        expect.any(Function),
+      );
+    });
+
+    it('should not wipe a new connection started while endAsync is still pending', async () => {
+      const mqtt = new ClientMqtt({});
+      const untyped: any = mqtt;
+      let finishEnd!: () => void;
+      const firstClient: any = new EventEmitter();
+      firstClient.options = { reconnectPeriod: 0 };
+      firstClient.endAsync = vi.fn(
+        () =>
+          new Promise<void>(resolve => {
+            finishEnd = resolve;
+          }),
+      );
+      const secondClient: any = new EventEmitter();
+      secondClient.options = { reconnectPeriod: 0 };
+      secondClient.endAsync = vi.fn().mockResolvedValue(undefined);
+      const createClientSpy = vi
+        .spyOn(mqtt, 'createClient')
+        .mockReturnValueOnce(firstClient)
+        .mockReturnValueOnce(secondClient);
+
+      const firstConnect = mqtt.connect();
+      await vi.waitFor(() => expect(createClientSpy).toHaveBeenCalledTimes(1));
+      firstClient.emit('connect');
+      await firstConnect;
+
+      const closing = mqtt.close();
+      const secondConnect = mqtt.connect();
+      await vi.waitFor(() => expect(createClientSpy).toHaveBeenCalledTimes(2));
+      secondClient.emit('connect');
+      await secondConnect;
+
+      firstClient.emit('offline');
+      firstClient.emit('close');
+      finishEnd();
+      await closing;
+
+      expect(untyped.mqttClient).toBe(secondClient);
+      await expect(untyped.connectionPromise).resolves.toBeUndefined();
+      expect(secondClient.listenerCount('message')).toBe(1);
     });
   });
   describe('connect', () => {
-    let createClientStub: sinon.SinonStub;
-    let handleErrorsSpy: sinon.SinonSpy;
-    let connect$Stub: sinon.SinonStub;
-    let mergeCloseEvent: sinon.SinonStub;
+    let createClientStub: ReturnType<typeof vi.fn>;
+    let registerErrorListenerSpy: ReturnType<typeof vi.fn>;
+    let connect$Stub: ReturnType<typeof vi.fn>;
+    let mergeCloseEvent: ReturnType<typeof vi.fn>;
 
     beforeEach(async () => {
-      createClientStub = sinon.stub(client, 'createClient').callsFake(
+      createClientStub = vi.spyOn(client, 'createClient').mockImplementation(
         () =>
           ({
             addListener: () => ({}),
             removeListener: () => ({}),
-          } as any),
+            on: () => ({}),
+          }) as any,
       );
-      handleErrorsSpy = sinon.spy(client, 'handleError');
-      connect$Stub = sinon.stub(client, 'connect$' as any).callsFake(() => ({
-        subscribe: resolve => resolve(),
-        toPromise() {
-          return this;
-        },
-        pipe() {
-          return this;
-        },
-      }));
-      mergeCloseEvent = sinon
-        .stub(client, 'mergeCloseEvent')
-        .callsFake((_, source) => source);
+      registerErrorListenerSpy = vi.spyOn(client, 'registerErrorListener');
+      connect$Stub = vi
+        .spyOn(client, 'connect$' as any)
+        .mockImplementation(() => ({
+          subscribe: ({ complete }) => complete(),
+          pipe() {
+            return this;
+          },
+        }));
+      mergeCloseEvent = vi
+        .spyOn(client, 'mergeCloseEvent')
+        .mockImplementation((_, source) => source);
     });
     afterEach(() => {
-      createClientStub.restore();
-      handleErrorsSpy.restore();
-      connect$Stub.restore();
-      mergeCloseEvent.restore();
+      createClientStub.mockRestore();
+      registerErrorListenerSpy.mockRestore();
+      connect$Stub.mockRestore();
+      mergeCloseEvent.mockRestore();
     });
     describe('when is not connected', () => {
       beforeEach(async () => {
         client['mqttClient'] = null;
         await client.connect();
       });
-      it('should call "handleError" once', async () => {
-        expect(handleErrorsSpy.called).to.be.true;
+      it('should call "registerErrorListener" once', async () => {
+        expect(registerErrorListenerSpy).toHaveBeenCalled();
       });
       it('should call "createClient" once', async () => {
-        expect(createClientStub.called).to.be.true;
+        expect(createClientStub).toHaveBeenCalled();
       });
       it('should call "connect$" once', async () => {
-        expect(connect$Stub.called).to.be.true;
+        expect(connect$Stub).toHaveBeenCalled();
       });
     });
     describe('when is connected', () => {
@@ -247,14 +894,187 @@ describe('ClientMqtt', () => {
         client['mqttClient'] = { test: true } as any;
       });
       it('should not call "createClient"', () => {
-        expect(createClientStub.called).to.be.false;
+        expect(createClientStub).not.toHaveBeenCalled();
       });
-      it('should not call "handleError"', () => {
-        expect(handleErrorsSpy.called).to.be.false;
+      it('should not call "registerErrorListener"', () => {
+        expect(registerErrorListenerSpy).not.toHaveBeenCalled();
       });
       it('should not call "connect$"', () => {
-        expect(connect$Stub.called).to.be.false;
+        expect(connect$Stub).not.toHaveBeenCalled();
       });
+    });
+  });
+  describe('connect after a failed attempt', () => {
+    const refused = () => {
+      const err: any = new Error('connect ECONNREFUSED');
+      err.code = 'ECONNREFUSED';
+      return err;
+    };
+    const fakeClient = (reconnectPeriod: number) => {
+      const emitter: any = new EventEmitter();
+      emitter.options = { reconnectPeriod };
+      emitter.endAsync = vi.fn().mockResolvedValue(undefined);
+      emitter.subscribe = vi.fn();
+      return emitter;
+    };
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it('should try a new client when the failed one does not reconnect on its own', async () => {
+      const mqtt = new ClientMqtt({});
+      const untyped: any = mqtt;
+      const mqttClient = fakeClient(0);
+      const createClientStub = vi
+        .spyOn(mqtt, 'createClient')
+        .mockReturnValue(mqttClient);
+
+      const failed = mqtt.connect();
+      mqttClient.emit('error', refused());
+      await expect(failed).rejects.toThrow('connect ECONNREFUSED');
+
+      expect(untyped.mqttClient).toBeNull();
+      expect(untyped.connectionPromise).toBeNull();
+
+      // The next call has to create a new client instead of replaying the
+      // rejection of the attempt that already gave up.
+      const retry = mqtt.connect();
+      mqttClient.emit('error', refused());
+      await expect(retry).rejects.toThrow('connect ECONNREFUSED');
+      expect(createClientStub).toHaveBeenCalledTimes(2);
+    });
+
+    it('should keep the client when mqtt reconnects on it', async () => {
+      const mqtt = new ClientMqtt({});
+      const untyped: any = mqtt;
+      const mqttClient = fakeClient(1000);
+      mqttClient.reconnecting = true;
+      const createClientStub = vi
+        .spyOn(mqtt, 'createClient')
+        .mockReturnValue(mqttClient);
+
+      const failed = mqtt.connect();
+      mqttClient.emit('error', refused());
+      await expect(failed).rejects.toThrow('connect ECONNREFUSED');
+
+      // mqtt keeps retrying on the same client, so it has to stay in place for
+      // the reconnect to be picked up.
+      expect(untyped.mqttClient).toBe(mqttClient);
+      expect(createClientStub).toHaveBeenCalledTimes(1);
+    });
+
+    it('should drop a closed client that gave up reconnecting', () => {
+      const mqtt = new ClientMqtt({});
+      const untyped: any = mqtt;
+      const mqttClient = fakeClient(0);
+      untyped.mqttClient = mqttClient;
+      untyped.connectionPromise = Promise.resolve();
+
+      mqtt.registerCloseListener(mqttClient);
+      mqttClient.emit('close');
+
+      expect(untyped.mqttClient).toBeNull();
+      expect(untyped.connectionPromise).toBeNull();
+    });
+
+    it('should drop a closed client whose reconnect the broker refused', () => {
+      const mqtt = new ClientMqtt({});
+      const untyped: any = mqtt;
+      const mqttClient = fakeClient(1000);
+      // What mqtt leaves behind once a CONNACK error suppressed reconnecting
+      mqttClient.reconnecting = true;
+      mqttClient.reconnectTimer = null;
+      untyped.mqttClient = mqttClient;
+      untyped.connectionPromise = Promise.reject(new Error('Connection lost'));
+      untyped.connectionPromise.catch(() => {});
+      const callback = vi.fn();
+      untyped.routingMap.set('pending id', callback);
+
+      mqtt.registerCloseListener(mqttClient);
+      mqttClient.emit('close');
+
+      expect(untyped.mqttClient).toBeNull();
+      expect(untyped.connectionPromise).toBeNull();
+      expect(callback).toHaveBeenCalledWith({
+        err: expect.objectContaining({ message: 'Connection closed' }),
+      });
+    });
+
+    it('should keep a closed client that has a reconnect scheduled', () => {
+      const mqtt = new ClientMqtt({});
+      const untyped: any = mqtt;
+      const mqttClient = fakeClient(1000);
+      mqttClient.reconnecting = true;
+      mqttClient.reconnectTimer = {};
+      untyped.mqttClient = mqttClient;
+      untyped.connectionPromise = Promise.resolve();
+
+      mqtt.registerCloseListener(mqttClient);
+      mqttClient.emit('close');
+
+      expect(untyped.mqttClient).toBe(mqttClient);
+      expect(untyped.connectionPromise).not.toBeNull();
+    });
+
+    it('should let the next client handle responses after a connected client gave up', async () => {
+      const mqtt = new ClientMqtt({});
+      const untyped: any = mqtt;
+      const firstClient = fakeClient(0);
+      const secondClient = fakeClient(0);
+      vi.spyOn(mqtt, 'createClient')
+        .mockReturnValueOnce(firstClient)
+        .mockReturnValueOnce(secondClient);
+
+      const first = mqtt.connect();
+      firstClient.emit('connect');
+      await first;
+      const callback = vi.fn();
+      untyped.routingMap.set('pending id', callback);
+      untyped.subscriptionsCount.set('test/reply', 1);
+
+      firstClient.emit('close');
+
+      expect(callback).toHaveBeenCalledWith({
+        err: expect.objectContaining({ message: 'Connection closed' }),
+      });
+      expect(untyped.subscriptionsCount.size).toBe(0);
+
+      const second = mqtt.connect();
+      secondClient.emit('connect');
+      await second;
+      expect(secondClient.listenerCount('message')).toBe(1);
+    });
+
+    it('should ignore late events emitted by a dropped client', async () => {
+      const mqtt = new ClientMqtt({});
+      const untyped: any = mqtt;
+      const firstClient = fakeClient(0);
+      const secondClient = fakeClient(0);
+      vi.spyOn(mqtt, 'createClient')
+        .mockReturnValueOnce(firstClient)
+        .mockReturnValueOnce(secondClient);
+
+      const failed = mqtt.connect();
+      firstClient.emit('error', refused());
+      await expect(failed).rejects.toThrow('connect ECONNREFUSED');
+
+      // mqtt.js emits "offline" and "close" on the failed client after "error"
+      firstClient.emit('offline');
+      firstClient.emit('close');
+      expect(untyped.connectionPromise).toBeNull();
+
+      const second = mqtt.connect();
+      secondClient.emit('connect');
+      await second;
+
+      firstClient.emit('offline');
+      firstClient.emit('disconnect');
+      firstClient.emit('reconnect');
+      firstClient.emit('close');
+
+      expect(untyped.mqttClient).toBe(secondClient);
+      await expect(untyped.connectionPromise).resolves.toBeUndefined();
     });
   });
   describe('mergeCloseEvent', () => {
@@ -264,44 +1084,267 @@ describe('ClientMqtt', () => {
         on: (ev, callback) => callback(error),
         off: () => ({}),
       };
-      client
-        .mergeCloseEvent(instance as any, empty())
-        .subscribe(null, (err: any) => expect(err).to.be.eql(error));
+      client.mergeCloseEvent(instance, EMPTY).subscribe({
+        error: (err: any) => expect(err).toEqual(error),
+      });
     });
   });
-  describe('handleError', () => {
+  describe('registerErrorListener', () => {
     it('should bind error event handler', () => {
-      const callback = sinon.stub().callsFake((_, fn) => fn({ code: 'test' }));
+      const callback = vi
+        .fn()
+        .mockImplementation((_, fn) => fn({ code: 'test' }));
       const emitter = {
-        addListener: callback,
+        on: callback,
       };
-      client.handleError(emitter as any);
-      expect(callback.getCall(0).args[0]).to.be.eql(ERROR_EVENT);
+      client.registerErrorListener(emitter as any);
+      expect(callback.mock.calls[0][0]).toEqual('error');
+    });
+  });
+  describe('registerConnectListener', () => {
+    it('should bind connect event handler', () => {
+      const callback = vi
+        .fn()
+        .mockImplementation((_, fn) => fn({ code: 'test' }));
+      const emitter = {
+        on: callback,
+      };
+      client.registerConnectListener(emitter as any);
+      expect(callback.mock.calls[0][0]).toEqual('connect');
+    });
+  });
+  describe('registerDisconnectListener', () => {
+    it('should bind disconnect event handler', () => {
+      const callback = vi
+        .fn()
+        .mockImplementation((_, fn) => fn({ code: 'test' }));
+      const emitter = {
+        on: callback,
+      };
+      client.registerDisconnectListener(emitter as any);
+      expect(callback.mock.calls[0][0]).toEqual('disconnect');
+    });
+  });
+  describe('registerOfflineListener', () => {
+    it('should bind offline event handler', () => {
+      const callback = vi
+        .fn()
+        .mockImplementation((_, fn) => fn({ code: 'test' }));
+      const emitter = {
+        on: callback,
+      };
+      client.registerOfflineListener(emitter as any);
+      expect(callback.mock.calls[0][0]).toEqual('offline');
+    });
+  });
+  describe('registerCloseListener', () => {
+    it('should bind close event handler', () => {
+      const callback = vi
+        .fn()
+        .mockImplementation((_, fn) => fn({ code: 'test' }));
+      const emitter = {
+        on: callback,
+      };
+      client.registerCloseListener(emitter as any);
+      expect(callback.mock.calls[0][0]).toEqual('close');
     });
   });
   describe('dispatchEvent', () => {
-    const msg = { pattern: 'pattern', data: 'data' };
-    let publishStub: sinon.SinonStub, mqttClient;
+    let msg: ReadPacket;
+    let publishStub: ReturnType<typeof vi.fn>, mqttClient;
 
     beforeEach(() => {
-      publishStub = sinon.stub();
+      client = new ClientMqtt({});
+      untypedClient = client as any;
+
+      msg = { pattern: 'pattern', data: 'data' };
+      publishStub = vi.fn();
       mqttClient = {
         publish: publishStub,
       };
-      (client as any).mqttClient = mqttClient;
+      untypedClient.mqttClient = mqttClient;
     });
 
     it('should publish packet', async () => {
-      publishStub.callsFake((a, b, c) => c());
+      publishStub.mockImplementation((a, b, c, d) => d());
       await client['dispatchEvent'](msg);
 
-      expect(publishStub.called).to.be.true;
+      expect(publishStub).toHaveBeenCalled();
     });
     it('should throw error', async () => {
-      publishStub.callsFake((a, b, c) => c(new Error()));
+      publishStub.mockImplementation((a, b, c, d) => d(new Error()));
       client['dispatchEvent'](msg).catch(err =>
-        expect(err).to.be.instanceOf(Error),
+        expect(err).toBeInstanceOf(Error),
       );
+    });
+    it.each(['devices/+/status', 'devices/#', 'devices/\u0000'])(
+      'should not publish an event on %j',
+      pattern => {
+        expect(() =>
+          client['dispatchEvent']({ pattern, data: 'data' }),
+        ).toThrow(InvalidMqttTopicNameException);
+        expect(publishStub).not.toHaveBeenCalled();
+      },
+    );
+    it('should not publish an event whose topic exceeds the maximum topic length', () => {
+      const pattern = 'a'.repeat(MQTT_MAX_TOPIC_LENGTH + 1);
+
+      expect(() => client['dispatchEvent']({ pattern, data: 'data' })).toThrow(
+        MaxMqttTopicLengthExceededException,
+      );
+      expect(publishStub).not.toHaveBeenCalled();
+    });
+    describe('headers', () => {
+      it('should not generate headers if none are configured', async () => {
+        publishStub.mockImplementation((a, b, c, d) => d());
+        await client['dispatchEvent'](msg);
+        expect(publishStub.mock.calls[0][2]).toBeUndefined();
+      });
+      it('should send packet headers', async () => {
+        publishStub.mockImplementation((a, b, c, d) => d());
+        const requestHeaders = { '1': '123' };
+        msg.data = new MqttRecord('data', {
+          properties: { userProperties: requestHeaders },
+        });
+
+        await client['dispatchEvent'](msg);
+        expect(publishStub.mock.calls[0][2].properties.userProperties).toEqual(
+          requestHeaders,
+        );
+      });
+      it('should combine packet and static headers', async () => {
+        publishStub.mockImplementation((a, b, c, d) => d());
+        const staticHeaders = { 'client-id': 'some-client-id' };
+        untypedClient.options.userProperties = staticHeaders;
+
+        const requestHeaders = { '1': '123' };
+        msg.data = new MqttRecord('data', {
+          properties: { userProperties: requestHeaders },
+        });
+
+        await client['dispatchEvent'](msg);
+        expect(publishStub.mock.calls[0][2].properties.userProperties).toEqual({
+          ...staticHeaders,
+          ...requestHeaders,
+        });
+      });
+      it('should prefer packet headers over static headers', async () => {
+        publishStub.mockImplementation((a, b, c, d) => d());
+        const staticHeaders = { 'client-id': 'some-client-id' };
+        untypedClient.options.headers = staticHeaders;
+
+        const requestHeaders = { 'client-id': 'override-client-id' };
+        msg.data = new MqttRecord('data', {
+          properties: { userProperties: requestHeaders },
+        });
+
+        await client['dispatchEvent'](msg);
+        expect(publishStub.mock.calls[0][2].properties.userProperties).toEqual(
+          requestHeaders,
+        );
+      });
+      it('should send the packet metadata as MQTT 5 user properties, and not in the payload', async () => {
+        publishStub.mockImplementation((a, b, c, d) => d());
+        untypedClient.options.protocolVersion = 5;
+        msg.metadata = { 'x-request-id': 'trace-1' };
+
+        await client['dispatchEvent'](msg);
+
+        const [, payload, options] = publishStub.mock.calls[0];
+        expect(options.properties.userProperties).toEqual({
+          'x-request-id': 'trace-1',
+        });
+        expect(JSON.parse(payload)).toEqual({
+          pattern: 'pattern',
+          data: 'data',
+        });
+      });
+      it('should not send the packet metadata over MQTT 3', async () => {
+        publishStub.mockImplementation((a, b, c, d) => d());
+        msg.metadata = { 'x-request-id': 'trace-1' };
+
+        await client['dispatchEvent'](msg);
+
+        expect(publishStub.mock.calls[0][2]).toBeUndefined();
+      });
+    });
+  });
+  describe('on', () => {
+    const fakeClient = (reconnectPeriod: number) => {
+      const emitter: any = new EventEmitter();
+      emitter.options = { reconnectPeriod };
+      emitter.endAsync = vi.fn().mockResolvedValue(undefined);
+      emitter.subscribe = vi.fn();
+      return emitter;
+    };
+    const connectWith = async (mqtt: ClientMqtt, mqttClient: any) => {
+      const connectPromise = mqtt.connect();
+      mqttClient.emit('connect');
+      await connectPromise;
+    };
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it('should attach a listener registered before "connect()" to the clients of later reconnects', async () => {
+      const mqtt = new ClientMqtt({});
+      const firstClient = fakeClient(0);
+      const secondClient = fakeClient(0);
+      vi.spyOn(mqtt, 'createClient')
+        .mockReturnValueOnce(firstClient)
+        .mockReturnValueOnce(secondClient);
+
+      const callback = vi.fn();
+      mqtt.on('close', callback);
+
+      await connectWith(mqtt, firstClient);
+      firstClient.emit('close');
+      await connectWith(mqtt, secondClient);
+      secondClient.emit('close');
+
+      expect(callback).toHaveBeenCalledTimes(2);
+    });
+
+    it('should attach a listener registered after "connect()" to the clients of later reconnects', async () => {
+      const mqtt = new ClientMqtt({});
+      const firstClient = fakeClient(0);
+      const secondClient = fakeClient(0);
+      vi.spyOn(mqtt, 'createClient')
+        .mockReturnValueOnce(firstClient)
+        .mockReturnValueOnce(secondClient);
+
+      await connectWith(mqtt, firstClient);
+      const callback = vi.fn();
+      mqtt.on('close', callback);
+
+      firstClient.emit('close');
+      expect(callback).toHaveBeenCalledTimes(1);
+
+      await connectWith(mqtt, secondClient);
+      secondClient.emit('close');
+      expect(callback).toHaveBeenCalledTimes(2);
+    });
+
+    it('should drop the listeners on "close()"', async () => {
+      const mqtt = new ClientMqtt({});
+      const firstClient = fakeClient(0);
+      const secondClient = fakeClient(0);
+      vi.spyOn(mqtt, 'createClient')
+        .mockReturnValueOnce(firstClient)
+        .mockReturnValueOnce(secondClient);
+
+      const callback = vi.fn();
+      mqtt.on('close', callback);
+
+      await connectWith(mqtt, firstClient);
+      await mqtt.close();
+      firstClient.emit('close');
+      expect(callback).toHaveBeenCalledTimes(1);
+
+      await connectWith(mqtt, secondClient);
+      secondClient.emit('close');
+      expect(callback).toHaveBeenCalledTimes(1);
     });
   });
 });

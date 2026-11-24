@@ -1,15 +1,17 @@
-import { EXCEPTION_FILTERS_METADATA } from '@nestjs/common/constants';
-import { Controller } from '@nestjs/common/interfaces';
-import { ExceptionFilterMetadata } from '@nestjs/common/interfaces/exceptions';
-import { isEmpty } from '@nestjs/common/utils/shared.utils';
-import { ApplicationConfig } from '../application-config';
-import { STATIC_CONTEXT } from '../injector/constants';
-import { NestContainer } from '../injector/container';
-import { InstanceWrapper } from '../injector/instance-wrapper';
-import { RouterProxyCallback } from '../router/router-proxy';
-import { BaseExceptionFilterContext } from './base-exception-filter-context';
-import { ExternalExceptionsHandler } from './external-exceptions-handler';
 import { iterate } from 'iterare';
+import { ApplicationConfig } from '../application-config.js';
+import { STATIC_CONTEXT } from '../injector/constants.js';
+import { NestContainer } from '../injector/container.js';
+import { InstanceWrapper } from '../injector/instance-wrapper.js';
+import { RouterProxyCallback } from '../router/router-proxy.js';
+import { BaseExceptionFilterContext } from './base-exception-filter-context.js';
+import { ExternalExceptionsHandler } from './external-exceptions-handler.js';
+import {
+  EXCEPTION_FILTERS_METADATA,
+  type Controller,
+  type ExceptionFilterMetadata,
+  isEmptyArray,
+} from '@nestjs/common/internal';
 
 export class ExternalExceptionFilterContext extends BaseExceptionFilterContext {
   constructor(
@@ -36,7 +38,7 @@ export class ExternalExceptionFilterContext extends BaseExceptionFilterContext {
       contextId,
       inquirerId,
     );
-    if (isEmpty(filters)) {
+    if (isEmptyArray(filters)) {
       return exceptionHandler;
     }
     exceptionHandler.setCustomFilters(filters.reverse());
@@ -48,17 +50,27 @@ export class ExternalExceptionFilterContext extends BaseExceptionFilterContext {
     inquirerId?: string,
   ): T {
     if (!this.config) {
-      return [] as T;
+      return [] as any[] as T;
     }
     const globalFilters = this.config.getGlobalFilters() as T;
     if (contextId === STATIC_CONTEXT && !inquirerId) {
       return globalFilters;
     }
-    const scopedFilterWrappers = this.config.getGlobalRequestFilters() as InstanceWrapper[];
+    const scopedFilterWrappers =
+      this.config.getGlobalRequestFilters() as InstanceWrapper[];
     const scopedFilters = iterate(scopedFilterWrappers)
-      .map(wrapper => wrapper.getInstanceByContextId(contextId, inquirerId))
-      .filter(host => !!host)
-      .map(host => host.instance)
+      .map(wrapper => ({
+        wrapper,
+        host: wrapper.getInstanceByContextId(
+          this.getContextId(contextId, wrapper),
+          inquirerId,
+        ),
+      }))
+      // e.g. a request-scoped filter that the request did not instantiate
+      .filter(
+        ({ wrapper, host }) => !!host && this.isInstantiated(wrapper, host),
+      )
+      .map(({ host }) => host.instance)
       .toArray();
 
     return globalFilters.concat(scopedFilters) as T;

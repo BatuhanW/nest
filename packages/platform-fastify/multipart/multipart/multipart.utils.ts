@@ -1,0 +1,114 @@
+import {
+  BadRequestException,
+  HttpException,
+  PayloadTooLargeException,
+} from '@nestjs/common';
+import { isNil, isPlainObject } from '@nestjs/common/internal';
+import type {
+  MultipartModuleOptions,
+  MultipartOptions,
+} from '../interfaces/index.js';
+import {
+  busboyExceptions,
+  fastifyBusboyMessages,
+  fastifyMultipartBadRequestCodes,
+  fastifyMultipartErrorCodes,
+} from './multipart.constants.js';
+import { MultipartError } from './multipart.error.js';
+
+/**
+ * Merges module-level (global) options with interceptor-level (local)
+ * options, with the same rule as platform-express's `mergeMulterOptions`:
+ * `limits` is merged key-by-key when both sides define it as an object, and
+ * the local value wins outright otherwise. A local option or limit set to
+ * `null` or `undefined` keeps the global value, as if it were not set.
+ */
+export function mergeMultipartOptions(
+  options: MultipartModuleOptions = {},
+  localOptions: MultipartOptions = {},
+): MultipartModuleOptions {
+  const merged: MultipartModuleOptions = {
+    ...options,
+    ...withoutNil(localOptions),
+  };
+  if (isPlainObject(options.limits) && isPlainObject(localOptions.limits)) {
+    merged.limits = { ...options.limits, ...withoutNil(localOptions.limits) };
+  }
+  // `dest` and `storage` both say where files go, and `resolveStorage()`
+  // prefers `storage`, so a global storage engine would shadow a local `dest`.
+  if (localOptions.dest && !localOptions.storage) {
+    delete merged.storage;
+  }
+  return merged;
+}
+
+function withoutNil<T extends object>(options: T): Partial<T> {
+  return Object.fromEntries(
+    Object.entries(options).filter(([, value]) => !isNil(value)),
+  ) as Partial<T>;
+}
+
+/**
+ * Maps parser errors to the same HTTP exceptions (status and message)
+ * platform-express's `transformException` produces for multer, so clients
+ * cannot tell the adapters apart.
+ *
+ * Errors raised by `@fastify/multipart` are identified by their `code`; only
+ * `@fastify/busboy`'s errors, which carry no code, are matched by message.
+ */
+export function transformException(
+  error: (Error & { code?: string; part?: { fieldname?: string } }) | undefined,
+) {
+  if (!error || error instanceof HttpException) {
+    return error;
+  }
+  if (isFastifyMultipartLimitCode(error.code)) {
+    error = new MultipartError(
+      fastifyMultipartErrorCodes[error.code],
+      error.part?.fieldname,
+      { cause: error },
+    );
+  }
+  // Keep the error as the cause, as platform-express does, so that an
+  // exception filter can read its code and field. A `@fastify/multipart`
+  // limit error is reported as the `MultipartError` above, with the multer
+  // code, which keeps the plugin's error as its own cause.
+  const options = { cause: error };
+  if (error instanceof MultipartError) {
+    if (error.code === 'LIMIT_FILE_SIZE') {
+      return new PayloadTooLargeException(error.message, options);
+    }
+    return new BadRequestException(
+      error.field ? `${error.message} - ${error.field}` : error.message,
+      options,
+    );
+  }
+  if (error.code && fastifyMultipartBadRequestCodes.includes(error.code)) {
+    return new BadRequestException(error.message, options);
+  }
+  const message = error.message ?? '';
+  if (message === fastifyBusboyMessages.BOUNDARY_NOT_FOUND) {
+    return new BadRequestException(
+      busboyExceptions.MULTIPART_BOUNDARY_NOT_FOUND,
+      options,
+    );
+  }
+  if (
+    message === fastifyBusboyMessages.UNEXPECTED_END_OF_FORM ||
+    message.includes(fastifyBusboyMessages.PART_TERMINATED_EARLY)
+  ) {
+    return new BadRequestException(
+      busboyExceptions.MULTIPART_UNEXPECTED_END_OF_FORM,
+      options,
+    );
+  }
+  return error;
+}
+
+function isFastifyMultipartLimitCode(
+  code: unknown,
+): code is keyof typeof fastifyMultipartErrorCodes {
+  return (
+    typeof code === 'string' && Object.hasOwn(fastifyMultipartErrorCodes, code)
+  );
+}

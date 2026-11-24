@@ -1,8 +1,8 @@
-import { expect } from 'chai';
-import * as sinon from 'sinon';
-import { ApplicationConfig } from '../../application-config';
-import { GuardsContextCreator } from '../../guards/guards-context-creator';
-import { InstanceWrapper } from '../../injector/instance-wrapper';
+import { Scope, UseGuards } from '@nestjs/common';
+import { ApplicationConfig } from '../../application-config.js';
+import { InvalidEnhancerException } from '../../errors/exceptions/invalid-enhancer.exception.js';
+import { GuardsContextCreator } from '../../guards/guards-context-creator.js';
+import { ContextId, InstanceWrapper } from '../../injector/instance-wrapper.js';
 
 class Guard {}
 
@@ -11,19 +11,26 @@ describe('GuardsContextCreator', () => {
   let applicationConfig: ApplicationConfig;
   let guards: any[];
   let container: any;
-  let getSpy: sinon.SinonSpy;
+  let getSpy: ReturnType<typeof vi.fn>;
+
+  class Guard1 {}
+  class Guard2 {}
 
   beforeEach(() => {
     guards = [
       {
-        name: 'test',
+        name: 'Guard1',
+        token: Guard1,
+        metatype: Guard1,
         instance: {
           canActivate: () => true,
         },
         getInstanceByContextId: () => guards[0],
       },
       {
-        name: 'test2',
+        name: 'Guard2',
+        token: Guard2,
+        metatype: Guard2,
         instance: {
           canActivate: () => true,
         },
@@ -32,10 +39,10 @@ describe('GuardsContextCreator', () => {
       {},
       undefined,
     ];
-    getSpy = sinon.stub().returns({
+    getSpy = vi.fn().mockReturnValue({
       injectables: new Map([
-        ['test', guards[0]],
-        ['test2', guards[1]],
+        [Guard1, guards[0]],
+        [Guard2, guards[1]],
       ]),
     });
     container = {
@@ -51,9 +58,9 @@ describe('GuardsContextCreator', () => {
   });
   describe('createConcreteContext', () => {
     describe('when `moduleContext` is nil', () => {
-      it('should returns empty array', () => {
+      it('should return empty array', () => {
         const result = guardsContextCreator.createConcreteContext(guards);
-        expect(result).to.be.empty;
+        expect(result).toHaveLength(0);
       });
     });
     describe('when `moduleContext` is defined', () => {
@@ -61,9 +68,50 @@ describe('GuardsContextCreator', () => {
         guardsContextCreator['moduleContext'] = 'test';
       });
       it('should filter metatypes', () => {
+        const guardTypeRefs = [guards[0].metatype, guards[1].instance];
         expect(
-          guardsContextCreator.createConcreteContext(guards),
-        ).to.have.length(2);
+          guardsContextCreator.createConcreteContext(guardTypeRefs),
+        ).toHaveLength(2);
+      });
+      it('should keep classes without a name', () => {
+        const AnonymousGuard = (() => class {})();
+        const wrapper = {
+          instance: { canActivate: () => true },
+          getInstanceByContextId: () => wrapper,
+        };
+        getSpy.mockReturnValue({
+          injectables: new Map([[AnonymousGuard, wrapper]]),
+        });
+
+        expect(AnonymousGuard.name).toBe('');
+        expect(
+          guardsContextCreator.createConcreteContext([AnonymousGuard]),
+        ).toEqual([wrapper.instance]);
+      });
+    });
+  });
+
+  describe('create', () => {
+    describe('when the "constructor" of the host prototype was overwritten', () => {
+      it('should reflect class-level guards from the registered class', () => {
+        @UseGuards(Guard2)
+        class Mixin {}
+        @UseGuards(Guard1)
+        class Host {
+          handler() {}
+        }
+        // What mixin helpers copying every property of the prototype do
+        Host.prototype.constructor = Mixin;
+        new InstanceWrapper({ metatype: Host });
+
+        const instance = new Host();
+        const result = guardsContextCreator.create(
+          instance,
+          instance.handler,
+          'test',
+        );
+        expect(result).toHaveLength(1);
+        expect(result[0]).toBe(guards[0].instance);
       });
     });
   });
@@ -71,8 +119,8 @@ describe('GuardsContextCreator', () => {
   describe('getGuardInstance', () => {
     describe('when param is an object', () => {
       it('should return instance', () => {
-        const instance = { canActivate: () => null };
-        expect(guardsContextCreator.getGuardInstance(instance)).to.be.eql(
+        const instance = { canActivate: () => null! };
+        expect(guardsContextCreator.getGuardInstance(instance)).toEqual(
           instance,
         );
       });
@@ -83,18 +131,150 @@ describe('GuardsContextCreator', () => {
           instance: 'test',
           getInstanceByContextId: () => wrapper,
         };
-        sinon
-          .stub(guardsContextCreator, 'getInstanceByMetatype')
-          .callsFake(() => wrapper as any);
-        expect(guardsContextCreator.getGuardInstance(Guard)).to.be.eql(
+        vi.spyOn(
+          guardsContextCreator,
+          'getInstanceByMetatype',
+        ).mockImplementation(() => wrapper as any);
+        expect(guardsContextCreator.getGuardInstance(Guard)).toEqual(
           wrapper.instance,
         );
       });
+      it('should pick the instance from the container when the class also has a static "canActivate"', () => {
+        class WithStatic {
+          static canActivate() {
+            return 'static';
+          }
+          canActivate() {
+            return 'instance';
+          }
+        }
+        const wrapper = {
+          instance: new WithStatic(),
+          getInstanceByContextId: () => wrapper,
+        };
+        vi.spyOn(
+          guardsContextCreator,
+          'getInstanceByMetatype',
+        ).mockImplementation(() => wrapper as any);
+        expect(guardsContextCreator.getGuardInstance(WithStatic)).toBe(
+          wrapper.instance,
+        );
+      });
+      it('should throw when Nest constructed the class and it has no "canActivate"', () => {
+        // What is left at run time of an abstract class used as a token
+        class AbstractGuard {}
+        const wrapper = {
+          instance: new AbstractGuard(),
+          isConstructorCalled: true,
+          getInstanceByContextId: () => wrapper,
+        };
+        vi.spyOn(
+          guardsContextCreator,
+          'getInstanceByMetatype',
+        ).mockImplementation(() => wrapper as any);
+        expect(() =>
+          guardsContextCreator.getGuardInstance(AbstractGuard),
+        ).toThrow(InvalidEnhancerException);
+      });
+      it('should throw when the class was a guard factory, called by Nest', () => {
+        function RoleGuard(role = 'admin') {
+          return class {
+            canActivate() {
+              return role === 'admin';
+            }
+          };
+        }
+        const wrapper = {
+          instance: new (RoleGuard as any)(),
+          isConstructorCalled: true,
+          getInstanceByContextId: () => wrapper,
+        };
+        vi.spyOn(
+          guardsContextCreator,
+          'getInstanceByMetatype',
+        ).mockImplementation(() => wrapper as any);
+        expect(() => guardsContextCreator.getGuardInstance(RoleGuard)).toThrow(
+          /The guard \(class RoleGuard\) doesn't provide the "canActivate" method/,
+        );
+      });
+      it('should not throw for the placeholder of a scoped guard', () => {
+        class ScopedGuard {
+          canActivate = () => true;
+        }
+        const wrapper = {
+          instance: Object.create(ScopedGuard.prototype),
+          getInstanceByContextId: () => wrapper,
+        };
+        vi.spyOn(
+          guardsContextCreator,
+          'getInstanceByMetatype',
+        ).mockImplementation(() => wrapper as any);
+        expect(guardsContextCreator.getGuardInstance(ScopedGuard)).toBe(
+          wrapper.instance,
+        );
+      });
+      it('should return the class when only the class has a "canActivate"', () => {
+        class StaticOnly {
+          static canActivate() {
+            return 'static';
+          }
+        }
+        const wrapper = {
+          instance: new StaticOnly(),
+          getInstanceByContextId: () => wrapper,
+        };
+        vi.spyOn(
+          guardsContextCreator,
+          'getInstanceByMetatype',
+        ).mockImplementation(() => wrapper as any);
+        expect(guardsContextCreator.getGuardInstance(StaticOnly)).toBe(
+          StaticOnly,
+        );
+      });
       it('should return null', () => {
-        sinon
-          .stub(guardsContextCreator, 'getInstanceByMetatype')
-          .callsFake(() => null);
-        expect(guardsContextCreator.getGuardInstance(Guard)).to.be.eql(null);
+        vi.spyOn(
+          guardsContextCreator,
+          'getInstanceByMetatype',
+        ).mockImplementation(() => null!);
+        expect(guardsContextCreator.getGuardInstance(Guard)).toEqual(null);
+      });
+      it('should not pick the instance of a transient guard from a durable sub-tree', () => {
+        const database = new InstanceWrapper({
+          scope: Scope.REQUEST,
+          durable: true,
+        });
+        const wrapper = new InstanceWrapper({
+          token: Guard,
+          metatype: Guard,
+          scope: Scope.TRANSIENT,
+        });
+        wrapper.addCtorMetadata(0, database);
+        vi.spyOn(
+          guardsContextCreator,
+          'getInstanceByMetatype',
+        ).mockImplementation(() => wrapper);
+
+        const tenant: ContextId = { id: 1 };
+        const contextId: ContextId = {
+          id: 2,
+          getParent: ({ isTreeDurable }) =>
+            isTreeDurable ? tenant : contextId,
+        };
+        const guard = { canActivate: () => true };
+        wrapper.setInstanceByContextId(
+          tenant,
+          { instance: { canActivate: () => false } },
+          'inquirer',
+        );
+        wrapper.setInstanceByContextId(
+          contextId,
+          { instance: guard },
+          'inquirer',
+        );
+
+        expect(
+          guardsContextCreator.getGuardInstance(Guard, contextId, 'inquirer'),
+        ).toBe(guard);
       });
     });
   });
@@ -103,8 +283,9 @@ describe('GuardsContextCreator', () => {
     describe('when "moduleContext" is nil', () => {
       it('should return undefined', () => {
         (guardsContextCreator as any).moduleContext = undefined;
-        expect(guardsContextCreator.getInstanceByMetatype(null)).to.be
-          .undefined;
+        expect(
+          guardsContextCreator.getInstanceByMetatype(null!),
+        ).toBeUndefined();
       });
     });
     describe('when "moduleContext" is not nil', () => {
@@ -112,10 +293,11 @@ describe('GuardsContextCreator', () => {
         (guardsContextCreator as any).moduleContext = 'test';
       });
 
-      describe('and when module exists', () => {
+      describe('but module does not exist', () => {
         it('should return undefined', () => {
-          expect(guardsContextCreator.getInstanceByMetatype({})).to.be
-            .undefined;
+          expect(
+            guardsContextCreator.getInstanceByMetatype(class RandomModule {}),
+          ).toBeUndefined();
         });
       });
     });
@@ -125,9 +307,7 @@ describe('GuardsContextCreator', () => {
     describe('when contextId is static and inquirerId is nil', () => {
       it('should return global guards', () => {
         const expectedResult = applicationConfig.getGlobalGuards();
-        expect(guardsContextCreator.getGlobalMetadata()).to.be.equal(
-          expectedResult,
-        );
+        expect(guardsContextCreator.getGlobalMetadata()).toBe(expectedResult);
       });
     });
     describe('otherwise', () => {
@@ -137,19 +317,38 @@ describe('GuardsContextCreator', () => {
         const instance = 'request-scoped';
         const scopedGuardWrappers = [instanceWrapper];
 
-        sinon
-          .stub(applicationConfig, 'getGlobalGuards')
-          .callsFake(() => globalGuards);
-        sinon
-          .stub(applicationConfig, 'getGlobalRequestGuards')
-          .callsFake(() => scopedGuardWrappers);
-        sinon
-          .stub(instanceWrapper, 'getInstanceByContextId')
-          .callsFake(() => ({ instance } as any));
+        vi.spyOn(applicationConfig, 'getGlobalGuards').mockImplementation(
+          () => globalGuards,
+        );
+        vi.spyOn(
+          applicationConfig,
+          'getGlobalRequestGuards',
+        ).mockImplementation(() => scopedGuardWrappers);
+        vi.spyOn(instanceWrapper, 'getInstanceByContextId').mockImplementation(
+          () => ({ instance }) as any,
+        );
 
-        expect(guardsContextCreator.getGlobalMetadata({ id: 3 })).to.contains(
-          instance,
-          ...globalGuards,
+        expect(guardsContextCreator.getGlobalMetadata({ id: 3 })).toEqual(
+          expect.arrayContaining([instance, ...globalGuards]),
+        );
+      });
+      it('should throw when a constructed scoped guard has no "canActivate"', () => {
+        class AbstractGuard {}
+        const instanceWrapper = new InstanceWrapper();
+        vi.spyOn(
+          applicationConfig,
+          'getGlobalRequestGuards',
+        ).mockImplementation(() => [instanceWrapper]);
+        vi.spyOn(instanceWrapper, 'getInstanceByContextId').mockImplementation(
+          () =>
+            ({
+              instance: new AbstractGuard(),
+              isConstructorCalled: true,
+            }) as any,
+        );
+
+        expect(() => guardsContextCreator.getGlobalMetadata({ id: 3 })).toThrow(
+          InvalidEnhancerException,
         );
       });
     });

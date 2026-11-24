@@ -1,50 +1,64 @@
 {
   "name": "@nestjs/core",
-  "version": "7.6.11",
-  "description": "Nest - modern, fast, powerful node.js web framework (@core)",
+  "version": "12.6.0",
+  "description": "The core of NestJS, a TypeScript framework for Node.js backends: modules, dependency injection and the request pipeline, on Express, Fastify or node:http.",
+  "keywords": [
+    "nestjs",
+    "nest",
+    "framework",
+    "web-framework",
+    "typescript",
+    "node",
+    "nodejs",
+    "backend",
+    "api",
+    "rest-api",
+    "dependency-injection"
+  ],
   "author": "Kamil Mysliwiec",
   "license": "MIT",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json",
+    "./internal": "./internal.js",
+    "./*.js": "./*.js",
+    "./*": "./*.js"
+  },
   "homepage": "https://nestjs.com",
   "funding": {
     "type": "opencollective",
     "url": "https://opencollective.com/nest"
   },
+  "engines": {
+    "node": ">= 20"
+  },
   "repository": {
     "type": "git",
-    "url": "https://github.com/nestjs/nest"
+    "url": "https://github.com/nestjs/nest.git",
+    "directory": "packages/core"
   },
   "publishConfig": {
     "access": "public"
   },
-  "scripts": {
-    "postinstall": "opencollective || exit 0"
-  },
-  "collective": {
-    "type": "opencollective",
-    "url": "https://opencollective.com/nest",
-    "donation": {
-      "text": "Become a partner:"
-    }
-  },
   "dependencies": {
-    "@nuxtjs/opencollective": "0.3.2",
-    "fast-safe-stringify": "2.0.7",
+    "fast-safe-stringify": "2.1.1",
     "iterare": "1.2.1",
-    "object-hash": "2.1.1",
-    "path-to-regexp": "3.2.0",
-    "tslib": "2.1.0",
-    "uuid": "8.3.2"
+    "path-to-regexp": "8.4.2",
+    "tslib": "2.9.1",
+    "uid": "2.0.2"
   },
   "devDependencies": {
-    "@nestjs/common": "7.6.11"
+    "@nestjs/common": "12.6.0"
   },
   "peerDependencies": {
-    "@nestjs/common": "^7.0.0",
-    "@nestjs/microservices": "^7.0.0",
-    "@nestjs/platform-express": "^7.0.0",
-    "@nestjs/websockets": "^7.0.0",
-    "reflect-metadata": "^0.1.12",
-    "rxjs": "^6.0.0"
+    "@nestjs/common": "^12.0.0",
+    "@nestjs/microservices": "^12.0.0",
+    "@nestjs/platform-express": "^12.0.0",
+    "@nestjs/websockets": "^12.0.0",
+    "reflect-metadata": "^0.1.12 || ^0.2.0",
+    "rxjs": "^7.1.0"
   },
   "peerDependenciesMeta": {
     "@nestjs/websockets": {
@@ -56,5 +70,6 @@
     "@nestjs/platform-express": {
       "optional": true
     }
-  }
+  },
+  "gitHead": "ab3fb3d5ca7d51d078835e44a8db1b354f8b651b"
 }

@@ -1,5 +1,6 @@
-import { CacheModule, Module } from '@nestjs/common';
-import { AppController } from './app.controller';
+import { CacheModule } from '@nestjs/cache-manager';
+import { Module } from '@nestjs/common';
+import { AppController } from './app.controller.js';
 
 @Module({
   imports: [CacheModule.register()],

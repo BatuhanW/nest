@@ -1,56 +1,101 @@
-import { Logger } from '@nestjs/common/services/logger.service';
-import { loadPackage } from '@nestjs/common/utils/load-package.util';
-import { isFunction, isObject } from '@nestjs/common/utils/shared.utils';
-import { Observable, Subscription } from 'rxjs';
+import { createRequire } from 'module';
+import { Observable, Subscriber, Subscription } from 'rxjs';
+import { GRPC_DEFAULT_PROTO_LOADER, GRPC_DEFAULT_URL } from '../constants.js';
+import { GrpcStatus } from '../enums/index.js';
+import { InvalidGrpcPackageException } from '../errors/invalid-grpc-package.exception.js';
+import { InvalidGrpcServiceException } from '../errors/invalid-grpc-service.exception.js';
+import { InvalidProtoDefinitionException } from '../errors/invalid-proto-definition.exception.js';
+import { ChannelOptions } from '../external/grpc-options.interface.js';
+import { getGrpcPackageDefinition } from '../helpers/index.js';
+import { ClientGrpc, GrpcOptions } from '../interfaces/index.js';
+import { hasPacketMetadata } from '../utils/packet-metadata.utils.js';
+import { ClientProxy } from './client-proxy.js';
+import { Logger } from '@nestjs/common';
 import {
-  GRPC_DEFAULT_MAX_RECEIVE_MESSAGE_LENGTH,
-  GRPC_DEFAULT_MAX_SEND_MESSAGE_LENGTH,
-  GRPC_DEFAULT_PROTO_LOADER,
-  GRPC_DEFAULT_URL,
-} from '../constants';
-import { InvalidGrpcPackageException } from '../errors/invalid-grpc-package.exception';
-import { InvalidGrpcServiceException } from '../errors/invalid-grpc-service.exception';
-import { InvalidProtoDefinitionException } from '../errors/invalid-proto-definition.exception';
-import { ClientGrpc, GrpcOptions } from '../interfaces';
-import { ClientProxy } from './client-proxy';
-import { GRPC_CANCELLED } from './constants';
+  loadPackageSync,
+  isFunction,
+  isNil,
+  isObject,
+} from '@nestjs/common/internal';
 
-let grpcPackage: any = {};
-let grpcProtoLoaderPackage: any = {};
+const GRPC_CANCELLED = 'Cancelled';
 
-export class ClientGrpcProxy extends ClientProxy implements ClientGrpc {
+/**
+ * Values `@grpc/grpc-js` reads after the request: metadata, then call
+ * options. It does not skip a nil value: one before a `CallOptions` object
+ * hides that object, and one in front of the unary-response callback is
+ * taken as the call options and then read as `options.interceptors`.
+ */
+function getArgumentsAfterRequest(hookedArgs: any[]): any[] {
+  return hookedArgs.slice(1).filter(value => !isNil(value));
+}
+
+// To enable type safety for gRPC. This cant be uncommented by default
+// because it would require the user to install the @grpc/grpc-js package even if they dont use gRPC
+// Otherwise, TypeScript would fail to compile the code.
+//
+// type GrpcClient = import('@grpc/grpc-js').Client;
+// let grpcPackage = {} as typeof import('@grpc/grpc-js');
+// let grpcProtoLoaderPackage = {} as typeof import('@grpc/proto-loader');
+
+type GrpcClient = any;
+let grpcPackage = {} as any;
+let grpcProtoLoaderPackage = {} as any;
+
+/**
+ * @publicApi
+ */
+export class ClientGrpcProxy
+  extends ClientProxy<never, never>
+  implements ClientGrpc
+{
   protected readonly logger = new Logger(ClientProxy.name);
   protected readonly clients = new Map<string, any>();
   protected readonly url: string;
-  protected grpcClients = [];
+  protected grpcClients: GrpcClient[] = [];
 
-  constructor(protected readonly options: GrpcOptions['options']) {
+  get status(): never {
+    throw new Error(
+      'The "status" attribute is not supported by the gRPC transport',
+    );
+  }
+
+  constructor(protected readonly options: Required<GrpcOptions>['options']) {
     super();
     this.url = this.getOptionsProp(options, 'url') || GRPC_DEFAULT_URL;
 
     const protoLoader =
       this.getOptionsProp(options, 'protoLoader') || GRPC_DEFAULT_PROTO_LOADER;
 
-    grpcPackage = loadPackage('grpc', ClientGrpcProxy.name, () =>
-      require('grpc'),
+    // Loaded synchronously, unlike the packages of the other transports:
+    // getService() is synchronous and the clients are created right here.
+    // Bundlers such as esbuild cannot follow createRequire(), so applications
+    // bundling a gRPC client have to mark these packages as external.
+    grpcPackage = loadPackageSync('@grpc/grpc-js', ClientGrpcProxy.name, () =>
+      createRequire(import.meta.url)('@grpc/grpc-js'),
     );
-    grpcProtoLoaderPackage = loadPackage(protoLoader, ClientGrpcProxy.name);
+
+    grpcProtoLoaderPackage = loadPackageSync(
+      protoLoader,
+      ClientGrpcProxy.name,
+      () => createRequire(import.meta.url)(protoLoader),
+    );
+
     this.grpcClients = this.createClients();
   }
 
-  public getService<T extends {}>(name: string): T {
-    const grpcClient = this.createClientByServiceName(name);
+  public getService<T extends object>(name: string): T {
+    const grpcClient = this.getClientByServiceName(name);
     const clientRef = this.getClient(name);
     if (!clientRef) {
-      throw new InvalidGrpcServiceException();
+      throw new InvalidGrpcServiceException(name);
     }
 
     const protoMethods = Object.keys(clientRef[name].prototype);
     const grpcService = {} as T;
 
     protoMethods.forEach(m => {
-      const key = m[0].toLowerCase() + m.slice(1, m.length);
-      grpcService[key] = this.createServiceMethod(grpcClient, m);
+      grpcService[m] = this.createServiceMethod(grpcClient, m);
     });
     return grpcService;
   }
@@ -62,36 +107,28 @@ export class ClientGrpcProxy extends ClientProxy implements ClientGrpc {
   public createClientByServiceName(name: string) {
     const clientRef = this.getClient(name);
     if (!clientRef) {
-      throw new InvalidGrpcServiceException();
+      throw new InvalidGrpcServiceException(name);
     }
 
-    const maxSendMessageLengthKey = 'grpc.max_send_message_length';
-    const maxReceiveMessageLengthKey = 'grpc.max_receive_message_length';
-    const maxMessageLengthOptions = {
-      [maxSendMessageLengthKey]: this.getOptionsProp(
-        this.options,
-        'maxSendMessageLength',
-        GRPC_DEFAULT_MAX_SEND_MESSAGE_LENGTH,
-      ),
-      [maxReceiveMessageLengthKey]: this.getOptionsProp(
-        this.options,
-        'maxReceiveMessageLength',
-        GRPC_DEFAULT_MAX_RECEIVE_MESSAGE_LENGTH,
-      ),
+    // A copy, so the limits below never reach an object the caller may share
+    const channelOptions: ChannelOptions = {
+      ...this.options?.channelOptions,
     };
-    const maxMetadataSize = this.getOptionsProp(
-      this.options,
-      'maxMetadataSize',
-      -1,
-    );
-    if (maxMetadataSize > 0) {
-      maxMessageLengthOptions['grpc.max_metadata_size'] = maxMetadataSize;
+    if (this.options && this.options.maxSendMessageLength) {
+      channelOptions['grpc.max_send_message_length'] =
+        this.options.maxSendMessageLength;
+    }
+    if (this.options && this.options.maxReceiveMessageLength) {
+      channelOptions['grpc.max_receive_message_length'] =
+        this.options.maxReceiveMessageLength;
+    }
+    if (this.options && this.options.maxMetadataSize) {
+      channelOptions['grpc.max_metadata_size'] = this.options.maxMetadataSize;
     }
 
     const keepaliveOptions = this.getKeepaliveOptions();
     const options: Record<string, string | number> = {
-      ...(this.options.channelOptions || {}),
-      ...maxMessageLengthOptions,
+      ...channelOptions,
       ...keepaliveOptions,
     };
 
@@ -108,7 +145,7 @@ export class ClientGrpcProxy extends ClientProxy implements ClientGrpc {
       return {};
     }
     const keepaliveKeys: Record<
-      keyof GrpcOptions['options']['keepalive'],
+      keyof NonNullable<GrpcOptions['options']['keepalive']>,
       string
     > = {
       keepaliveTimeMs: 'grpc.keepalive_time_ms',
@@ -148,27 +185,30 @@ export class ClientGrpcProxy extends ClientProxy implements ClientGrpc {
     methodName: string,
   ): (...args: any[]) => Observable<any> {
     return (...args: any[]) => {
-      const isRequestStream = client[methodName].requestStream;
+      const isRequestStream = client![methodName].requestStream;
       const stream = new Observable(observer => {
         let isClientCanceled = false;
-        let upstreamSubscription: Subscription;
+        let upstreamSubscription: Subscription | null = null;
 
-        const upstreamSubjectOrData = args[0];
-        const maybeMetadata = args[1];
+        const callArgs = this.applyDispatchHook(client, methodName, args);
+        const upstreamSubjectOrData = callArgs[0];
 
         const isUpstreamSubject =
           upstreamSubjectOrData && isFunction(upstreamSubjectOrData.subscribe);
 
         const call =
           isRequestStream && isUpstreamSubject
-            ? client[methodName](maybeMetadata)
-            : client[methodName](...args);
+            ? client![methodName](...getArgumentsAfterRequest(callArgs))
+            : client![methodName](
+                ...callArgs.slice(0, 1),
+                ...getArgumentsAfterRequest(callArgs),
+              );
 
         if (isRequestStream && isUpstreamSubject) {
-          upstreamSubscription = upstreamSubjectOrData.subscribe(
-            (val: unknown) => call.write(val),
-            (err: unknown) => call.emit('error', err),
-            () => call.end(),
+          upstreamSubscription = this.writeRequestStream(
+            call,
+            upstreamSubjectOrData,
+            observer,
           );
         }
         call.on('data', (data: any) => observer.next(data));
@@ -179,7 +219,7 @@ export class ClientGrpcProxy extends ClientProxy implements ClientGrpc {
               return;
             }
           }
-          observer.error(error);
+          observer.error(this.serializeError(error));
         });
         call.on('end', () => {
           if (upstreamSubscription) {
@@ -218,43 +258,152 @@ export class ClientGrpcProxy extends ClientProxy implements ClientGrpc {
 
       if (isRequestStream && isUpstreamSubject) {
         return new Observable(observer => {
+          let isClientCanceled = false;
           const callArgs = [
-            (error: unknown, data: unknown) => {
+            (error: any, data: unknown) => {
               if (error) {
-                return observer.error(error);
+                if (error.details === GRPC_CANCELLED || error.code === 1) {
+                  call.destroy();
+                  if (isClientCanceled) {
+                    return;
+                  }
+                }
+                return observer.error(this.serializeError(error));
               }
               observer.next(data);
               observer.complete();
             },
           ];
-          const maybeMetadata = args[1];
-          if (maybeMetadata) {
-            callArgs.unshift(maybeMetadata);
-          }
-          const call = client[methodName](...callArgs);
-          upstreamSubjectOrData.subscribe(
-            (val: unknown) => call.write(val),
-            (err: unknown) => call.emit('error', err),
-            () => call.end(),
+          callArgs.unshift(
+            ...getArgumentsAfterRequest(
+              this.applyDispatchHook(client, methodName, args),
+            ),
           );
+          const call = client[methodName](...callArgs);
+
+          const upstreamSubscription: Subscription = this.writeRequestStream(
+            call,
+            upstreamSubjectOrData,
+            observer,
+          );
+
+          return () => {
+            upstreamSubscription.unsubscribe();
+            if (!call.finished) {
+              isClientCanceled = true;
+              call.cancel();
+            }
+          };
         });
       }
       return new Observable(observer => {
-        client[methodName](...args, (error: any, data: any) => {
-          if (error) {
-            return observer.error(error);
+        const callArgs = this.applyDispatchHook(client, methodName, args);
+        const call = client[methodName](
+          ...callArgs.slice(0, 1),
+          ...getArgumentsAfterRequest(callArgs),
+          (error: any, data: any) => {
+            if (error) {
+              return observer.error(this.serializeError(error));
+            }
+            observer.next(data);
+            observer.complete();
+          },
+        );
+
+        return () => {
+          if (!call.finished) {
+            call.cancel();
           }
-          observer.next(data);
-          observer.complete();
-        });
+        };
       });
     };
+  }
+
+  /**
+   * Writes the values of a request stream to the call, and ends the call once
+   * the stream completes.
+   *
+   * The call is an object mode stream, whose "write" throws on null where
+   * nothing catches it, so null fails the call instead, as a null response
+   * does on the server. What a request stream emits synchronously after the
+   * null, while it cannot be unsubscribed from yet, is not sent either, so
+   * the server cannot take the rest of the stream for all of it.
+   */
+  protected writeRequestStream(
+    call: any,
+    upstream: any,
+    observer: Subscriber<unknown>,
+  ): Subscription {
+    let isFailed = false;
+    return upstream.subscribe(
+      (val: unknown) => {
+        if (isFailed) {
+          return;
+        }
+        if (val === null) {
+          isFailed = true;
+          return observer.error(
+            this.serializeError(this.createNullRequestError()),
+          );
+        }
+        call.write(val);
+      },
+      (err: unknown) => observer.error(this.serializeError(err)),
+      () => !isFailed && call.end(),
+    );
+  }
+
+  private createNullRequestError() {
+    const details = 'The request stream emitted a null value';
+    return Object.assign(new Error(details), {
+      code: GrpcStatus.INTERNAL,
+      details,
+    });
+  }
+
+  /**
+   * Runs the dispatch hook for a call - gRPC calls do not go through `send()`
+   * or `emit()` - once per subscription, in the subscriber's context.
+   *
+   * Returns the arguments to make the call with: the caller's, with the
+   * metadata the hook attached added to the call's `Metadata` under every key
+   * the caller did not set. A `Metadata` the caller passed is cloned rather
+   * than changed, as it may be reused for other calls.
+   */
+  protected applyDispatchHook(
+    client: any,
+    methodName: string,
+    args: any[],
+  ): any[] {
+    if (!this.onDispatchHook) {
+      return args;
+    }
+    // A gRPC method is known by its path, e.g. "/hero.HeroesService/FindOne"
+    const pattern = client[methodName]?.path ?? methodName;
+    const packet = this.createPacket(pattern, args[0]);
+    if (!hasPacketMetadata(packet.metadata)) {
+      return args;
+    }
+    const [data, maybeMetadata, ...rest] = args;
+    const isMetadata = maybeMetadata instanceof grpcPackage.Metadata;
+    const metadata = isMetadata
+      ? maybeMetadata.clone()
+      : new grpcPackage.Metadata();
+    for (const [key, value] of Object.entries(packet.metadata)) {
+      if (metadata.get(key).length === 0) {
+        metadata.set(key, value);
+      }
+    }
+    // Call options passed in place of the metadata move one place along
+    return isMetadata || isNil(maybeMetadata)
+      ? [data, metadata, ...rest]
+      : [data, metadata, maybeMetadata, ...rest];
   }
 
   public createClients(): any[] {
     const grpcContext = this.loadProto();
     const packageOption = this.getOptionsProp(this.options, 'package');
-    const grpcPackages = [];
+    const grpcPackages: any[] = [];
     const packageNames = Array.isArray(packageOption)
       ? packageOption
       : [packageOption];
@@ -263,7 +412,9 @@ export class ClientGrpcProxy extends ClientProxy implements ClientGrpc {
       const grpcPkg = this.lookupPackage(grpcContext, packageName);
 
       if (!grpcPkg) {
-        const invalidPackageError = new InvalidGrpcPackageException();
+        const invalidPackageError = new InvalidGrpcPackageException(
+          packageName,
+        );
         this.logger.error(
           invalidPackageError.message,
           invalidPackageError.stack,
@@ -277,16 +428,13 @@ export class ClientGrpcProxy extends ClientProxy implements ClientGrpc {
 
   public loadProto(): any {
     try {
-      const file = this.getOptionsProp(this.options, 'protoPath');
-      const loader = this.getOptionsProp(this.options, 'loader');
-
-      const packageDefinition = grpcProtoLoaderPackage.loadSync(file, loader);
-      const packageObject = grpcPackage.loadPackageDefinition(
-        packageDefinition,
+      const packageDefinition = getGrpcPackageDefinition(
+        this.options,
+        grpcProtoLoaderPackage,
       );
-      return packageObject;
+      return grpcPackage.loadPackageDefinition(packageDefinition);
     } catch (err) {
-      const invalidProtoError = new InvalidProtoDefinitionException();
+      const invalidProtoError = new InvalidProtoDefinitionException(err.path);
       const message =
         err && err.message ? err.message : invalidProtoError.message;
 
@@ -298,16 +446,26 @@ export class ClientGrpcProxy extends ClientProxy implements ClientGrpc {
   public lookupPackage(root: any, packageName: string) {
     /** Reference: https://github.com/kondi/rxjs-grpc */
     let pkg = root;
-    for (const name of packageName.split(/\./)) {
-      pkg = pkg[name];
+
+    if (packageName) {
+      for (const name of packageName.split('.')) {
+        if (!pkg) {
+          break;
+        }
+        pkg = pkg[name];
+      }
     }
+
     return pkg;
   }
 
   public close() {
-    this.grpcClients
-      .filter(client => client && isFunction(client.close))
-      .forEach(client => client.close());
+    this.clients.forEach(client => {
+      if (client && isFunction(client.close)) {
+        client.close();
+      }
+    });
+    this.clients.clear();
     this.grpcClients = [];
   }
 
@@ -325,7 +483,7 @@ export class ClientGrpcProxy extends ClientProxy implements ClientGrpc {
   }
 
   protected getClient(name: string): any {
-    return this.grpcClients.find(client => client.hasOwnProperty(name));
+    return this.grpcClients.find(client => Object.hasOwn(client, name));
   }
 
   protected publish(packet: any, callback: (packet: any) => any): any {
@@ -338,5 +496,16 @@ export class ClientGrpcProxy extends ClientProxy implements ClientGrpc {
     throw new Error(
       'Method is not supported in gRPC mode. Use ClientGrpc instead (learn more in the documentation).',
     );
+  }
+
+  public on<EventKey extends never = never, EventCallback = any>(
+    event: EventKey,
+    callback: EventCallback,
+  ) {
+    throw new Error('Method is not supported in gRPC mode.');
+  }
+
+  public unwrap<T>(): T {
+    throw new Error('Method is not supported in gRPC mode.');
   }
 }

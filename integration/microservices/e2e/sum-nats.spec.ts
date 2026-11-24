@@ -1,9 +1,9 @@
 import { INestApplication } from '@nestjs/common';
-import { Transport } from '@nestjs/microservices';
+import { MicroserviceOptions, Transport } from '@nestjs/microservices';
 import { Test } from '@nestjs/testing';
-import { expect } from 'chai';
-import * as request from 'supertest';
-import { NatsController } from '../src/nats/nats.controller';
+import request from 'supertest';
+import { NatsController } from '../src/nats/nats.controller.js';
+import { NatsService } from '../src/nats/nats.service.js';
 
 describe('NATS transport', () => {
   let server;
@@ -12,18 +12,19 @@ describe('NATS transport', () => {
   beforeEach(async () => {
     const module = await Test.createTestingModule({
       controllers: [NatsController],
+      providers: [NatsService],
     }).compile();
 
     app = module.createNestApplication();
     server = app.getHttpAdapter().getInstance();
 
-    app.connectMicroservice({
+    app.connectMicroservice<MicroserviceOptions>({
       transport: Transport.NATS,
       options: {
-        url: 'nats://0.0.0.0:4222',
+        servers: 'nats://0.0.0.0:4222',
       },
     });
-    await app.startAllMicroservicesAsync();
+    await app.startAllMicroservices();
     await app.init();
   });
 
@@ -81,15 +82,30 @@ describe('NATS transport', () => {
     });
   });
 
-  it(`/POST (event notification)`, done => {
-    request(server)
-      .post('/notify')
-      .send([1, 2, 3, 4, 5])
-      .end(() => {
-        setTimeout(() => {
-          expect(NatsController.IS_NOTIFIED).to.be.true;
-          done();
-        }, 1000);
+  it(`/POST (event notification)`, () =>
+    new Promise<void>(done => {
+      void request(server)
+        .post('/notify')
+        .send([1, 2, 3, 4, 5])
+        .end(() => {
+          setTimeout(() => {
+            expect(NatsController.IS_NOTIFIED).toBe(true);
+            expect(NatsController.IS_NOTIFIED2).toBe(true);
+            done();
+          }, 1000);
+        });
+    }));
+
+  it(`/POST (sending headers with "RecordBuilder")`, () => {
+    const payload = { items: [1, 2, 3] };
+    return request(server)
+      .post('/record-builder-duplex')
+      .send(payload)
+      .expect(200, {
+        data: payload,
+        headers: {
+          ['x-version']: '1.0.0',
+        },
       });
   });
 

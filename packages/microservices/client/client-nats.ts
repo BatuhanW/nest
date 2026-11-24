@@ -1,70 +1,296 @@
-import { Logger } from '@nestjs/common/services/logger.service';
-import { loadPackage } from '@nestjs/common/utils/load-package.util';
-import { share } from 'rxjs/operators';
-import { ERROR_EVENT, NATS_DEFAULT_URL } from '../constants';
-import { Client } from '../external/nats-client.interface';
-import { NatsOptions, PacketId, ReadPacket, WritePacket } from '../interfaces';
-import { ClientProxy } from './client-proxy';
-import { CONN_ERR } from './constants';
+import { Logger } from '@nestjs/common';
+import { isObject, loadPackage } from '@nestjs/common/internal';
+import { randomBytes } from 'crypto';
+import { EventEmitter } from 'events';
+import { NATS_DEFAULT_URL } from '../constants.js';
+import { NatsResponseJSONDeserializer } from '../deserializers/nats-response-json.deserializer.js';
+import { EmptyResponseException } from '../errors/empty-response.exception.js';
+import {
+  NatsEvents,
+  NatsEventsMap,
+  NatsStatus,
+} from '../events/nats.events.js';
+import {
+  IncomingResponse,
+  NatsOptions,
+  PacketId,
+  PacketMetadata,
+  ReadPacket,
+  WritePacket,
+} from '../interfaces/index.js';
+import { NatsRecord } from '../record-builders/index.js';
+import { NatsRecordSerializer } from '../serializers/nats-record.serializer.js';
+import { hasPacketMetadata } from '../utils/packet-metadata.utils.js';
+import { ClientProxy } from './client-proxy.js';
 
-let natsPackage: any = {};
+let natsPackage = {} as any;
 
-export class ClientNats extends ClientProxy {
-  protected readonly logger = new Logger(ClientProxy.name);
-  protected readonly url: string;
-  protected natsClient: Client;
-  protected connection: Promise<any>;
+// To enable type safety for Nats. This cant be uncommented by default
+// because it would require the user to install the nats package even if they dont use Nats
+// Otherwise, TypeScript would fail to compile the code.
+//
+// type Client = import('@nats-io/transport-node').NatsConnection;
+// type NatsMsg = import('@nats-io/transport-node').Msg;
 
-  constructor(protected readonly options: NatsOptions['options']) {
+type Client = Record<string, any>;
+type NatsMsg = Record<string, any>;
+type MsgHdrs = { keys(): string[]; values(key: string): string[] };
+
+const isMsgHdrs = (headers: unknown): headers is MsgHdrs =>
+  isObject(headers) && typeof (headers as MsgHdrs).keys === 'function';
+
+/**
+ * @publicApi
+ */
+export class ClientNats extends ClientProxy<NatsEvents, NatsStatus> {
+  protected readonly logger = new Logger(ClientNats.name);
+
+  protected natsClient: Client | null = null;
+  protected connectionPromise: Promise<Client> | null = null;
+  protected statusEventEmitter = new EventEmitter<{
+    [key in keyof NatsEvents]: Parameters<NatsEvents[key]>;
+  }>();
+
+  constructor(protected readonly options: Required<NatsOptions>['options']) {
     super();
-    this.url = this.getOptionsProp(this.options, 'url') || NATS_DEFAULT_URL;
-    natsPackage = loadPackage('nats', ClientNats.name, () => require('nats'));
-
     this.initializeSerializer(options);
     this.initializeDeserializer(options);
   }
 
-  public close() {
-    this.natsClient && this.natsClient.close();
+  public async close() {
+    this.handleClose();
+    // Reset first, so that the status updates do not take this close for a
+    // client that gave up
+    const natsClient = this.natsClient;
     this.natsClient = null;
-    this.connection = null;
+    this.connectionPromise = null;
+    try {
+      await natsClient?.close();
+    } finally {
+      this.statusEventEmitter.removeAllListeners();
+    }
+  }
+
+  public handleClose() {
+    if (this.routingMap.size > 0) {
+      const err = new Error('Connection closed');
+      const callbacks = [...this.routingMap.values()];
+      this.routingMap.clear();
+
+      for (const callback of callbacks) {
+        try {
+          callback({ err });
+        } catch (callbackErr) {
+          // A failing callback must not keep the remaining requests pending
+          // nor prevent the connection from being closed.
+          this.logger.error(callbackErr);
+        }
+      }
+    }
   }
 
   public async connect(): Promise<any> {
-    if (this.natsClient) {
-      return this.connection;
+    if (this.connectionPromise) {
+      return this.connectionPromise;
     }
-    this.natsClient = this.createClient();
-    this.handleError(this.natsClient);
+    const connectionPromise = this.createClient();
+    this.connectionPromise = connectionPromise;
+    const natsClient = await connectionPromise.catch(err => {
+      // A rejected attempt must not be cached, but a newer attempt may have
+      // replaced it in the meantime (close() followed by connect() while this
+      // attempt was still pending): only reset the shared state when the
+      // failing attempt is still the current one, as ClientRedis, ClientRMQ
+      // and ClientKafka already do.
+      if (this.connectionPromise === connectionPromise) {
+        this.connectionPromise = null;
+      }
+      throw err;
+    });
+    if (this.connectionPromise !== connectionPromise) {
+      // The client was closed (and possibly reconnected) while this attempt
+      // was still pending: the connection it opened is no longer tracked by
+      // the client, so it must not replace the current one nor stay open.
+      await natsClient.close().catch(() => {});
+      if (this.connectionPromise) {
+        return this.connectionPromise;
+      }
+      throw new Error('Connection closed');
+    }
+    this.natsClient = natsClient;
 
-    this.connection = await this.connect$(this.natsClient)
-      .pipe(share())
-      .toPromise();
-    return this.connection;
+    this._status$.next(NatsStatus.CONNECTED);
+    this.handleStatusUpdates(this.natsClient).catch(err =>
+      this.logger.error(err),
+    );
+    return this.natsClient;
   }
 
-  public createClient(): Client {
-    const options: any = this.options || ({} as NatsOptions);
+  public async createClient(): Promise<Client> {
+    natsPackage = await loadPackage(
+      '@nats-io/transport-node',
+      ClientNats.name,
+      () => import('@nats-io/transport-node'),
+    );
+
+    // Eagerly initialize serializer/deserializer so they can be used synchronously
+    if (
+      this.serializer &&
+      typeof (this.serializer as any).init === 'function'
+    ) {
+      await (this.serializer as any).init();
+    }
+    if (
+      this.deserializer &&
+      typeof (this.deserializer as any).init === 'function'
+    ) {
+      await (this.deserializer as any).init();
+    }
+
+    const options = this.options || ({} as NatsOptions);
     return natsPackage.connect({
+      servers: NATS_DEFAULT_URL,
       ...options,
-      url: this.url,
-      json: true,
     });
   }
 
-  public handleError(client: Client) {
-    client.addListener(
-      ERROR_EVENT,
-      (err: any) => err.code !== CONN_ERR && this.logger.error(err),
-    );
+  public async handleStatusUpdates(client: Client) {
+    for await (const status of client.status()) {
+      if (this.natsClient !== client) {
+        return;
+      }
+      try {
+        switch (status.type) {
+          case 'error':
+            this.logger.error(
+              `NatsError: type: "${status.type}", error: "${status.error}".`,
+            );
+            break;
+
+          case 'disconnect':
+            this.connectionPromise = Promise.reject(
+              'Error: Connection lost. Trying to reconnect...',
+            );
+            // Prevent unhandled promise rejection
+            this.connectionPromise.catch(() => {});
+
+            this.logger.error(`NatsError: type: "${status.type}".`);
+
+            this._status$.next(NatsStatus.DISCONNECTED);
+            this.statusEventEmitter.emit(
+              NatsEventsMap.DISCONNECT,
+              status.server as string,
+            );
+            break;
+
+          case 'reconnecting':
+            this._status$.next(NatsStatus.RECONNECTING);
+            break;
+
+          case 'reconnect':
+            this.connectionPromise = Promise.resolve(client);
+            this.logger.log(`NatsStatus: type: "${status.type}".`);
+
+            this._status$.next(NatsStatus.CONNECTED);
+            this.statusEventEmitter.emit(
+              NatsEventsMap.RECONNECT,
+              status.server as string,
+            );
+            break;
+
+          case 'ping':
+            if (this.options.debug) {
+              this.logger.debug(
+                `NatsStatus: type: "${status.type}", pending pings: "${status.pendingPings}".`,
+              );
+            }
+            break;
+
+          case 'update':
+            this.logger.log(
+              `NatsStatus: type: "${status.type}", added: "${status.added}", deleted: "${status.deleted}".`,
+            );
+            this.statusEventEmitter.emit(NatsEventsMap.UPDATE, {
+              added: status.added,
+              deleted: status.deleted,
+            });
+            break;
+
+          default: {
+            const data =
+              'data' in status && isObject(status.data)
+                ? JSON.stringify(status.data)
+                : 'data' in status
+                  ? status.data
+                  : '';
+            this.logger.log(
+              `NatsStatus: type: "${status.type}", data: "${data}".`,
+            );
+            break;
+          }
+        }
+      } catch (err) {
+        // A throwing listener must neither end the status updates nor
+        // escape as an unhandled rejection
+        this.logger.error(err);
+      }
+    }
+    // The status iterator only completes once the client has given up: it was
+    // closed, or it exhausted `maxReconnectAttempts` and is not coming back.
+    // The promise the "disconnect" case cached is never reset in that case, so
+    // every later `connect()` call would replay the same rejection. Drop the
+    // client and the cached promise so the next call starts over.
+    if (this.natsClient === client) {
+      this.natsClient = null;
+      this.connectionPromise = null;
+      this._status$.next(NatsStatus.DISCONNECTED);
+      // nats never calls back the reply subscriptions it closes. Fail them
+      // after the reset, so that a request retried from its callback reconnects.
+      this.handleClose();
+    }
+  }
+
+  public on<
+    EventKey extends keyof NatsEvents = keyof NatsEvents,
+    EventCallback extends NatsEvents[EventKey] = NatsEvents[EventKey],
+  >(event: EventKey, callback: EventCallback) {
+    this.statusEventEmitter.on(event as string | symbol, callback as any);
+  }
+
+  public unwrap<T>(): T {
+    if (!this.natsClient) {
+      throw new Error(
+        'Not initialized. Please call the "connect" method first.',
+      );
+    }
+    return this.natsClient as T;
   }
 
   public createSubscriptionHandler(
     packet: ReadPacket & PacketId,
     callback: (packet: WritePacket) => any,
-  ): Function {
-    return (rawPacket: unknown) => {
-      const message = this.deserializer.deserialize(rawPacket);
+  ) {
+    return async (error: Error | null, natsMsg: NatsMsg) => {
+      if (error) {
+        return callback({
+          err: error,
+        });
+      }
+      const rawPacket = natsMsg.data;
+      if (rawPacket?.length === 0) {
+        return callback({
+          err: new EmptyResponseException(
+            this.normalizePattern(packet.pattern),
+          ),
+          isDisposed: true,
+        });
+      }
+      // nats-core does not await this callback: a rejection here would crash the process.
+      let message: IncomingResponse;
+      try {
+        message = await this.deserializer.deserialize(natsMsg);
+      } catch (err) {
+        return callback({ err, isDisposed: true });
+      }
       if (message.id && message.id !== packet.id) {
         return undefined;
       }
@@ -86,35 +312,151 @@ export class ClientNats extends ClientProxy {
   protected publish(
     partialPacket: ReadPacket,
     callback: (packet: WritePacket) => any,
-  ): Function {
+  ): () => void {
+    const packet = this.assignPacketId(partialPacket);
+    this.routingMap.set(packet.id, callback);
+
+    let cleanup = () => {
+      this.routingMap.delete(packet.id);
+    };
+
     try {
-      const packet = this.assignPacketId(partialPacket);
       const channel = this.normalizePattern(partialPacket.pattern);
-      const serializedPacket = this.serializer.serialize(packet);
+      // The metadata travels as headers, not in the payload
+      const { metadata, ...outgoingPacket } = packet;
+      const serializedPacket: NatsRecord = this.serializer.serialize(
+        outgoingPacket,
+      ) as NatsRecord;
+      // A reply is accepted on its inbox even without an id, and createInbox()
+      // names the inbox after a counter that grows by a constant step, so the
+      // name gets random bits too. They stay in the same token, so that
+      // "<prefix>.*" permissions keep matching.
+      const inbox =
+        natsPackage.createInbox(this.options.inboxPrefix) +
+        randomBytes(16).toString('hex');
 
       const subscriptionHandler = this.createSubscriptionHandler(
         packet,
         callback,
       );
-      const subscriptionId = this.natsClient.request(
-        channel,
-        serializedPacket as any,
-        subscriptionHandler,
-      );
-      return () => this.natsClient.unsubscribe(subscriptionId);
+
+      const subscription = this.natsClient!.subscribe(inbox, {
+        callback: subscriptionHandler as (
+          err: Error | null,
+          msg: NatsMsg,
+        ) => Promise<never>,
+      });
+
+      cleanup = () => {
+        this.routingMap.delete(packet.id);
+        subscription.unsubscribe();
+      };
+
+      const headers = this.mergeHeaders(serializedPacket.headers, metadata);
+      this.natsClient!.publish(channel, serializedPacket.data, {
+        reply: inbox,
+        headers,
+      });
+
+      return cleanup;
     } catch (err) {
+      cleanup();
       callback({ err });
+      return () => {};
     }
   }
 
-  protected dispatchEvent(packet: ReadPacket): Promise<any> {
+  protected async dispatchEvent(packet: ReadPacket): Promise<any> {
     const pattern = this.normalizePattern(packet.pattern);
-    const serializedPacket = this.serializer.serialize(packet);
+    const { metadata, ...outgoingPacket } = packet;
+    const serializedPacket: NatsRecord =
+      await this.serializer.serialize(outgoingPacket);
+    const headers = this.mergeHeaders(serializedPacket.headers, metadata);
 
-    return new Promise<void>((resolve, reject) =>
-      this.natsClient.publish(pattern, serializedPacket as any, err =>
-        err ? reject(err) : resolve(),
-      ),
-    );
+    return new Promise<void>((resolve, reject) => {
+      try {
+        this.natsClient!.publish(pattern, serializedPacket.data, {
+          headers,
+        });
+        resolve();
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
+
+  protected initializeSerializer(options: NatsOptions['options']) {
+    this.serializer = options?.serializer ?? new NatsRecordSerializer();
+  }
+
+  protected initializeDeserializer(options: NatsOptions['options']) {
+    this.deserializer =
+      options?.deserializer ?? new NatsResponseJSONDeserializer();
+  }
+
+  protected mergeHeaders<THeaders = any>(
+    requestHeaders?: THeaders,
+    metadata?: PacketMetadata,
+  ) {
+    const metadataEntries =
+      hasPacketMetadata(metadata) && this.supportsHeaders()
+        ? Object.entries(metadata)
+        : [];
+    if (
+      !requestHeaders &&
+      !this.options?.headers &&
+      metadataEntries.length === 0
+    ) {
+      return undefined;
+    }
+
+    // nats.js encodes the headers of a publish with "MsgHdrs.encode()", so
+    // anything that is not a "MsgHdrs" cannot be sent. "NatsRecordBuilder"
+    // takes the headers of a record as they are given to it, and the packet
+    // headers of "send()" are a plain object, so both are copied into a
+    // "MsgHdrs" here rather than passed on.
+    const headers = natsPackage.headers();
+
+    // The packet headers win over the static ones, as they always did.
+    if (isMsgHdrs(requestHeaders)) {
+      // A "MsgHdrs" keeps its headers in a map that "Object.entries()" does
+      // not expose.
+      for (const key of requestHeaders.keys()) {
+        for (const value of requestHeaders.values(key)) {
+          // "set()" would keep only the last value of a multi-valued header
+          headers.append(key, value);
+        }
+      }
+    } else if (isObject(requestHeaders)) {
+      for (const [key, value] of Object.entries(requestHeaders)) {
+        headers.set(key, value as string);
+      }
+    }
+
+    for (const [key, value] of Object.entries(this.options?.headers || {})) {
+      if (!headers.has(key)) {
+        headers.set(key, value);
+      }
+    }
+
+    // The packet metadata only fills in what neither the record nor the
+    // client options set
+    for (const [key, value] of metadataEntries) {
+      if (!headers.has(key)) {
+        headers.set(key, value);
+      }
+    }
+
+    return headers;
+  }
+
+  /**
+   * Whether the server accepts message headers, as every NATS server does
+   * since 2.2. Packet metadata is left off a message to one that does not:
+   * the publish would fail over a header the application never set.
+   */
+  protected supportsHeaders(): boolean {
+    const info = this.natsClient?.info;
+    return !info || !!info.headers;
   }
 }

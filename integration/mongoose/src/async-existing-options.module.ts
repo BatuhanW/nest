@@ -4,13 +4,12 @@ import {
   MongooseModuleOptions,
   MongooseOptionsFactory,
 } from '@nestjs/mongoose';
-import { CatsModule } from './cats/cats.module';
+import { CatsModule } from './cats/cats.module.js';
 
 class ConfigService implements MongooseOptionsFactory {
   createMongooseOptions(): MongooseModuleOptions {
     return {
       uri: 'mongodb://localhost:27017/test',
-      useNewUrlParser: true,
     };
   }
 }

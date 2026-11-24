@@ -2,28 +2,29 @@ import {
   Body,
   Controller,
   HttpCode,
+  Logger,
   OnModuleDestroy,
   OnModuleInit,
   Post,
 } from '@nestjs/common';
-import { Logger } from '@nestjs/common/services/logger.service';
 import { Client, ClientKafka, Transport } from '@nestjs/microservices';
 import { PartitionerArgs } from 'kafkajs';
 import { Observable } from 'rxjs';
-import { SumDto } from './dto/sum.dto';
+import { SumDto } from './dto/sum.dto.js';
 
 /**
- * The following function explicity sends messages to the key representing the partition.
+ * The following function explicitly sends messages to the key representing the partition.
  */
 const explicitPartitioner = () => {
   return ({ message }: PartitionerArgs) => {
-    return parseFloat(message.headers.toPartition.toString());
+    return parseFloat(message.headers!.toPartition!.toString());
   };
 };
 
 @Controller()
 export class KafkaConcurrentController
-  implements OnModuleInit, OnModuleDestroy {
+  implements OnModuleInit, OnModuleDestroy
+{
   protected readonly logger = new Logger(KafkaConcurrentController.name);
 
   @Client({

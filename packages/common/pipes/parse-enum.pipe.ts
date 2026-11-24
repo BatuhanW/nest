@@ -1,0 +1,125 @@
+import { Injectable, Optional } from '../decorators/core/index.js';
+import { ArgumentMetadata, HttpStatus } from '../index.js';
+import { PipeTransform } from '../interfaces/features/pipe-transform.interface.js';
+import {
+  ErrorHttpStatusCode,
+  HttpErrorByCode,
+} from '../utils/http-error-by-code.util.js';
+import { isNil } from '../utils/shared.utils.js';
+
+/**
+ * @publicApi
+ */
+export interface ParseEnumPipeOptions {
+  /**
+   * If true, the pipe will return null or undefined if the value is not provided
+   * @default false
+   */
+  optional?: boolean;
+  /**
+   * The HTTP status code to be used in the response when the validation fails.
+   */
+  errorHttpStatusCode?: ErrorHttpStatusCode;
+  /**
+   * A factory function that returns an exception object to be thrown
+   * if validation fails.
+   * @param error Error message
+   * @returns The exception object
+   */
+  exceptionFactory?: (error: string) => any;
+}
+
+/**
+ * Defines the built-in ParseEnum Pipe
+ *
+ * @see [Built-in Pipes](https://docs.nestjs.com/pipes#built-in-pipes)
+ *
+ * @publicApi
+ */
+@Injectable()
+export class ParseEnumPipe<T = any> implements PipeTransform<T> {
+  protected exceptionFactory: (error: string) => any;
+  private cachedEnumValues?: (string | number)[];
+  constructor(
+    protected readonly enumType: T,
+    @Optional() protected readonly options?: ParseEnumPipeOptions,
+  ) {
+    if (!enumType) {
+      throw new Error(
+        `"ParseEnumPipe" requires "enumType" argument specified (to validate input values).`,
+      );
+    }
+    options = options || {};
+    const { exceptionFactory, errorHttpStatusCode = HttpStatus.BAD_REQUEST } =
+      options;
+
+    this.exceptionFactory =
+      exceptionFactory ||
+      (error => new HttpErrorByCode[errorHttpStatusCode](error));
+  }
+
+  /**
+   * Method that accesses and performs optional transformation on argument for
+   * in-flight requests.
+   *
+   * @param value currently processed route argument
+   * @param metadata contains metadata about the currently processed route argument
+   */
+  async transform(
+    value: unknown,
+    metadata: ArgumentMetadata,
+  ): Promise<T | undefined | null> {
+    if (isNil(value) && this.options?.optional) {
+      return value;
+    }
+    if (!this.isEnum(value)) {
+      throw this.exceptionFactory(
+        'Validation failed (enum string is expected)',
+      );
+    }
+    return (this.toEnumValue(value) ?? value) as T;
+  }
+
+  protected isEnum(value: unknown): boolean {
+    return this.toEnumValue(value) !== undefined;
+  }
+
+  /**
+   * Returns the enum member that `value` refers to, or `undefined` if there is none.
+   * Numeric members also match their string representation (e.g. `'1'` for `1`),
+   * since HTTP route and query params always arrive as strings.
+   */
+  protected toEnumValue(value: unknown): string | number | undefined {
+    const enumValues = this.getEnumValues();
+    if (enumValues.includes(value as string | number)) {
+      return value as string | number;
+    }
+    if (typeof value === 'string') {
+      return enumValues.find(
+        enumValue =>
+          typeof enumValue === 'number' && String(enumValue) === value,
+      );
+    }
+    return undefined;
+  }
+
+  protected getEnumValues(): (string | number)[] {
+    // The enum object never changes after construction, so the values are
+    // computed once and reused on every request.
+    return (this.cachedEnumValues ??= this.computeEnumValues());
+  }
+
+  private computeEnumValues(): (string | number)[] {
+    return Object.keys(this.enumType as object)
+      .filter(key => {
+        const enumValue = (this.enumType as any)[key];
+        // Only numeric reverse mappings point back to their own key.
+        return !(
+          typeof enumValue === 'string' &&
+          typeof (this.enumType as any)[enumValue] === 'number' &&
+          String((this.enumType as any)[enumValue]) === key
+        );
+      })
+      .map(key => (this.enumType as any)[key]);
+  }
+}

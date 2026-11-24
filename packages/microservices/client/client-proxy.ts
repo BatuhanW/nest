@@ -1,18 +1,18 @@
-import { randomStringGenerator } from '@nestjs/common/utils/random-string-generator.util';
-import { isNil } from '@nestjs/common/utils/shared.utils';
+import { randomUUID } from 'crypto';
 import {
-  ConnectableObservable,
+  throwError as _throw,
+  connectable,
   defer,
   fromEvent,
   merge,
   Observable,
   Observer,
-  throwError as _throw,
+  ReplaySubject,
+  Subject,
 } from 'rxjs';
-import { map, mergeMap, publish, take } from 'rxjs/operators';
-import { CONNECT_EVENT, ERROR_EVENT } from '../constants';
-import { IncomingResponseDeserializer } from '../deserializers/incoming-response.deserializer';
-import { InvalidMessageException } from '../errors/invalid-message.exception';
+import { distinctUntilChanged, map, mergeMap, take } from 'rxjs/operators';
+import { IncomingResponseDeserializer } from '../deserializers/incoming-response.deserializer.js';
+import { InvalidMessageException } from '../errors/invalid-message.exception.js';
 import {
   ClientOptions,
   KafkaOptions,
@@ -25,57 +25,146 @@ import {
   RmqOptions,
   TcpClientOptions,
   WritePacket,
-} from '../interfaces';
-import { ProducerDeserializer } from '../interfaces/deserializer.interface';
-import { ProducerSerializer } from '../interfaces/serializer.interface';
-import { IdentitySerializer } from '../serializers/identity.serializer';
-import { transformPatternToRoute } from '../utils';
+} from '../interfaces/index.js';
+import { ProducerDeserializer } from '../interfaces/deserializer.interface.js';
+import { ProducerSerializer } from '../interfaces/serializer.interface.js';
+import { IdentitySerializer } from '../serializers/identity.serializer.js';
+import { transformPatternToRoute } from '../utils/index.js';
+import { isNil } from '@nestjs/common/internal';
 
-export abstract class ClientProxy {
-  public abstract connect(): Promise<any>;
-  public abstract close(): any;
-
+/**
+ * @publicApi
+ */
+export abstract class ClientProxy<
+  EventsMap extends Record<never, Function> = Record<never, Function>,
+  Status extends string = string,
+> {
+  protected onDispatchHook?: (packet: ReadPacket) => void;
   protected routingMap = new Map<string, Function>();
   protected serializer: ProducerSerializer;
   protected deserializer: ProducerDeserializer;
+  protected _status$ = new ReplaySubject<Status>(1);
 
+  /**
+   * Returns an observable that emits status changes.
+   */
+  public get status(): Observable<Status> {
+    return this._status$.asObservable().pipe(distinctUntilChanged());
+  }
+
+  /**
+   * Establishes the connection to the underlying server/broker.
+   */
+  public abstract connect(): Promise<any>;
+  /**
+   * Closes the underlying connection to the server/broker.
+   */
+  public abstract close(): any;
+  /**
+   * Registers an event listener for the given event.
+   * @param event Event name
+   * @param callback Callback to be executed when the event is emitted
+   */
+  public on<
+    EventKey extends keyof EventsMap = keyof EventsMap,
+    EventCallback extends EventsMap[EventKey] = EventsMap[EventKey],
+  >(event: EventKey, callback: EventCallback) {
+    throw new Error('Method not implemented.');
+  }
+  /**
+   * Returns an instance of the underlying server/broker instance,
+   * or a group of servers if there are more than one.
+   */
+  public abstract unwrap<T>(): T;
+
+  /**
+   * Send a message to the server/broker.
+   * Used for message-driven communication style between microservices.
+   * @param pattern Pattern to identify the message
+   * @param data Data to be sent
+   * @returns Observable with the result
+   */
   public send<TResult = any, TInput = any>(
     pattern: any,
     data: TInput,
   ): Observable<TResult> {
     if (isNil(pattern) || isNil(data)) {
-      return _throw(new InvalidMessageException());
+      return _throw(() => new InvalidMessageException());
     }
     return defer(async () => this.connect()).pipe(
       mergeMap(
         () =>
           new Observable((observer: Observer<TResult>) => {
             const callback = this.createObserver(observer);
-            return this.publish({ pattern, data }, callback);
+            return this.publish(this.createPacket(pattern, data), callback);
           }),
       ),
     );
   }
 
+  /**
+   * Emits an event to the server/broker.
+   * Used for event-driven communication style between microservices.
+   * @param pattern Pattern to identify the event
+   * @param data Data to be sent
+   * @returns Observable that completes when the event is successfully emitted
+   */
   public emit<TResult = any, TInput = any>(
     pattern: any,
     data: TInput,
   ): Observable<TResult> {
     if (isNil(pattern) || isNil(data)) {
-      return _throw(new InvalidMessageException());
+      return _throw(() => new InvalidMessageException());
     }
     const source = defer(async () => this.connect()).pipe(
-      mergeMap(() => this.dispatchEvent({ pattern, data })),
-      publish(),
+      mergeMap(() => this.dispatchEvent(this.createPacket(pattern, data))),
     );
-    (source as ConnectableObservable<TResult>).connect();
-    return source;
+    const connectableSource = connectable(source, {
+      connector: () => new Subject(),
+      resetOnDisconnect: false,
+    });
+    connectableSource.connect();
+    return connectableSource;
+  }
+
+  /**
+   * Sets a hook that is called with every outgoing packet - requests and
+   * events alike - right before it is handed to the transport. The hook may
+   * assign `packet.metadata`; it must not replace `pattern` or `data`.
+   *
+   * The client-side counterpart of `Server#setOnProcessingStartHook`: what one
+   * side attaches here, the other reads from the RPC context, which is what
+   * lets instrumentation carry a trace id across a hop without touching the
+   * application's payloads.
+   *
+   * TCP and Redis carry the metadata inside the packet. NATS, Kafka, RabbitMQ,
+   * MQTT 5 and gRPC carry it as headers, under the names the hook gave it, and
+   * never in the payload. There, metadata only fills in what the message does
+   * not set itself: a header set on the record (`NatsRecordBuilder`,
+   * `RmqRecordBuilder`, `MqttRecordBuilder`, a Kafka message's `headers`, the
+   * `Metadata` passed to a gRPC call) or in the client options (`headers`,
+   * `userProperties`) wins over a metadata entry of the same name.
+   *
+   * An entry the transport cannot carry (a NATS header value with a line
+   * break, a gRPC metadata key with a space) fails the call, as the same
+   * header set on the record would. MQTT 3 has no header channel, so metadata
+   * does not travel over it, and it is left off for a NATS server without
+   * header support.
+   */
+  public setOnDispatchHook(hook: (packet: ReadPacket) => void): void {
+    this.onDispatchHook = hook;
+  }
+
+  protected createPacket<TInput>(pattern: any, data: TInput): ReadPacket {
+    const packet: ReadPacket<TInput> = { pattern, data };
+    this.onDispatchHook?.(packet);
+    return packet;
   }
 
   protected abstract publish(
     packet: ReadPacket,
     callback: (packet: WritePacket) => void,
-  ): Function;
+  ): () => void;
 
   protected abstract dispatchEvent<T = any>(packet: ReadPacket): Promise<T>;
 
@@ -104,14 +193,16 @@ export abstract class ClientProxy {
   }
 
   protected assignPacketId(packet: ReadPacket): ReadPacket & PacketId {
-    const id = randomStringGenerator();
+    // Most transports match a reply to its request by the id alone, so it must
+    // not be guessable from the ids of other requests
+    const id = randomUUID();
     return Object.assign(packet, { id });
   }
 
   protected connect$(
     instance: any,
-    errorEvent = ERROR_EVENT,
-    connectEvent = CONNECT_EVENT,
+    errorEvent = 'error',
+    connectEvent = 'connect',
   ): Observable<any> {
     const error$ = fromEvent(instance, errorEvent).pipe(
       map((err: any) => {
@@ -123,10 +214,28 @@ export abstract class ClientProxy {
   }
 
   protected getOptionsProp<
-    T extends ClientOptions['options'],
-    K extends keyof T
-  >(obj: T, prop: K, defaultValue: T[K] = undefined) {
-    return (obj && obj[prop]) || defaultValue;
+    Options extends ClientOptions['options'],
+    Attribute extends keyof Options,
+  >(obj: Options, prop: Attribute): Options[Attribute];
+  protected getOptionsProp<
+    Options extends ClientOptions['options'],
+    Attribute extends keyof Options,
+    DefaultValue extends Options[Attribute] = Options[Attribute],
+  >(
+    obj: Options,
+    prop: Attribute,
+    defaultValue: DefaultValue,
+  ): Required<Options>[Attribute];
+  protected getOptionsProp<
+    Options extends ClientOptions['options'],
+    Attribute extends keyof Options,
+    DefaultValue extends Options[Attribute] = Options[Attribute],
+  >(
+    obj: Options,
+    prop: Attribute,
+    defaultValue: DefaultValue = undefined as DefaultValue,
+  ) {
+    return obj && prop in obj ? (obj as any)[prop] : defaultValue;
   }
 
   protected normalizePattern(pattern: MsPattern): string {
@@ -142,7 +251,7 @@ export abstract class ClientProxy {
           | MqttOptions['options']
           | TcpClientOptions['options']
           | RmqOptions['options']
-          | KafkaOptions['options']).serializer) ||
+          | KafkaOptions['options'])!.serializer) ||
       new IdentitySerializer();
   }
 
@@ -155,7 +264,7 @@ export abstract class ClientProxy {
           | MqttOptions['options']
           | TcpClientOptions['options']
           | RmqOptions['options']
-          | KafkaOptions['options']).deserializer) ||
+          | KafkaOptions['options'])!.deserializer) ||
       new IncomingResponseDeserializer();
   }
 }

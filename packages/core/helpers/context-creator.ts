@@ -1,6 +1,7 @@
-import { Controller } from '@nestjs/common/interfaces';
-import { STATIC_CONTEXT } from '../injector/constants';
-import { ContextId } from '../injector/instance-wrapper';
+import { STATIC_CONTEXT } from '../injector/constants.js';
+import { ContextId, InstanceWrapper } from '../injector/instance-wrapper.js';
+import { getClassRef } from './class-ref-registry.js';
+import { type Controller, isFunction } from '@nestjs/common/internal';
 
 export abstract class ContextCreator {
   public abstract createConcreteContext<T extends any[], R extends any[]>(
@@ -27,7 +28,7 @@ export abstract class ContextCreator {
     const methodMetadata = this.reflectMethodMetadata<T>(callback, metadataKey);
     return [
       ...this.createConcreteContext<T, R>(
-        globalMetadata || ([] as T),
+        globalMetadata || ([] as unknown[] as T),
         contextId,
         inquirerId,
       ),
@@ -41,8 +42,7 @@ export abstract class ContextCreator {
   }
 
   public reflectClassMetadata<T>(instance: Controller, metadataKey: string): T {
-    const prototype = Object.getPrototypeOf(instance);
-    return Reflect.getMetadata(metadataKey, prototype.constructor);
+    return Reflect.getMetadata(metadataKey, getClassRef(instance));
   }
 
   public reflectMethodMetadata<T>(
@@ -50,5 +50,42 @@ export abstract class ContextCreator {
     metadataKey: string,
   ): T {
     return Reflect.getMetadata(metadataKey, callback);
+  }
+
+  /**
+   * Returns the enhancer to run for one bound as a class: the instance that
+   * the container holds for it. The class itself is used only when that
+   * instance doesn't implement the method and the class has a static one of
+   * that name, so a static method no longer takes the place of the instance.
+   */
+  protected pickEnhancer<T extends object>(
+    metatype: Function,
+    instance: T | null | undefined,
+    methodKey: keyof T,
+  ): T | null {
+    if (instance && isFunction(instance[methodKey])) {
+      return instance;
+    }
+    if (isFunction((metatype as unknown as T)[methodKey])) {
+      return metatype as unknown as T;
+    }
+    return instance ?? null;
+  }
+
+  protected getContextId(
+    contextId: ContextId,
+    instanceWrapper: InstanceWrapper,
+  ): ContextId {
+    return contextId.getParent
+      ? contextId.getParent({
+          token: instanceWrapper.token,
+          // A transient instance belongs to the consumer it was created for,
+          // which is not necessarily durable, so it is never shared through
+          // a durable sub-tree
+          isTreeDurable:
+            !instanceWrapper.isTransient &&
+            instanceWrapper.isDependencyTreeDurable(),
+        })
+      : contextId;
   }
 }

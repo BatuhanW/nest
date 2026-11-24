@@ -1,8 +1,12 @@
-import { JsonSocket } from '../helpers';
-import { BaseRpcContext } from './base-rpc.context';
+import { TcpSocket } from '../helpers/index.js';
+import { PacketMetadata } from '../interfaces/packet.interface.js';
+import { BaseRpcContext } from './base-rpc.context.js';
 
-type TcpContextArgs = [JsonSocket, string];
+type TcpContextArgs = [TcpSocket, string, PacketMetadata?];
 
+/**
+ * @publicApi
+ */
 export class TcpContext extends BaseRpcContext<TcpContextArgs> {
   constructor(args: TcpContextArgs) {
     super(args);
@@ -20,5 +24,12 @@ export class TcpContext extends BaseRpcContext<TcpContextArgs> {
    */
   getPattern() {
     return this.args[1];
+  }
+
+  /**
+   * Returns the metadata the client attached to the packet, if any.
+   */
+  getMetadata(): PacketMetadata | undefined {
+    return this.args[2];
   }
 }

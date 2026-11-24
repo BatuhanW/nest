@@ -1,47 +1,83 @@
-import {
-  CUSTOM_ROUTE_AGRS_METADATA,
-  PARAMTYPES_METADATA,
-} from '@nestjs/common/constants';
-import {
+import type {
+  ArgumentMetadata,
   ContextType,
-  Controller,
   PipeTransform,
-} from '@nestjs/common/interfaces';
-import { isEmpty } from '@nestjs/common/utils/shared.utils';
-import { FORBIDDEN_MESSAGE } from '@nestjs/core/guards/constants';
-import { GuardsConsumer } from '@nestjs/core/guards/guards-consumer';
-import { GuardsContextCreator } from '@nestjs/core/guards/guards-context-creator';
+  PreRequestHook,
+} from '@nestjs/common';
+import {
+  type Controller,
+  CUSTOM_ROUTE_ARGS_METADATA,
+  isEmptyArray,
+  isObject,
+  PARAMTYPES_METADATA,
+} from '@nestjs/common/internal';
+import type { ApplicationConfig, ContextId } from '@nestjs/core';
 import {
   ContextUtils,
-  ParamProperties,
-} from '@nestjs/core/helpers/context-utils';
-import { ExecutionContextHost } from '@nestjs/core/helpers/execution-context-host';
-import { HandlerMetadataStorage } from '@nestjs/core/helpers/handler-metadata-storage';
-import { ParamsMetadata } from '@nestjs/core/helpers/interfaces';
-import { STATIC_CONTEXT } from '@nestjs/core/injector/constants';
-import { InterceptorsConsumer } from '@nestjs/core/interceptors/interceptors-consumer';
-import { InterceptorsContextCreator } from '@nestjs/core/interceptors/interceptors-context-creator';
-import { PipesConsumer } from '@nestjs/core/pipes/pipes-consumer';
-import { PipesContextCreator } from '@nestjs/core/pipes/pipes-context-creator';
-import { Observable } from 'rxjs';
-import { PARAM_ARGS_METADATA } from '../constants';
-import { RpcException } from '../exceptions';
-import { RpcParamsFactory } from '../factories/rpc-params-factory';
-import { ExceptionFiltersContext } from './exception-filters-context';
-import { DEFAULT_CALLBACK_METADATA } from './rpc-metadata-constants';
-import { RpcProxy } from './rpc-proxy';
+  type ExecutionContextHost,
+  FORBIDDEN_MESSAGE,
+  type GuardsConsumer,
+  type GuardsContextCreator,
+  HandlerMetadataStorage,
+  type InterceptorsConsumer,
+  type InterceptorsContextCreator,
+  type ParamProperties,
+  type ParamsMetadata,
+  type PipesConsumer,
+  type PipesContextCreator,
+  STATIC_CONTEXT,
+} from '@nestjs/core/internal';
+import { defer, isObservable, Observable, ReplaySubject, Subject } from 'rxjs';
+import { PARAM_ARGS_METADATA } from '../constants.js';
+import { RpcException } from '../exceptions/index.js';
+import { RpcParamsFactory } from '../factories/rpc-params-factory.js';
+import { ExceptionFiltersContext } from './exception-filters-context.js';
+import { DEFAULT_CALLBACK_METADATA } from './rpc-metadata-constants.js';
+import { RpcProxy } from './rpc-proxy.js';
+
+/**
+ * Notifiers that emit once the handler itself has returned (or resolved to)
+ * an Observable, keyed by the context (the second argument) it was called
+ * with. Only kept when interceptors or pre-request hooks hand back an
+ * Observable in place of its result.
+ */
+const handlerObservableNotifiers = new WeakMap<object, Subject<void>>();
+
+/**
+ * Returns a notifier that emits once the handler called with `context` has
+ * returned (or resolved to) an Observable. Returns `undefined` when the
+ * result of the handler is not wrapped by interceptors or pre-request hooks,
+ * which leaves the caller to look at it directly.
+ */
+export function getHandlerObservableNotifier(
+  context: unknown,
+): Observable<void> | undefined {
+  return isObject(context)
+    ? handlerObservableNotifiers.get(context)
+    : undefined;
+}
 
 type RpcParamProperties = ParamProperties & { metatype?: any };
 export interface RpcHandlerMetadata {
   argsLength: number;
   paramtypes: any[];
-  getParamsMetadata: (moduleKey: string) => RpcParamProperties[];
+  getParamsMetadata: (
+    moduleKey: string,
+    contextId?: ContextId,
+    inquirerId?: string,
+  ) => RpcParamProperties[];
 }
+
+const isThenable = (value: unknown): value is PromiseLike<unknown> =>
+  value !== null &&
+  (typeof value === 'object' || typeof value === 'function') &&
+  typeof (value as PromiseLike<unknown>).then === 'function';
 
 export class RpcContextCreator {
   private readonly contextUtils = new ContextUtils();
   private readonly rpcParamsFactory = new RpcParamsFactory();
-  private readonly handlerMetadataStorage = new HandlerMetadataStorage<RpcHandlerMetadata>();
+  private readonly handlerMetadataStorage =
+    new HandlerMetadataStorage<RpcHandlerMetadata>();
 
   constructor(
     private readonly rpcProxy: RpcProxy,
@@ -52,16 +88,18 @@ export class RpcContextCreator {
     private readonly guardsConsumer: GuardsConsumer,
     private readonly interceptorsContextCreator: InterceptorsContextCreator,
     private readonly interceptorsConsumer: InterceptorsConsumer,
+    private readonly applicationConfig?: ApplicationConfig,
   ) {}
 
   public create<T extends ParamsMetadata = ParamsMetadata>(
     instance: Controller,
     callback: (...args: unknown[]) => Observable<any>,
-    module: string,
+    moduleKey: string,
     methodName: string,
     contextId = STATIC_CONTEXT,
     inquirerId?: string,
     defaultCallMetadata: Record<string, any> = DEFAULT_CALLBACK_METADATA,
+    reportUnhandledErrors = false,
   ): (...args: any[]) => Promise<Observable<any>> {
     const contextType: ContextType = 'rpc';
     const { argsLength, paramtypes, getParamsMetadata } = this.getMetadata<T>(
@@ -74,36 +112,44 @@ export class RpcContextCreator {
     const exceptionHandler = this.exceptionFiltersContext.create(
       instance,
       callback,
-      module,
+      moduleKey,
       contextId,
       inquirerId,
     );
     const pipes = this.pipesContextCreator.create(
       instance,
       callback,
-      module,
+      moduleKey,
       contextId,
       inquirerId,
     );
     const guards = this.guardsContextCreator.create(
       instance,
       callback,
-      module,
+      moduleKey,
       contextId,
       inquirerId,
     );
     const interceptors = this.interceptorsContextCreator.create(
       instance,
       callback,
-      module,
+      moduleKey,
       contextId,
       inquirerId,
     );
 
-    const paramsMetadata = getParamsMetadata(module);
+    const paramsMetadata = getParamsMetadata(moduleKey, contextId, inquirerId);
     const paramsOptions = paramsMetadata
       ? this.contextUtils.mergeParamsMetatypes(paramsMetadata, paramtypes)
       : [];
+    // Optional call, as an older "@nestjs/core" may not implement it
+    this.contextUtils.warnOnMissingParamtypes?.(
+      instance,
+      methodName,
+      paramtypes,
+      pipes,
+      paramsOptions,
+    );
     const fnApplyPipes = this.createPipesFn(pipes, paramsOptions);
 
     const fnCanActivate = this.createGuardsFn(
@@ -113,27 +159,84 @@ export class RpcContextCreator {
       contextType,
     );
 
-    const handler = (initialArgs: unknown[], args: unknown[]) => async () => {
-      if (fnApplyPipes) {
-        await fnApplyPipes(initialArgs, ...args);
-        return callback.apply(instance, initialArgs);
-      }
-      return callback.apply(instance, args);
-    };
+    const handler =
+      (
+        initialArgs: unknown[],
+        args: unknown[],
+        handlerObservable$?: Subject<void>,
+      ) =>
+      async () => {
+        const pendingPipes = fnApplyPipes && fnApplyPipes(initialArgs, ...args);
+        pendingPipes && (await pendingPipes);
+        const result = callback.apply(
+          instance,
+          fnApplyPipes ? initialArgs : args,
+        );
+        handlerObservable$ &&
+          this.notifyIfObservable(result, handlerObservable$);
+        return result;
+      };
 
-    return this.rpcProxy.create(async (...args: unknown[]) => {
+    const preRequestHooks =
+      this.applicationConfig?.getGlobalPreRequestHooks() ?? [];
+    // Interceptors and pre-request hooks always hand back an Observable, so
+    // whether the handler itself returned one can only be observed where it
+    // runs. Transports read it with "getHandlerObservableNotifier".
+    const isResultWrapped =
+      !isEmptyArray(interceptors) || preRequestHooks.length > 0;
+
+    const targetCallback = async (...args: unknown[]) => {
       const initialArgs = this.contextUtils.createNullArray(argsLength);
-      fnCanActivate && (await fnCanActivate(args));
+      const handlerObservable$ = isResultWrapped
+        ? this.attachHandlerObservableNotifier(args[1])
+        : undefined;
 
-      return this.interceptorsConsumer.intercept(
-        interceptors,
-        args,
+      const executePipeline = async () => {
+        fnCanActivate && (await fnCanActivate(args));
+        return this.interceptorsConsumer.intercept(
+          interceptors,
+          args,
+          instance,
+          callback,
+          handler(initialArgs, args, handlerObservable$),
+          contextType,
+        ) as Promise<Observable<unknown>>;
+      };
+
+      if (preRequestHooks.length === 0) {
+        return executePipeline();
+      }
+
+      // The context factory resolves the class through the class-ref
+      // registry, as the guards and interceptors do
+      const executionContext = this.contextUtils.getContextFactory(
+        contextType,
         instance,
         callback,
-        handler(initialArgs, args),
-        contextType,
-      ) as Promise<Observable<unknown>>;
-    }, exceptionHandler);
+      )(args);
+
+      // With no interceptors registered, `InterceptorsConsumer#intercept`
+      // resolves to whatever the handler returned rather than to an observable,
+      // so the result has to be wrapped rather than merged.
+      // `InterceptorsConsumer#transformDeferred` does exactly that, and also
+      // skips subscribing the producer once the consumer has unsubscribed.
+      const pipelineObs: Observable<unknown> = defer(() =>
+        this.interceptorsConsumer.transformDeferred(executePipeline),
+      );
+
+      let index = 0;
+      const next = (): Observable<unknown> => {
+        if (index >= preRequestHooks.length) return pipelineObs;
+        return preRequestHooks[index++](executionContext, next);
+      };
+
+      return next();
+    };
+    return this.rpcProxy.create(
+      targetCallback,
+      exceptionHandler,
+      reportUnhandledErrors,
+    );
   }
 
   public reflectCallbackParamtypes(
@@ -191,13 +294,19 @@ export class RpcContextCreator {
       instance,
       instance[methodName],
     );
-    const getParamsMetadata = (moduleKey: string) =>
+    const getParamsMetadata = (
+      moduleKey: string,
+      contextId = STATIC_CONTEXT,
+      inquirerId?: string,
+    ) =>
       this.exchangeKeysForValues(
         keys,
         metadata,
         moduleKey,
         this.rpcParamsFactory,
         contextFactory,
+        contextId,
+        inquirerId,
       );
 
     const handlerMetadata: RpcHandlerMetadata = {
@@ -215,69 +324,162 @@ export class RpcContextCreator {
     moduleContext: string,
     paramsFactory: RpcParamsFactory,
     contextFactory: (args: unknown[]) => ExecutionContextHost,
+    contextId = STATIC_CONTEXT,
+    inquirerId?: string,
   ): ParamProperties[] {
     this.pipesContextCreator.setModuleContext(moduleContext);
 
     return keys.map(key => {
-      const { index, data, pipes: pipesCollection } = metadata[key];
+      const { index, data, pipes: pipesCollection, schema } = metadata[key];
       const pipes = this.pipesContextCreator.createConcreteContext(
         pipesCollection,
+        contextId,
+        inquirerId,
       );
       const type = this.contextUtils.mapParamType(key);
 
-      if (key.includes(CUSTOM_ROUTE_AGRS_METADATA)) {
+      if (key.includes(CUSTOM_ROUTE_ARGS_METADATA)) {
         const { factory } = metadata[key];
         const customExtractValue = this.contextUtils.getCustomFactory(
           factory,
           data,
           contextFactory,
         );
-        return { index, extractValue: customExtractValue, type, data, pipes };
+        return {
+          index,
+          extractValue: customExtractValue,
+          type,
+          data,
+          pipes,
+          schema,
+        };
       }
       const numericType = Number(type);
       const extractValue = (...args: unknown[]) =>
-        paramsFactory.exchangeKeyForValue(numericType, args);
+        paramsFactory.exchangeKeyForValue(numericType, data, args);
 
-      return { index, extractValue, type: numericType, data, pipes };
+      return { index, extractValue, type: numericType, data, pipes, schema };
     });
   }
 
   public createPipesFn(
     pipes: PipeTransform[],
     paramsOptions: (ParamProperties & { metatype?: unknown })[],
-  ) {
-    const pipesFn = async (args: unknown[], ...params: unknown[]) => {
-      const resolveParamValue = async (
-        param: ParamProperties & { metatype?: unknown },
-      ) => {
-        const {
-          index,
-          extractValue,
-          type,
-          data,
-          metatype,
-          pipes: paramPipes,
-        } = param;
-        const value = extractValue(...params);
+  ):
+    | ((args: unknown[], ...params: unknown[]) => Promise<unknown> | undefined)
+    | null {
+    if (!paramsOptions.length) {
+      return null;
+    }
+    // Which pipes a param runs through is fixed for the handler, so it is
+    // worked out once here rather than on every call.
+    const params = paramsOptions.map(
+      ({
+        index,
+        extractValue,
+        type,
+        data,
+        metatype,
+        pipes: paramPipes,
+        schema,
+      }) => ({
+        index,
+        extractValue,
+        metadata: { metatype, type, data, schema } as ArgumentMetadata,
+        pipes: pipes.concat(paramPipes),
+      }),
+    );
 
-        args[index] = await this.getParamValue(
-          value,
-          { metatype, type, data },
-          pipes.concat(paramPipes),
-        );
-      };
-      await Promise.all(paramsOptions.map(resolveParamValue));
+    const applyPipes = async (
+      args: unknown[],
+      param: (typeof params)[number],
+      value: unknown,
+    ) => {
+      args[param.index] = await this.getParamValue(
+        value,
+        param.metadata,
+        param.pipes,
+      );
     };
-    return paramsOptions.length ? pipesFn : null;
+
+    const settle = async (pending: Promise<void>[]) => {
+      try {
+        await Promise.all(pending);
+      } catch (err) {
+        // The pipes of the other parameters are still running. Answering now
+        // would let the transport take the message as handled while their
+        // work goes on, so a client could have any number of them running by
+        // sending messages that fail fast.
+        await Promise.allSettled(pending);
+        throw err;
+      }
+    };
+
+    return (args: unknown[], ...extractArgs: unknown[]) => {
+      // A value no pipe runs on is final once extracted and needs no promise,
+      // unless it is a thenable, which getParamValue() has always settled.
+      // The rest, and any extractor that throws, go through one
+      // Promise.all() in param order, as before.
+      let pending: Promise<void>[] | undefined;
+      for (let i = 0; i < params.length; i++) {
+        const param = params[i];
+        try {
+          const value = param.extractValue(...extractArgs);
+          if (param.pipes.length > 0 || isThenable(value)) {
+            (pending ??= []).push(applyPipes(args, param, value));
+          } else {
+            args[param.index] = value;
+          }
+        } catch (err) {
+          (pending ??= []).push(Promise.reject(err));
+        }
+      }
+      return pending && settle(pending);
+    };
   }
 
   public async getParamValue<T>(
     value: T,
-    { metatype, type, data }: { metatype: any; type: any; data: any },
+    metadata: ArgumentMetadata,
     pipes: PipeTransform[],
   ): Promise<any> {
-    return isEmpty(pipes)
+    return isEmptyArray(pipes)
       ? value
-      : this.pipesConsumer.apply(value, { metatype, type, data }, pipes);
+      : this.pipesConsumer.apply(value, metadata, pipes);
+  }
+
+  /**
+   * Returns the notifier of the context, which all the handlers called with
+   * it share (e.g. the event handlers of one pattern).
+   */
+  private attachHandlerObservableNotifier(
+    context: unknown,
+  ): Subject<void> | undefined {
+    if (!isObject(context)) {
+      return undefined;
+    }
+    let handlerObservable$ = handlerObservableNotifiers.get(context);
+    if (!handlerObservable$) {
+      handlerObservable$ = new ReplaySubject<void>(1);
+      handlerObservableNotifiers.set(context, handlerObservable$);
+    }
+    return handlerObservable$;
+  }
+
+  private notifyIfObservable(
+    result: unknown,
+    handlerObservable$: Subject<void>,
+  ) {
+    if (isObservable(result)) {
+      handlerObservable$.next();
+    } else if (result instanceof Promise) {
+      // Only native promises are observed: calling `then()` on an arbitrary
+      // thenable (e.g. a lazy query builder) could repeat its side effects.
+      // This extra reaction leaves the handler's own promise chain untouched.
+      result.then(
+        value => isObservable(value) && handlerObservable$.next(),
+        () => undefined,
+      );
+    }
   }
 }

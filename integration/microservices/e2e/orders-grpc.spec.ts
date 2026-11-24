@@ -1,22 +1,22 @@
+import * as GRPC from '@grpc/grpc-js';
 import * as ProtoLoader from '@grpc/proto-loader';
 import { INestApplication } from '@nestjs/common';
-import { Transport } from '@nestjs/microservices';
+import { MicroserviceOptions, Transport } from '@nestjs/microservices';
 import { ExpressAdapter } from '@nestjs/platform-express';
 import { Test } from '@nestjs/testing';
 import { fail } from 'assert';
-import { expect } from 'chai';
-import * as express from 'express';
-import * as GRPC from 'grpc';
+import express from 'express';
 import { join } from 'path';
-import * as request from 'supertest';
-import { AdvancedGrpcController } from '../src/grpc-advanced/advanced.grpc.controller';
+import request from 'supertest';
+import { AdvancedGrpcController } from '../src/grpc-advanced/advanced.grpc.controller.js';
+import { listenOnLoopback } from '../../_support/listen-on-loopback.js';
 
 describe('Advanced GRPC transport', () => {
   let server;
   let app: INestApplication;
   let client: any;
 
-  before(async () => {
+  beforeAll(async () => {
     const module = await Test.createTestingModule({
       controllers: [AdvancedGrpcController],
     }).compile();
@@ -26,24 +26,26 @@ describe('Advanced GRPC transport', () => {
     /*
      *  Create microservice configuration
      */
-    app.connectMicroservice({
+    app.connectMicroservice<MicroserviceOptions>({
       transport: Transport.GRPC,
       options: {
         url: 'localhost:5001',
         package: 'proto_example',
         protoPath: 'root.proto',
         loader: {
-          includeDirs: [join(__dirname, '../src/grpc-advanced/proto')],
+          includeDirs: [
+            join(import.meta.dirname, '../src/grpc-advanced/proto'),
+          ],
           keepCase: true,
         },
       },
     });
     // Start gRPC microservice
-    await app.startAllMicroservicesAsync();
-    await app.init();
+    await app.startAllMicroservices();
+    await listenOnLoopback(app);
     // Load proto-buffers for test gRPC dispatch
     const proto = ProtoLoader.loadSync('root.proto', {
-      includeDirs: [join(__dirname, '../src/grpc-advanced/proto')],
+      includeDirs: [join(import.meta.dirname, '../src/grpc-advanced/proto')],
     }) as any;
     // Create Raw gRPC client object
     const protoGRPC = GRPC.loadPackageDefinition(proto) as any;
@@ -93,8 +95,8 @@ describe('Advanced GRPC transport', () => {
         },
         (err, result) => {
           // Compare results
-          expect(err).to.be.null;
-          expect(result).to.eql({
+          expect(err).toBeNull();
+          expect(result).toEqual({
             id: 1,
             itemTypes: [1],
             shipmentType: {
@@ -115,12 +117,12 @@ describe('Advanced GRPC transport', () => {
 
     // Get Set-Cookie from Metadata
     callHandler.on('metadata', (metadata: GRPC.Metadata) => {
-      expect(metadata.get('Set-Cookie')[0]).to.eq('test_cookie=abcd');
+      expect(metadata.get('Set-Cookie')[0]).toBe('test_cookie=abcd');
     });
 
     callHandler.on('data', (msg: number) => {
       // Do deep comparison (to.eql)
-      expect(msg).to.eql({
+      expect(msg).toEqual({
         id: 1,
         itemTypes: [1],
         shipmentType: {
@@ -134,7 +136,7 @@ describe('Advanced GRPC transport', () => {
     callHandler.on('error', (err: any) => {
       // We want to fail only on real errors while Cancellation error
       // is expected
-      if (String(err).toLowerCase().indexOf('cancelled') === -1) {
+      if (!String(err).toLowerCase().includes('cancelled')) {
         fail('gRPC Stream error happened, error: ' + err);
       }
     });
@@ -152,7 +154,7 @@ describe('Advanced GRPC transport', () => {
 
     callHandler.on('data', (msg: number) => {
       // Do deep comparison (to.eql)
-      expect(msg).to.eql({
+      expect(msg).toEqual({
         id: 1,
         itemTypes: [1],
         shipmentType: {
@@ -166,7 +168,7 @@ describe('Advanced GRPC transport', () => {
     callHandler.on('error', (err: any) => {
       // We want to fail only on real errors while Cancellation error
       // is expected
-      if (String(err).toLowerCase().indexOf('cancelled') === -1) {
+      if (!String(err).toLowerCase().includes('cancelled')) {
         fail('gRPC Stream error happened, error: ' + err);
       }
     });
@@ -184,7 +186,7 @@ describe('Advanced GRPC transport', () => {
       if (err) {
         throw err;
       }
-      expect(res).to.eql({
+      expect(res).toEqual({
         id: 1,
         itemTypes: [1],
         shipmentType: {
@@ -208,7 +210,7 @@ describe('Advanced GRPC transport', () => {
       if (err) {
         throw err;
       }
-      expect(res).to.eql({
+      expect(res).toEqual({
         id: 1,
         itemTypes: [1],
         shipmentType: {

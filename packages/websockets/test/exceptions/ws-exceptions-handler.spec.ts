@@ -1,62 +1,446 @@
-import { ExecutionContextHost } from '@nestjs/core/helpers/execution-context-host';
-import { expect } from 'chai';
-import * as sinon from 'sinon';
-import { WsException } from '../../errors/ws-exception';
-import { WsExceptionsHandler } from '../../exceptions/ws-exceptions-handler';
+import { ExecutionContextHost } from '@nestjs/core/helpers/execution-context-host.js';
+import { WsException } from '../../errors/ws-exception.js';
+import { WsExceptionsHandler } from '../../exceptions/ws-exceptions-handler.js';
 
 describe('WsExceptionsHandler', () => {
   let handler: WsExceptionsHandler;
-  let emitStub: sinon.SinonStub;
-  let client;
+  let emitStub: ReturnType<typeof vi.fn>;
+  let client: {
+    emit: ReturnType<typeof vi.fn>;
+  };
+  let pattern: string;
+  let data: unknown;
+  let executionContextHost: ExecutionContextHost;
 
   beforeEach(() => {
     handler = new WsExceptionsHandler();
-    emitStub = sinon.stub();
+    emitStub = vi.fn();
     client = {
       emit: emitStub,
     };
-    client.emit.returns(client);
+    pattern = 'test';
+    data = { foo: 'bar' };
+    executionContextHost = new ExecutionContextHost([client, data, pattern]);
+
+    client.emit.mockReturnValue(client);
   });
 
   describe('handle', () => {
-    it('should method emit expected status code message when exception is unknown', () => {
-      handler.handle(new Error(), new ExecutionContextHost([client]));
-      expect(
-        emitStub.calledWith('exception', {
+    describe('when "includeCause" is set to true (default)', () => {
+      it('should method emit expected status code message when exception is unknown', () => {
+        handler.handle(new Error(), executionContextHost);
+        expect(emitStub).toHaveBeenCalledWith('exception', {
           status: 'error',
           message: 'Internal server error',
-        }),
-      ).to.be.true;
-    });
-    describe('when exception is instance of WsException', () => {
-      it('should method emit expected status and json object', () => {
-        const message = {
-          custom: 'Unauthorized',
-        };
-        handler.handle(
-          new WsException(message),
-          new ExecutionContextHost([client]),
-        );
-        expect(emitStub.calledWith('exception', message)).to.be.true;
+          cause: {
+            pattern,
+            data,
+          },
+        });
       });
-      it('should method emit expected status and transform message to json', () => {
+      describe('when exception is instance of WsException', () => {
+        it('should method emit expected status and json object', () => {
+          const message = {
+            custom: 'Unauthorized',
+          };
+          handler.handle(new WsException(message), executionContextHost);
+          expect(emitStub).toHaveBeenCalledWith('exception', message);
+        });
+        it('should method emit expected status and transform message to json', () => {
+          const message = 'Unauthorized';
+
+          handler.handle(new WsException(message), executionContextHost);
+          expect(emitStub).toHaveBeenCalledWith('exception', {
+            message,
+            status: 'error',
+            cause: {
+              pattern,
+              data,
+            },
+          });
+        });
+        it('should emit the unknown error payload and log the error when it holds an error', () => {
+          const loggerErrorSpy = vi
+            .spyOn((WsExceptionsHandler as any).logger, 'error')
+            .mockImplementation(() => undefined);
+          const error = Object.assign(new Error('Request failed'), {
+            config: { headers: { Authorization: 'Bearer secret' } },
+          });
+
+          handler.handle(new WsException(error), executionContextHost);
+          expect(emitStub).toHaveBeenCalledWith('exception', {
+            status: 'error',
+            message: 'Internal server error',
+            cause: {
+              pattern,
+              data,
+            },
+          });
+          expect(loggerErrorSpy).toHaveBeenCalledWith(error);
+          loggerErrorSpy.mockRestore();
+        });
+      });
+    });
+
+    describe('when "includeCause" is set to false', () => {
+      beforeEach(() => {
+        handler = new WsExceptionsHandler({ includeCause: false });
+      });
+
+      it('should method emit expected status code message when exception is unknown', () => {
+        handler.handle(
+          new Error(),
+          new ExecutionContextHost([client, pattern, data]),
+        );
+        expect(emitStub).toHaveBeenCalledWith('exception', {
+          status: 'error',
+          message: 'Internal server error',
+        });
+      });
+      describe('when exception is instance of WsException', () => {
+        it('should method emit expected status and json object', () => {
+          const message = {
+            custom: 'Unauthorized',
+          };
+          handler.handle(new WsException(message), executionContextHost);
+          expect(emitStub).toHaveBeenCalledWith('exception', message);
+        });
+        it('should method emit expected status and transform message to json', () => {
+          const message = 'Unauthorized';
+
+          handler.handle(new WsException(message), executionContextHost);
+          expect(emitStub).toHaveBeenCalledWith('exception', {
+            message,
+            status: 'error',
+          });
+        });
+      });
+    });
+
+    describe('when client uses "send" instead of "emit" (native WebSocket)', () => {
+      let sendStub: ReturnType<typeof vi.fn>;
+      let wsClient: { send: ReturnType<typeof vi.fn>; readyState: number };
+      let wsExecutionContextHost: ExecutionContextHost;
+
+      beforeEach(() => {
+        handler = new WsExceptionsHandler();
+        sendStub = vi.fn();
+        wsClient = { send: sendStub, readyState: 1 };
+        wsExecutionContextHost = new ExecutionContextHost([
+          wsClient,
+          data,
+          pattern,
+        ]);
+      });
+
+      it('should send JSON-stringified error via "send" when exception is unknown', () => {
+        handler.handle(new Error(), wsExecutionContextHost);
+        expect(sendStub).toHaveBeenCalledTimes(1);
+        const sent = JSON.parse(sendStub.mock.calls[0][0]);
+        expect(sent).toEqual({
+          event: 'exception',
+          data: {
+            status: 'error',
+            message: 'Internal server error',
+            cause: {
+              pattern,
+              data,
+            },
+          },
+        });
+      });
+
+      it('should send JSON-stringified error via "send" for WsException with object', () => {
+        const message = { custom: 'Unauthorized' };
+        handler.handle(new WsException(message), wsExecutionContextHost);
+        expect(sendStub).toHaveBeenCalledTimes(1);
+        const sent = JSON.parse(sendStub.mock.calls[0][0]);
+        expect(sent).toEqual({
+          event: 'exception',
+          data: message,
+        });
+      });
+
+      it('should send the unknown error payload via "send" for WsException with error', () => {
+        const loggerErrorSpy = vi
+          .spyOn((WsExceptionsHandler as any).logger, 'error')
+          .mockImplementation(() => undefined);
+        const error = Object.assign(new Error('Request failed'), {
+          config: { headers: { Authorization: 'Bearer secret' } },
+        });
+        handler.handle(new WsException(error), wsExecutionContextHost);
+        expect(sendStub).toHaveBeenCalledTimes(1);
+        const sent = JSON.parse(sendStub.mock.calls[0][0]);
+        expect(sent).toEqual({
+          event: 'exception',
+          data: {
+            status: 'error',
+            message: 'Internal server error',
+            cause: {
+              pattern,
+              data,
+            },
+          },
+        });
+        loggerErrorSpy.mockRestore();
+      });
+
+      it('should send JSON-stringified error via "send" for WsException with string', () => {
         const message = 'Unauthorized';
+        handler.handle(new WsException(message), wsExecutionContextHost);
+        expect(sendStub).toHaveBeenCalledTimes(1);
+        const sent = JSON.parse(sendStub.mock.calls[0][0]);
+        expect(sent).toEqual({
+          event: 'exception',
+          data: {
+            message,
+            status: 'error',
+            cause: {
+              pattern,
+              data,
+            },
+          },
+        });
+      });
+
+      describe('when "includeCause" is set to false', () => {
+        beforeEach(() => {
+          handler = new WsExceptionsHandler({ includeCause: false });
+        });
+
+        it('should send error without cause via "send"', () => {
+          const message = 'Unauthorized';
+          handler.handle(new WsException(message), wsExecutionContextHost);
+          expect(sendStub).toHaveBeenCalledTimes(1);
+          const sent = JSON.parse(sendStub.mock.calls[0][0]);
+          expect(sent).toEqual({
+            event: 'exception',
+            data: {
+              message,
+              status: 'error',
+            },
+          });
+        });
+      });
+    });
+
+    describe('when the data of the message holds binary data', () => {
+      const binaryData = {
+        file: { name: 'a.png', content: Buffer.from('image') },
+        chunks: [new Uint8Array(4), new ArrayBuffer(4)],
+      };
+      const hostWithData = (data: unknown) =>
+        new ExecutionContextHost([client, data, pattern]);
+      let loggerErrorSpy: ReturnType<typeof vi.spyOn>;
+      beforeEach(() => {
+        loggerErrorSpy = vi
+          .spyOn((WsExceptionsHandler as any).logger, 'error')
+          .mockImplementation(() => undefined);
+      });
+      afterEach(() => {
+        loggerErrorSpy.mockRestore();
+      });
+
+      it.each([
+        ['a WsException', new WsException('Unauthorized'), 'Unauthorized'],
+        ['an unknown exception', new Error('test'), 'Internal server error'],
+      ])(
+        'should leave the data out of the cause for %s',
+        (_, exception, message) => {
+          handler.handle(exception, hostWithData(binaryData));
+
+          expect(emitStub).toHaveBeenCalledWith('exception', {
+            status: 'error',
+            message,
+            cause: { pattern },
+          });
+        },
+      );
+
+      it.each([
+        ['a Buffer', Buffer.from('x')],
+        ['an ArrayBuffer', new ArrayBuffer(1)],
+        ['a typed array', new Float32Array(1)],
+        ['a DataView', new DataView(new ArrayBuffer(1))],
+        ['a Blob', new Blob(['x'])],
+      ])('should leave out data that is %s', (_, data) => {
+        handler.handle(new WsException('Unauthorized'), hostWithData([data]));
+
+        expect(emitStub.mock.calls[0][1].cause).toEqual({ pattern });
+      });
+
+      it('should look through data nested deeper than the stack allows', () => {
+        let nested: Record<string, unknown> = { content: Buffer.from('x') };
+        for (let depth = 0; depth < 100_000; depth++) {
+          nested = { nested };
+        }
+
+        handler.handle(new WsException('Unauthorized'), hostWithData(nested));
+
+        expect(emitStub.mock.calls[0][1].cause).toEqual({ pattern });
+      });
+
+      it('should keep the data of a message without binary data', () => {
+        const data = { text: 'hello', list: [1, { a: null }] };
+        handler.handle(new WsException('Unauthorized'), hostWithData(data));
+
+        expect(emitStub.mock.calls[0][1].cause).toEqual({ pattern, data });
+      });
+
+      it('should pass the data to a custom "causeFactory" as it is', () => {
+        const causeFactory = vi.fn((pattern: string, data: unknown) => ({
+          pattern,
+          data,
+        }));
+        handler = new WsExceptionsHandler({ causeFactory });
 
         handler.handle(
-          new WsException(message),
-          new ExecutionContextHost([client]),
+          new WsException('Unauthorized'),
+          hostWithData(binaryData),
         );
-        expect(emitStub.calledWith('exception', { message, status: 'error' }))
-          .to.be.true;
+
+        expect(causeFactory).toHaveBeenCalledWith(pattern, binaryData);
       });
     });
+
+    describe('when the error payload cannot be sent with its cause', () => {
+      let loggerErrorSpy: ReturnType<typeof vi.spyOn>;
+      let sendStub: ReturnType<typeof vi.fn>;
+      let wsExecutionContextHost: ExecutionContextHost;
+
+      beforeEach(() => {
+        loggerErrorSpy = vi
+          .spyOn((WsExceptionsHandler as any).logger, 'error')
+          .mockImplementation(() => undefined);
+        sendStub = vi.fn();
+        // JSON.stringify throws on it, as it does on a message nested deeper
+        // than its native recursion allows
+        const unserializableData: Record<string, unknown> = {};
+        unserializableData.self = unserializableData;
+        wsExecutionContextHost = new ExecutionContextHost([
+          { send: sendStub, readyState: 1 },
+          unserializableData,
+          pattern,
+        ]);
+      });
+
+      afterEach(() => {
+        loggerErrorSpy.mockRestore();
+      });
+
+      it('should log an unknown exception and send the error without the cause', () => {
+        const error = new Error('test');
+        handler.handle(error, wsExecutionContextHost);
+
+        expect(loggerErrorSpy).toHaveBeenCalledWith(error);
+        expect(sendStub).toHaveBeenCalledTimes(1);
+        expect(JSON.parse(sendStub.mock.calls[0][0])).toEqual({
+          event: 'exception',
+          data: { status: 'error', message: 'Internal server error' },
+        });
+      });
+
+      it('should send a WsException without the cause', () => {
+        handler.handle(new WsException('Unauthorized'), wsExecutionContextHost);
+
+        expect(loggerErrorSpy).not.toHaveBeenCalled();
+        expect(sendStub).toHaveBeenCalledTimes(1);
+        expect(JSON.parse(sendStub.mock.calls[0][0])).toEqual({
+          event: 'exception',
+          data: { status: 'error', message: 'Unauthorized' },
+        });
+      });
+
+      it('should emit the error again without the cause when "emit" throws', () => {
+        emitStub.mockImplementationOnce(() => {
+          throw new RangeError('Maximum call stack size exceeded');
+        });
+        handler.handle(new WsException('Unauthorized'), executionContextHost);
+
+        expect(emitStub).toHaveBeenCalledTimes(2);
+        expect(emitStub).toHaveBeenLastCalledWith('exception', {
+          status: 'error',
+          message: 'Unauthorized',
+        });
+      });
+
+      it('should log an unknown exception and rethrow when there is no cause to drop', () => {
+        handler = new WsExceptionsHandler({ includeCause: false });
+        const error = new Error('test');
+        const emitError = new Error('emit');
+        emitStub.mockImplementation(() => {
+          throw emitError;
+        });
+
+        expect(() => handler.handle(error, executionContextHost)).toThrow(
+          emitError,
+        );
+        expect(emitStub).toHaveBeenCalledTimes(1);
+        expect(loggerErrorSpy).toHaveBeenCalledWith(error);
+      });
+    });
+
+    describe('when a custom filter catches the exception', () => {
+      it('should return the promise of an asynchronous filter', () => {
+        const pending = Promise.resolve();
+        handler.setCustomFilters([
+          { exceptionMetatypes: [], func: () => pending },
+        ] as any);
+
+        expect(handler.handle(new WsException(''), executionContextHost)).toBe(
+          pending,
+        );
+        expect(emitStub).not.toHaveBeenCalled();
+      });
+
+      it('should return nothing for a synchronous filter', () => {
+        handler.setCustomFilters([
+          { exceptionMetatypes: [], func: () => 'done' },
+        ] as any);
+
+        expect(
+          handler.handle(new WsException(''), executionContextHost),
+        ).toBeUndefined();
+      });
+    });
+
     describe('when "invokeCustomFilters" returns true', () => {
       beforeEach(() => {
-        sinon.stub(handler, 'invokeCustomFilters').returns(true);
+        vi.spyOn(handler, 'invokeCustomFilters').mockReturnValue(true);
       });
       it('should not call `emit`', () => {
-        handler.handle(new WsException(''), new ExecutionContextHost([client]));
-        expect(emitStub.notCalled).to.be.true;
+        handler.handle(new WsException(''), executionContextHost);
+        expect(emitStub).not.toHaveBeenCalled();
+      });
+    });
+  });
+  describe('constructor', () => {
+    describe('when the caller provides an options object', () => {
+      it('should not mutate the options object passed by the caller', () => {
+        const options = {};
+        new WsExceptionsHandler(options);
+        expect(options).toStrictEqual({});
+      });
+
+      it('should not add defaults to the options object passed by the caller', () => {
+        const options = { includeCause: false };
+        new WsExceptionsHandler(options);
+        expect(options).toStrictEqual({ includeCause: false });
+      });
+
+      it('should not throw when the options object passed by the caller is frozen', () => {
+        const options = Object.freeze({ includeCause: false });
+        expect(() => new WsExceptionsHandler(options)).not.toThrow();
+      });
+
+      it('should apply the options to emitted errors', () => {
+        const options = { includeCause: false };
+        const scopedHandler = new WsExceptionsHandler(options);
+        scopedHandler.handle(new Error(), executionContextHost);
+        expect(emitStub).toHaveBeenCalledWith('exception', {
+          status: 'error',
+          message: 'Internal server error',
+        });
       });
     });
   });
@@ -64,24 +448,24 @@ describe('WsExceptionsHandler', () => {
     const filters = ['test', 'test2'];
     it('should set custom filters', () => {
       handler.setCustomFilters(filters as any);
-      expect((handler as any).filters).to.be.eql(filters);
+      expect((handler as any).filters).toEqual(filters);
     });
-    it('should throws exception when passed argument is not an array', () => {
-      expect(() => handler.setCustomFilters(null)).to.throw();
+    it('should throw exception when passed argument is not an array', () => {
+      expect(() => handler.setCustomFilters(null!)).toThrow();
     });
   });
   describe('invokeCustomFilters', () => {
     describe('when filters array is empty', () => {
-      it('should returns false', () => {
-        expect(handler.invokeCustomFilters(null, null)).to.be.false;
+      it('should return false', () => {
+        expect(handler.invokeCustomFilters(null, null!)).toBe(false);
       });
     });
     describe('when filters array is not empty', () => {
-      let filters, funcSpy;
+      let filters: any[], funcSpy: ReturnType<typeof vi.fn>;
       class TestException {}
 
       beforeEach(() => {
-        funcSpy = sinon.spy();
+        funcSpy = vi.fn();
       });
       describe('when filter exists in filters array', () => {
         beforeEach(() => {
@@ -89,29 +473,31 @@ describe('WsExceptionsHandler', () => {
           (handler as any).filters = filters;
         });
         it('should call funcSpy', () => {
-          handler.invokeCustomFilters(new TestException(), null);
-          expect(funcSpy.notCalled).to.be.false;
+          handler.invokeCustomFilters(new TestException(), null!);
+          expect(funcSpy).toHaveBeenCalled();
         });
         it('should call funcSpy with exception and response passed as an arguments', () => {
           const exception = new TestException();
           const res = { foo: 'bar' };
 
           handler.invokeCustomFilters(exception, res as any);
-          expect(funcSpy.calledWith(exception, res)).to.be.true;
+          expect(funcSpy).toHaveBeenCalledWith(exception, res);
         });
-        it('should returns true', () => {
-          expect(handler.invokeCustomFilters(new TestException(), null)).to.be
-            .true;
+        it('should return true', () => {
+          expect(handler.invokeCustomFilters(new TestException(), null!)).toBe(
+            true,
+          );
         });
       });
       describe('when filter does not exists in filters array', () => {
         it('should not call funcSpy', () => {
-          handler.invokeCustomFilters(new TestException(), null);
-          expect(funcSpy.notCalled).to.be.true;
+          handler.invokeCustomFilters(new TestException(), null!);
+          expect(funcSpy).not.toHaveBeenCalled();
         });
-        it('should returns false', () => {
-          expect(handler.invokeCustomFilters(new TestException(), null)).to.be
-            .false;
+        it('should return false', () => {
+          expect(handler.invokeCustomFilters(new TestException(), null!)).toBe(
+            false,
+          );
         });
       });
     });

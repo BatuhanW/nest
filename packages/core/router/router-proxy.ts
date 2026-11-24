@@ -1,11 +1,11 @@
-import { ExceptionsHandler } from '../exceptions/exceptions-handler';
-import { ExecutionContextHost } from '../helpers/execution-context-host';
+import { ExceptionsHandler } from '../exceptions/exceptions-handler.js';
+import { ExecutionContextHost } from '../helpers/execution-context-host.js';
 
 export type RouterProxyCallback = <TRequest, TResponse>(
-  req?: TRequest,
-  res?: TResponse,
-  next?: () => void,
-) => void;
+  req: TRequest,
+  res: TResponse,
+  next: () => void,
+) => void | Promise<void>;
 
 export class RouterProxy {
   public createProxy(
@@ -22,6 +22,7 @@ export class RouterProxy {
       } catch (e) {
         const host = new ExecutionContextHost([req, res, next]);
         exceptionsHandler.next(e, host);
+        return res;
       }
     };
   }
@@ -32,7 +33,7 @@ export class RouterProxy {
       req: TRequest,
       res: TResponse,
       next: () => void,
-    ) => void,
+    ) => void | Promise<void>,
     exceptionsHandler: ExceptionsHandler,
   ) {
     return async <TError, TRequest, TResponse>(
@@ -46,6 +47,7 @@ export class RouterProxy {
       } catch (e) {
         const host = new ExecutionContextHost([req, res, next]);
         exceptionsHandler.next(e, host);
+        return res;
       }
     };
   }

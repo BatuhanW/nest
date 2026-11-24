@@ -4,12 +4,12 @@ import {
   Injectable,
   PipeTransform,
 } from '@nestjs/common';
-import { UsersService } from './users.service';
+import { UsersService } from './users.service.js';
 
 @Injectable()
 export class UserByIdPipe implements PipeTransform<string> {
   static COUNTER = 0;
-  static REQUEST_SCOPED_DATA = [];
+  static REQUEST_SCOPED_DATA = [] as number[];
 
   constructor(
     @Inject('REQUEST_ID') private readonly requestId: number,

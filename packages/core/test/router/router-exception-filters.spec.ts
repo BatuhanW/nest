@@ -1,12 +1,11 @@
-import { expect } from 'chai';
-import * as sinon from 'sinon';
-import { Catch } from '../../../common/decorators/core/catch.decorator';
-import { UseFilters } from '../../../common/decorators/core/exception-filters.decorator';
-import { ApplicationConfig } from '../../application-config';
-import { NestContainer } from '../../injector/container';
-import { InstanceWrapper } from '../../injector/instance-wrapper';
-import { RouterExceptionFilters } from '../../router/router-exception-filters';
-import { NoopHttpAdapter } from '../utils/noop-adapter.spec';
+import { Catch } from '../../../common/decorators/core/catch.decorator.js';
+import { UseFilters } from '../../../common/decorators/core/exception-filters.decorator.js';
+import { Scope } from '../../../common/interfaces/scope-options.interface.js';
+import { ApplicationConfig } from '../../application-config.js';
+import { NestContainer } from '../../injector/container.js';
+import { InstanceWrapper } from '../../injector/instance-wrapper.js';
+import { RouterExceptionFilters } from '../../router/router-exception-filters.js';
+import { NoopHttpAdapter } from '../utils/noop-adapter.js';
 
 describe('RouterExceptionFilters', () => {
   let applicationConfig: ApplicationConfig;
@@ -30,56 +29,86 @@ describe('RouterExceptionFilters', () => {
     describe('when filters metadata is empty', () => {
       class EmptyMetadata {}
       beforeEach(() => {
-        sinon.stub(exceptionFilter, 'createContext').returns([]);
+        vi.spyOn(exceptionFilter, 'createContext').mockReturnValue([]);
       });
-      it('should returns plain ExceptionHandler object', () => {
+      it('should return plain ExceptionHandler object', () => {
         const filter = exceptionFilter.create(
           new EmptyMetadata(),
-          () => ({} as any),
+          () => ({}) as any,
           undefined,
         );
-        expect((filter as any).filters).to.be.empty;
+        expect((filter as any).filters).toHaveLength(0);
       });
     });
     describe('when filters metadata is not empty', () => {
       @UseFilters(new ExceptionFilter())
       class WithMetadata {}
 
-      it('should returns ExceptionHandler object with exception filters', () => {
+      it('should return ExceptionHandler object with exception filters', () => {
         const filter = exceptionFilter.create(
           new WithMetadata(),
-          () => ({} as any),
+          () => ({}) as any,
           undefined,
         );
-        expect((filter as any).filters).to.not.be.empty;
+        expect((filter as any).filters).not.toHaveLength(0);
       });
     });
   });
   describe('reflectCatchExceptions', () => {
-    it('should returns FILTER_CATCH_EXCEPTIONS metadata', () => {
+    it('should return FILTER_CATCH_EXCEPTIONS metadata', () => {
       expect(
         exceptionFilter.reflectCatchExceptions(new ExceptionFilter()),
-      ).to.be.eql([CustomException]);
+      ).toEqual([CustomException]);
     });
   });
   describe('createConcreteContext', () => {
     class InvalidFilter {}
     const filters = [new ExceptionFilter(), new InvalidFilter(), 'test'];
 
-    it('should returns expected exception filters metadata', () => {
+    it('should return expected exception filters metadata', () => {
       const resolved = exceptionFilter.createConcreteContext(filters as any);
-      expect(resolved).to.have.length(1);
-      expect(resolved[0].exceptionMetatypes).to.be.deep.equal([
-        CustomException,
-      ]);
-      expect(resolved[0].func).to.be.a('function');
+      expect(resolved).toHaveLength(1);
+      expect(resolved[0].exceptionMetatypes).toEqual([CustomException]);
+      expect(resolved[0].func).toBeTypeOf('function');
     });
   });
   describe('getGlobalMetadata', () => {
     describe('when contextId is static and inquirerId is nil', () => {
       it('should return global filters', () => {
         const expectedResult = applicationConfig.getGlobalFilters();
-        expect(exceptionFilter.getGlobalMetadata()).to.be.equal(expectedResult);
+        expect(exceptionFilter.getGlobalMetadata()).toBe(expectedResult);
+      });
+
+      it('should warn once that request-scoped and transient global filters are left out', () => {
+        const warnSpy = vi
+          .spyOn((RouterExceptionFilters as any).logger, 'warn')
+          .mockImplementation(() => {});
+        vi.spyOn(applicationConfig, 'getGlobalRequestFilters').mockReturnValue([
+          new InstanceWrapper({ scope: Scope.REQUEST }),
+        ]);
+        // e.g. the one of the middleware module
+        const otherExceptionFilter = new RouterExceptionFilters(
+          new NestContainer(),
+          applicationConfig,
+          new NoopHttpAdapter({}),
+        );
+
+        exceptionFilter.getGlobalMetadata();
+        exceptionFilter.getGlobalMetadata();
+        otherExceptionFilter.getGlobalMetadata();
+
+        expect(warnSpy).toHaveBeenCalledOnce();
+        expect(warnSpy.mock.calls[0][0]).toContain('outside of controllers');
+      });
+
+      it('should not warn without request-scoped or transient global filters', () => {
+        const warnSpy = vi
+          .spyOn((RouterExceptionFilters as any).logger, 'warn')
+          .mockImplementation(() => {});
+
+        exceptionFilter.getGlobalMetadata();
+
+        expect(warnSpy).not.toHaveBeenCalled();
       });
     });
     describe('otherwise', () => {
@@ -89,20 +118,82 @@ describe('RouterExceptionFilters', () => {
         const instance = 'request-scoped';
         const scopedFilterWrappers = [instanceWrapper];
 
-        sinon
-          .stub(applicationConfig, 'getGlobalFilters')
-          .callsFake(() => globalFilters);
-        sinon
-          .stub(applicationConfig, 'getGlobalRequestFilters')
-          .callsFake(() => scopedFilterWrappers);
-        sinon
-          .stub(instanceWrapper, 'getInstanceByContextId')
-          .callsFake(() => ({ instance } as any));
-
-        expect(exceptionFilter.getGlobalMetadata({ id: 3 })).to.contains(
-          instance,
-          ...globalFilters,
+        vi.spyOn(applicationConfig, 'getGlobalFilters').mockImplementation(
+          () => globalFilters,
         );
+        vi.spyOn(
+          applicationConfig,
+          'getGlobalRequestFilters',
+        ).mockImplementation(() => scopedFilterWrappers);
+        vi.spyOn(instanceWrapper, 'getInstanceByContextId').mockImplementation(
+          () => ({ instance }) as any,
+        );
+
+        const result = exceptionFilter.getGlobalMetadata({ id: 3 });
+        expect(result).toEqual(
+          expect.arrayContaining([instance, ...globalFilters]),
+        );
+      });
+    });
+    describe('when a scoped filter has not been instantiated for the request', () => {
+      it('should leave it out', () => {
+        // e.g. behind a request-scoped middleware, which does not
+        // instantiate the global enhancers of controllers
+        const contextId = { id: 4 };
+        const placeholderWrapper = new InstanceWrapper({
+          metatype: ExceptionFilter,
+          scope: Scope.REQUEST,
+          instance: Object.create(ExceptionFilter.prototype),
+        });
+        const constructedWrapper = new InstanceWrapper({
+          metatype: ExceptionFilter,
+          scope: Scope.REQUEST,
+        });
+        const instance = new ExceptionFilter();
+        constructedWrapper.setInstanceByContextId(contextId, {
+          instance,
+          isResolved: true,
+          isConstructorCalled: true,
+        });
+        vi.spyOn(applicationConfig, 'getGlobalFilters').mockReturnValue([]);
+        vi.spyOn(
+          applicationConfig,
+          'getGlobalRequestFilters',
+        ).mockImplementation(() => [placeholderWrapper, constructedWrapper]);
+
+        expect(exceptionFilter.getGlobalMetadata(contextId)).toEqual([
+          instance,
+        ]);
+      });
+    });
+    describe('when a ContextIdStrategy is applied', () => {
+      it('should look up durable filters with the durable context id', () => {
+        const tenantContextId = { id: 2 };
+        const contextId = {
+          id: 3,
+          getParent: info => (info.isTreeDurable ? tenantContextId : contextId),
+        };
+        const durableWrapper = new InstanceWrapper({
+          scope: Scope.REQUEST,
+          durable: true,
+        });
+        const requestWrapper = new InstanceWrapper({ scope: Scope.REQUEST });
+        durableWrapper.setInstanceByContextId(tenantContextId, {
+          instance: 'durable',
+        });
+        requestWrapper.setInstanceByContextId(contextId, {
+          instance: 'request-scoped',
+        });
+
+        vi.spyOn(
+          applicationConfig,
+          'getGlobalRequestFilters',
+        ).mockImplementation(() => [durableWrapper, requestWrapper]);
+
+        expect(exceptionFilter.getGlobalMetadata(contextId)).toEqual([
+          'durable',
+          'request-scoped',
+        ]);
       });
     });
   });

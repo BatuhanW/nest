@@ -1,9 +1,8 @@
-/* eslint-disable @typescript-eslint/no-use-before-define */
-import { EXCEPTION_FILTERS_METADATA } from '../../constants';
-import { ExceptionFilter } from '../../index';
-import { extendArrayMetadata } from '../../utils/extend-metadata.util';
-import { isFunction } from '../../utils/shared.utils';
-import { validateEach } from '../../utils/validate-each.util';
+import { EXCEPTION_FILTERS_METADATA } from '../../constants.js';
+import { ExceptionFilter } from '../../index.js';
+import { extendArrayMetadata } from '../../utils/extend-metadata.util.js';
+import { isFunction } from '../../utils/shared.utils.js';
+import { validateEach } from '../../utils/validate-each.util.js';
 
 /**
  * Decorator that binds exception filters to the scope of the controller or
@@ -40,9 +39,7 @@ function addExceptionFiltersMetadata(
   ) => {
     const isFilterValid = <T extends Function | Record<string, any>>(
       filter: T,
-    ) =>
-      filter &&
-      (isFunction(filter) || isFunction((filter as Record<string, any>).catch));
+    ) => filter && (isFunction(filter) || isFunction(filter.catch));
 
     if (descriptor) {
       validateEach(

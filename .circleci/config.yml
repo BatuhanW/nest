@@ -1,111 +1,123 @@
-version: 2
+version: 2.1
+
+parameters:
+  maintenance-node-version:
+    type: string
+    default: '20.19'
+  active-node-version:
+    type: string
+    default: '22.14'
+  current-node-version:
+    type: string
+    default: '24.1'
 
 aliases:
   - &restore-cache
     restore_cache:
-        key: dependency-cache-{{ checksum "package.json" }}
+      key: dependency-cache-{{ checksum "package.json" }}
+  - &save-cache
+    save_cache:
+      key: dependency-cache-{{ checksum "package.json" }}
+      paths:
+        - ./node_modules
   - &install-deps
     run:
-        name: Install dependencies
-        command: npm ci
+      name: Install dependencies
+      command: npm install --legacy-peer-deps
   - &build-packages
     run:
-        name: Build
-        command: npm run build
+      name: Build
+      command: npm run build
   - &run-unit-tests
     run:
-        name: Test
-        command: npm run test
-
-unit-tests-template: &unit-tests-template
-  working_directory: ~/nest
-  steps:
-    - checkout
-    - *restore-cache
-    - *install-deps
-    - *build-packages
-    - *run-unit-tests
+      name: Test
+      command: npm run test
 
 jobs:
   build:
     working_directory: ~/nest
     docker:
-      - image: circleci/node:12
+      - image: cimg/node:<< pipeline.parameters.maintenance-node-version >>
     steps:
       - checkout
       - run:
           name: Update NPM version
-          command: 'sudo npm install -g npm@latest'
-      - restore_cache:
-          key: dependency-cache-{{ checksum "package.json" }}
+          command: 'sudo npm install -g npm@^9'
+      - *restore-cache
+      - *install-deps
+      - *save-cache
+      - *build-packages
       - run:
-          name: Install dependencies
-          command: npm ci
-      - save_cache:
-          key: dependency-cache-{{ checksum "package.json" }}
-          paths:
-            - ./node_modules
-      - run:
-          name: Build
-          command: npm run build
-        
-  test_node_12:
+          name: Test public types
+          command: npm run test:types
+
+  test:
+    parameters:
+      node-version:
+        type: string
     working_directory: ~/nest
     docker:
-      - image: circleci/node:12
+      - image: cimg/node:<< parameters.node-version >>
     steps:
       - checkout
       - *restore-cache
       - *install-deps
       - *build-packages
-      - *run-unit-tests
-      - run:
-          name: Collect coverage
-          command: npm run coverage
-      - store_artifacts:
-          path: coverage
-
-  test_node_10:
-    <<: *unit-tests-template
-    docker:
-      - image: circleci/node:10
-
-  test_node_14:
-    <<: *unit-tests-template
-    docker:
-      - image: circleci/node:14
+      - when:
+          condition:
+            equal:
+              [
+                '<< parameters.node-version >>',
+                '<< pipeline.parameters.maintenance-node-version >>',
+              ]
+          steps:
+            - run:
+                name: Test (coverage)
+                command: npm run test:cov
+            - run:
+                name: Collect coverage
+                command: npm run coverage
+            - store_artifacts:
+                path: coverage
+      - when:
+          condition:
+            not:
+              equal:
+                [
+                  '<< parameters.node-version >>',
+                  '<< pipeline.parameters.maintenance-node-version >>',
+                ]
+          steps:
+            - *run-unit-tests
 
   lint:
     working_directory: ~/nest
     docker:
-      - image: circleci/node:12
+      - image: cimg/node:<< pipeline.parameters.active-node-version >>
     steps:
       - checkout
       - *restore-cache
       - *install-deps
       - run:
           name: Lint
-          command: npm run lint
-      - run:
-          name: Lint commit
-          command: ./node_modules/.bin/commitlint-circle -c .commitlintrc.json
+          command: npm run lint:ci
 
   integration_tests:
     working_directory: ~/nest
     machine: true
     steps:
       - checkout
-      - run: 
+      - run:
           name: Prepare nvm
           command: |
             echo 'export NVM_DIR="/opt/circleci/.nvm"' >> $BASH_ENV
             echo ' [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"' >> $BASH_ENV
-      - run: 
+      - run:
           name: Upgrade Node.js
           command: |
-            nvm install v12
+            nvm install << pipeline.parameters.maintenance-node-version >>
             node -v
-            nvm alias default v12
+            nvm alias default << pipeline.parameters.maintenance-node-version >>
       - run:
           name: Install Docker Compose
           command: |
@@ -115,38 +127,24 @@ jobs:
       - *install-deps
       - run:
           name: Prepare tests
-          command: |
-            bash ./scripts/prepare.sh
-            sleep 10
+          command: bash ./scripts/prepare.sh
       - run:
           name: List containers
           command: docker ps
       - run:
           name: Integration tests
           command: npm run test:integration
-          
-  codechecks_benchmarks:
-    working_directory: ~/nest
-    docker:
-      - image: circleci/node:12
-    steps:
-      - checkout
-      - *restore-cache
-      - *install-deps
-      - *build-packages
-      - run:
-          name: Install native wrk
-          command: .circleci/install-wrk.sh
-      - run:
-          name: Run codechecks with benchmarks
-          command: yarn codechecks:benchmarks
 
   samples:
     working_directory: ~/nest
     docker:
-      - image: circleci/node:12
+      - image: cimg/node:<< pipeline.parameters.maintenance-node-version >>
+      - image: redis:8-alpine
+        name: redis
     environment:
-      - DISABLE_OPENCOLLECTIVE: true
+      DISABLE_OPENCOLLECTIVE: 'true'
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
     steps:
       - checkout
       - *restore-cache
@@ -156,19 +154,20 @@ jobs:
           command: npm run build:samples
 
 workflows:
-  version: 2
   build-and-test:
     jobs:
       - build
-      - test_node_14:
+      - test:
           requires:
             - build
-      - test_node_12:
-          requires:
-            - build
-      - test_node_10:
-          requires:
-            - build
+          matrix:
+            parameters:
+              node-version:
+                [
+                  '<< pipeline.parameters.maintenance-node-version >>',
+                  '<< pipeline.parameters.active-node-version >>',
+                  '<< pipeline.parameters.current-node-version >>',
+                ]
       - lint:
           requires:
             - build
@@ -176,8 +175,5 @@ workflows:
           requires:
             - build
       - samples:
-          requires:
-            - build
-      - codechecks_benchmarks:
           requires:
             - build

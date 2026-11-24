@@ -1,7 +1,9 @@
-import { MESSAGE_MAPPING_METADATA, MESSAGE_METADATA } from '../constants';
+import { MESSAGE_MAPPING_METADATA, MESSAGE_METADATA } from '../constants.js';
 
 /**
  * Subscribes to messages that fulfils chosen pattern.
+ *
+ * @publicApi
  */
 export const SubscribeMessage = <T = string>(message: T): MethodDecorator => {
   return (

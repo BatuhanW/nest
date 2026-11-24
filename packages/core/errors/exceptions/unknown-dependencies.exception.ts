@@ -1,14 +1,18 @@
-import { InjectorDependencyContext } from '../../injector/injector';
-import { UNKNOWN_DEPENDENCIES_MESSAGE } from '../messages';
-import { RuntimeException } from './runtime.exception';
-import { Module } from '../../injector/module';
+import { InjectorDependencyContext } from '../../injector/injector.js';
+import { Module } from '../../injector/module.js';
+import { UNKNOWN_DEPENDENCIES_MESSAGE } from '../messages.js';
+import { RuntimeException } from './runtime.exception.js';
 
 export class UnknownDependenciesException extends RuntimeException {
+  public readonly moduleRef: { id: string } | undefined;
+
   constructor(
-    type: string | symbol,
-    unknownDependencyContext: InjectorDependencyContext,
-    module?: Module,
+    public readonly type: string | symbol,
+    public readonly context: InjectorDependencyContext,
+    moduleRef?: Module,
+    public readonly metadata?: { id: string },
   ) {
-    super(UNKNOWN_DEPENDENCIES_MESSAGE(type, unknownDependencyContext, module));
+    super(UNKNOWN_DEPENDENCIES_MESSAGE(type, context, moduleRef));
+    this.moduleRef = moduleRef && { id: moduleRef.id };
   }
 }

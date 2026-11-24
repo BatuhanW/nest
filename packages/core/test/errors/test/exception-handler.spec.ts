@@ -1,8 +1,5 @@
-import * as sinon from 'sinon';
-import { expect } from 'chai';
-import { ExceptionHandler } from '../../../errors/exception-handler';
-import { RuntimeException } from '../../../errors/exceptions/runtime.exception';
-import { InvalidMiddlewareException } from '../../../errors/exceptions/invalid-middleware.exception';
+import { ExceptionHandler } from '../../../errors/exception-handler.js';
+import { RuntimeException } from '../../../errors/exceptions/runtime.exception.js';
 
 describe('ExceptionHandler', () => {
   let instance: ExceptionHandler;
@@ -10,25 +7,19 @@ describe('ExceptionHandler', () => {
     instance = new ExceptionHandler();
   });
   describe('handle', () => {
-    let logger;
-    let errorSpy: sinon.SinonSpy;
+    let logger: { error: Function };
+    let errorSpy: ReturnType<typeof vi.fn>;
     beforeEach(() => {
       logger = {
         error: () => {},
       };
       (ExceptionHandler as any).logger = logger;
-      errorSpy = sinon.spy(logger, 'error');
+      errorSpy = vi.spyOn(logger, 'error');
     });
-    it('when exception is instanceof RuntimeException', () => {
+    it('should call the logger.error method with the thrown exception passed as an argument', () => {
       const exception = new RuntimeException('msg');
       instance.handle(exception);
-      expect(errorSpy.calledWith(exception.message, exception.stack)).to.be
-        .true;
-    });
-    it('when exception is not instanceof RuntimeException', () => {
-      const exception = new InvalidMiddlewareException('msg');
-      instance.handle(exception);
-      expect(errorSpy.calledWith(exception.what(), exception.stack)).to.be.true;
+      expect(errorSpy).toHaveBeenCalledWith(exception);
     });
   });
 });

@@ -1,0 +1,70 @@
+import { BadRequestException, CallHandler } from '@nestjs/common';
+import multer from 'multer';
+import { ExecutionContextHost } from '@nestjs/core/helpers/execution-context-host.js';
+import { of } from 'rxjs';
+import { NoFilesInterceptor } from '../../../multer/interceptors/no-files.interceptor.js';
+
+describe('NoFilesInterceptor', () => {
+  it('should return metatype with expected structure', async () => {
+    const targetClass = NoFilesInterceptor();
+    expect(targetClass.prototype.intercept).not.toBeUndefined();
+  });
+  describe('intercept', () => {
+    let handler: CallHandler;
+    beforeEach(() => {
+      handler = {
+        handle: () => of('test'),
+      };
+    });
+    it('should call none() with expected params', async () => {
+      const target = new (NoFilesInterceptor())();
+
+      const callback = (req, res, next) => next();
+      const noneSpy = vi
+        .spyOn((target as any).multer, 'none')
+        .mockReturnValue(callback);
+
+      await target.intercept(new ExecutionContextHost([]), handler);
+
+      expect(noneSpy).toHaveBeenCalled();
+    });
+    it('should reject a body with a __proto__ key', async () => {
+      const target = new (NoFilesInterceptor())();
+      (target as any).multer = {
+        none: () => (req, _res, next) => {
+          req.body = Object.create(null);
+          req.body.__proto__ = { isAdmin: 'true' };
+          next();
+        },
+        storage: multer.memoryStorage(),
+      };
+      const req: any = {};
+      await expect(
+        target.intercept(new ExecutionContextHost([req, {}]), handler),
+      ).rejects.toBeInstanceOf(BadRequestException);
+    });
+    it('should transform exception', async () => {
+      const target = new (NoFilesInterceptor())();
+      const err = {};
+      const callback = (req, res, next) => next(err);
+      (target as any).multer = {
+        none: () => callback,
+      };
+      (target.intercept(new ExecutionContextHost([]), handler) as any).catch(
+        error => expect(error).not.toBeUndefined(),
+      );
+    });
+  });
+  it('should merge global and local limits key-by-key, over the default field name limits', () => {
+    const target = new (NoFilesInterceptor({ limits: { fileSize: 10 } }))({
+      limits: { files: 2 },
+    });
+    expect((target as any).multer.limits).toEqual({
+      files: 2,
+      fileSize: 10,
+      fieldNestingDepth: 32,
+      fieldArrayIndexLimit: 1000,
+      parts: 1000,
+    });
+  });
+});

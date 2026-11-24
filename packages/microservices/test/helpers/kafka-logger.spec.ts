@@ -1,7 +1,6 @@
-import { expect } from 'chai';
-import * as sinon from 'sinon';
-import { logLevel } from '../../external/kafka.interface';
-import { KafkaLogger } from '../../helpers/kafka-logger';
+import { inspect } from 'util';
+import { logLevel } from '../../external/kafka.interface.js';
+import { KafkaLogger } from '../../helpers/kafka-logger.js';
 
 const namespace = 'namespace';
 const label = 'label';
@@ -15,17 +14,17 @@ const entry = {
 describe('KafkaLogger', () => {
   let kafkaLogger: any;
 
-  let error: sinon.SinonSpy;
-  let warn: sinon.SinonSpy;
-  let log: sinon.SinonSpy;
-  let debug: sinon.SinonSpy;
+  let error: ReturnType<typeof vi.fn>;
+  let warn: ReturnType<typeof vi.fn>;
+  let log: ReturnType<typeof vi.fn>;
+  let debug: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     // set
-    error = sinon.spy();
-    warn = sinon.spy();
-    log = sinon.spy();
-    debug = sinon.spy();
+    error = vi.fn();
+    warn = vi.fn();
+    log = vi.fn();
+    debug = vi.fn();
 
     kafkaLogger = KafkaLogger({
       error,
@@ -43,8 +42,8 @@ describe('KafkaLogger', () => {
       log: entry,
     });
 
-    expect(error.calledOnce).to.be.true;
-    expect(error.args[0][0]).to.eq(
+    expect(error).toHaveBeenCalledOnce();
+    expect(error.mock.calls[0][0]).toBe(
       'label [namespace] message {"other":{"stuff":"here"}}',
     );
   });
@@ -57,7 +56,7 @@ describe('KafkaLogger', () => {
       log: entry,
     });
 
-    expect(error.calledOnce).to.be.true;
+    expect(error).toHaveBeenCalledOnce();
   });
 
   it('warn', () => {
@@ -68,7 +67,7 @@ describe('KafkaLogger', () => {
       log: entry,
     });
 
-    expect(warn.calledOnce).to.be.true;
+    expect(warn).toHaveBeenCalledOnce();
   });
 
   it('info', () => {
@@ -79,7 +78,7 @@ describe('KafkaLogger', () => {
       log: entry,
     });
 
-    expect(log.calledOnce).to.be.true;
+    expect(log).toHaveBeenCalledOnce();
   });
 
   it('debug', () => {
@@ -90,6 +89,81 @@ describe('KafkaLogger', () => {
       log: entry,
     });
 
-    expect(debug.calledOnce).to.be.true;
+    expect(debug).toHaveBeenCalledOnce();
+  });
+
+  it('should log the entry as json', () => {
+    kafkaLogger({ namespace, level: logLevel.ERROR, label, log: entry });
+
+    expect(error).toHaveBeenCalledExactlyOnceWith(
+      'label [namespace] message {"other":{"stuff":"here"}}',
+    );
+  });
+
+  describe('when the entry cannot be serialized as json', () => {
+    // kafkajs logs the error an "eachMessage" handler rejected with this way
+    const logError = (rejection: unknown) =>
+      kafkaLogger({
+        namespace,
+        level: logLevel.ERROR,
+        label,
+        log: { message: 'message', topic: 'topic', error: rejection },
+      });
+
+    it('should log an entry with a circular reference', () => {
+      const circular: Record<string, unknown> = { name: 'circular' };
+      circular.self = circular;
+
+      expect(() => logError(circular)).not.toThrow();
+      expect(error).toHaveBeenCalledExactlyOnceWith(
+        "label [namespace] message { topic: 'topic', error: <ref *1> { name: 'circular', self: [Circular *1] } }",
+      );
+    });
+
+    it('should log an entry with a BigInt value', () => {
+      expect(() => logError({ limit: 10n })).not.toThrow();
+      expect(error).toHaveBeenCalledExactlyOnceWith(
+        "label [namespace] message { topic: 'topic', error: { limit: 10n } }",
+      );
+    });
+
+    it('should log an entry nested deeper than JSON.stringify can recurse', () => {
+      // JSON.parse accepts any depth, so a Kafka record can carry such a value
+      let nested: Record<string, unknown> = {};
+      for (let i = 0; i < 100_000; i++) {
+        nested = { a: nested };
+      }
+
+      // From Node.js 26 on, JSON.stringify serializes values of any depth
+      let json: string | undefined;
+      try {
+        json = JSON.stringify({ topic: 'topic', error: nested });
+      } catch {
+        // Nested deeper than it can recurse: inspect() takes over
+      }
+
+      expect(() => logError(nested)).not.toThrow();
+      expect(error).toHaveBeenCalledExactlyOnceWith(
+        json === undefined
+          ? "label [namespace] message { topic: 'topic', error: { a: { a: [Object] } } }"
+          : `label [namespace] message ${json}`,
+      );
+    });
+
+    it('should log an entry that cannot be inspected either', () => {
+      const unreadable = {
+        toJSON: () => {
+          throw new Error('unreadable');
+        },
+        [inspect.custom]: () => {
+          throw new Error('unreadable');
+        },
+      };
+
+      expect(() => logError(unreadable)).not.toThrow();
+      expect(error).toHaveBeenCalledExactlyOnceWith(
+        'label [namespace] message [unserializable log entry]',
+      );
+    });
   });
 });

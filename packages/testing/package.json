@@ -1,9 +1,26 @@
 {
   "name": "@nestjs/testing",
-  "version": "7.6.11",
-  "description": "Nest - modern, fast, powerful node.js web framework (@testing)",
+  "version": "12.6.0",
+  "description": "Testing for NestJS: build a test module, replace providers with mocks, and run end-to-end tests against a real application.",
+  "keywords": [
+    "nestjs",
+    "nest",
+    "testing",
+    "test",
+    "unit-testing",
+    "e2e",
+    "mocks"
+  ],
   "author": "Kamil Mysliwiec",
   "license": "MIT",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json",
+    "./*.js": "./*.js",
+    "./*": "./*.js"
+  },
   "homepage": "https://nestjs.com",
   "funding": {
     "type": "opencollective",
@@ -11,20 +28,20 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/nestjs/nest"
+    "url": "https://github.com/nestjs/nest.git",
+    "directory": "packages/testing"
   },
   "publishConfig": {
     "access": "public"
   },
   "dependencies": {
-    "optional": "0.1.4",
-    "tslib": "2.1.0"
+    "tslib": "2.9.1"
   },
   "peerDependencies": {
-    "@nestjs/common": "^7.0.0",
-    "@nestjs/core": "^7.0.0",
-    "@nestjs/microservices": "^7.0.0",
-    "@nestjs/platform-express": "^7.0.0"
+    "@nestjs/common": "^12.0.0",
+    "@nestjs/core": "^12.0.0",
+    "@nestjs/microservices": "^12.0.0",
+    "@nestjs/platform-express": "^12.0.0"
   },
   "peerDependenciesMeta": {
     "@nestjs/microservices": {
@@ -33,5 +50,6 @@
     "@nestjs/platform-express": {
       "optional": true
     }
-  }
+  },
+  "gitHead": "ab3fb3d5ca7d51d078835e44a8db1b354f8b651b"
 }

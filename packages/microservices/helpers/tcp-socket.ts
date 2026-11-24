@@ -1,0 +1,97 @@
+import { Buffer } from 'buffer';
+import { Socket } from 'net';
+import { InvalidJSONFormatException } from '../errors/invalid-json-format.exception.js';
+import { NetSocketClosedException } from '../errors/net-socket-closed.exception.js';
+import { TcpEventsMap } from '../events/tcp.events.js';
+
+export abstract class TcpSocket {
+  private isClosed = false;
+
+  public get netSocket() {
+    return this.socket;
+  }
+
+  constructor(public readonly socket: Socket) {
+    this.socket.on('data', this.onData.bind(this));
+    this.socket.on(TcpEventsMap.CONNECT, () => (this.isClosed = false));
+    this.socket.on(TcpEventsMap.CLOSE, () => (this.isClosed = true));
+    this.socket.on(TcpEventsMap.ERROR, () => (this.isClosed = true));
+  }
+
+  public connect(port: number, host: string) {
+    this.socket.connect(port, host);
+    return this;
+  }
+
+  public on(event: string, callback: (err?: any) => void) {
+    this.socket.on(event, callback);
+    return this;
+  }
+
+  public once(event: string, callback: (err?: any) => void) {
+    this.socket.once(event, callback);
+    return this;
+  }
+
+  public end() {
+    this.socket.end();
+    return this;
+  }
+
+  /**
+   * Asks the socket to emit no further messages until "resumeMessages" is
+   * called. "ServerTCP" does so while "maxConcurrentMessages" messages of the
+   * peer are being handled. A socket class that does not implement it keeps
+   * emitting messages as it reads them.
+   */
+  public pauseMessages() {}
+
+  public resumeMessages() {}
+
+  public sendMessage(message: any, callback?: (err?: any) => void) {
+    if (this.isClosed) {
+      callback && callback(new NetSocketClosedException());
+      return;
+    }
+    this.handleSend(message, callback);
+  }
+
+  protected abstract handleSend(
+    message: any,
+    callback?: (err?: any) => void,
+  ): any;
+
+  private onData(data: Buffer) {
+    try {
+      this.handleData(data);
+    } catch (e) {
+      this.handleDataError(e);
+    }
+  }
+
+  /**
+   * Surfaces a framing error on the underlying socket and closes it.
+   * Pass "destroy" for a peer that cannot be trusted to answer a FIN.
+   */
+  protected handleDataError(e: any, { destroy = false } = {}) {
+    this.socket.emit(TcpEventsMap.ERROR, e.message);
+    if (destroy) {
+      this.socket.destroy();
+    } else {
+      this.socket.end();
+    }
+  }
+
+  protected abstract handleData(data: Buffer | string): any;
+
+  protected emitMessage(data: string) {
+    let message: Record<string, unknown>;
+    try {
+      message = JSON.parse(data);
+    } catch (e) {
+      throw new InvalidJSONFormatException(e, data);
+    }
+    message = message || {};
+    this.socket.emit('message', message);
+  }
+}

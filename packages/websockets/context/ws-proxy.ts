@@ -1,27 +1,37 @@
-import { isFunction } from '@nestjs/common/utils/shared.utils';
-import { ExecutionContextHost } from '@nestjs/core/helpers/execution-context-host';
-import { empty } from 'rxjs';
-import { catchError } from 'rxjs/operators';
-import { WsExceptionsHandler } from '../exceptions/ws-exceptions-handler';
+import { EMPTY, from, isObservable } from 'rxjs';
+import { catchError, ignoreElements } from 'rxjs/operators';
+import { WsExceptionsHandler } from '../exceptions/ws-exceptions-handler.js';
+import { ExecutionContextHost } from '@nestjs/core/internal';
 
 export class WsProxy {
   public create(
     targetCallback: (...args: unknown[]) => Promise<any>,
     exceptionsHandler: WsExceptionsHandler,
+    targetPattern?: string,
   ): (...args: unknown[]) => Promise<any> {
     return async (...args: unknown[]) => {
+      args = [...args, targetPattern ?? 'unknown'];
       try {
         const result = await targetCallback(...args);
-        return !this.isObservable(result)
+        return !isObservable(result)
           ? result
           : result.pipe(
               catchError(error => {
-                this.handleError(exceptionsHandler, args, error);
-                return empty();
+                const pending = this.handleError(
+                  exceptionsHandler,
+                  args,
+                  error,
+                );
+                return pending ? from(pending).pipe(ignoreElements()) : EMPTY;
               }),
             );
       } catch (error) {
-        this.handleError(exceptionsHandler, args, error);
+        // The message is being handled until an asynchronous exception filter
+        // is done, which is what the adapters count ("maxConcurrentMessages")
+        const pending = this.handleError(exceptionsHandler, args, error);
+        if (pending) {
+          await pending;
+        }
       }
     };
   }
@@ -30,13 +40,9 @@ export class WsProxy {
     exceptionsHandler: WsExceptionsHandler,
     args: unknown[],
     error: T,
-  ) {
+  ): void | PromiseLike<unknown> {
     const host = new ExecutionContextHost(args);
     host.setType('ws');
-    exceptionsHandler.handle(error, host);
-  }
-
-  isObservable(result: any): boolean {
-    return result && isFunction(result.subscribe);
+    return exceptionsHandler.handle(error as Error, host);
   }
 }

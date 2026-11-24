@@ -1,35 +1,58 @@
-import { BadRequestException, NotFoundException } from '@nestjs/common';
-import { HOST_METADATA, MODULE_PATH } from '@nestjs/common/constants';
-import { HttpServer, Type } from '@nestjs/common/interfaces';
-import { Controller } from '@nestjs/common/interfaces/controllers/controller.interface';
-import { Logger } from '@nestjs/common/services/logger.service';
-import { ApplicationConfig } from '../application-config';
-import { CONTROLLER_MAPPING_MESSAGE } from '../helpers/messages';
-import { NestContainer } from '../injector/container';
-import { Injector } from '../injector/injector';
-import { InstanceWrapper } from '../injector/instance-wrapper';
-import { MetadataScanner } from '../metadata-scanner';
-import { Resolver } from './interfaces/resolver.interface';
-import { RouterExceptionFilters } from './router-exception-filters';
-import { RouterExplorer } from './router-explorer';
-import { RouterProxy } from './router-proxy';
+import {
+  type HttpServer,
+  type Type,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
+import {
+  HOST_METADATA,
+  MODULE_PATH,
+  VERSION_METADATA,
+  type Controller,
+  type VersionValue,
+} from '@nestjs/common/internal';
+import { ApplicationConfig } from '../application-config.js';
+import {
+  CONTROLLER_MAPPING_MESSAGE,
+  VERSIONED_CONTROLLER_MAPPING_MESSAGE,
+} from '../helpers/messages.js';
+import { NestContainer } from '../injector/container.js';
+import { Injector } from '../injector/injector.js';
+import { InstanceWrapper } from '../injector/instance-wrapper.js';
+import { GraphInspector } from '../inspector/graph-inspector.js';
+import { MetadataScanner } from '../metadata-scanner.js';
+import { ResolvedRoute } from './interfaces/resolved-route.interface.js';
+import { Resolver } from './interfaces/resolver.interface.js';
+import { RoutePathMetadata } from './interfaces/route-path-metadata.interface.js';
+import { RouteResolutionOptions } from './interfaces/route-resolution-options.interface.js';
+import { RoutePathFactory } from './route-path-factory.js';
+import { RouterExceptionFilters } from './router-exception-filters.js';
+import { RouterExplorer } from './router-explorer.js';
+import { RouterProxy } from './router-proxy.js';
 
 export class RoutesResolver implements Resolver {
-  private readonly logger = new Logger(RoutesResolver.name, true);
+  private readonly logger = new Logger(RoutesResolver.name, {
+    timestamp: true,
+  });
   private readonly routerProxy = new RouterProxy();
+  private readonly routePathFactory: RoutePathFactory;
   private readonly routerExceptionsFilter: RouterExceptionFilters;
   private readonly routerExplorer: RouterExplorer;
 
   constructor(
     private readonly container: NestContainer,
-    private readonly config: ApplicationConfig,
+    private readonly applicationConfig: ApplicationConfig,
     private readonly injector: Injector,
+    graphInspector: GraphInspector,
   ) {
+    const httpAdapterRef = container.getHttpAdapterRef();
     this.routerExceptionsFilter = new RouterExceptionFilters(
       container,
-      config,
-      container.getHttpAdapterRef(),
+      applicationConfig,
+      httpAdapterRef,
     );
+    this.routePathFactory = new RoutePathFactory(this.applicationConfig);
+
     const metadataScanner = new MetadataScanner();
     this.routerExplorer = new RouterExplorer(
       metadataScanner,
@@ -37,48 +60,93 @@ export class RoutesResolver implements Resolver {
       this.injector,
       this.routerProxy,
       this.routerExceptionsFilter,
-      this.config,
+      this.applicationConfig,
+      this.routePathFactory,
+      graphInspector,
     );
   }
 
-  public resolve<T extends HttpServer>(applicationRef: T, basePath: string) {
+  public resolve<T extends HttpServer>(
+    applicationRef: T,
+    globalPrefix: string,
+    options: RouteResolutionOptions = {},
+  ) {
     const modules = this.container.getModules();
     modules.forEach(({ controllers, metatype }, moduleName) => {
-      let path = metatype ? this.getModulePathMetadata(metatype) : undefined;
-      path = path ? basePath + path : basePath;
-      this.registerRouters(controllers, moduleName, path, applicationRef);
+      const modulePath = this.getModulePathMetadata(metatype)!;
+      this.registerRouters(
+        controllers,
+        moduleName,
+        globalPrefix,
+        modulePath,
+        applicationRef,
+        options,
+      );
     });
   }
 
+  public registerResolvedRoute<T extends HttpServer>(
+    applicationRef: T,
+    route: ResolvedRoute,
+  ): void {
+    this.routerExplorer.registerResolvedRoute(applicationRef, route);
+  }
+
   public registerRouters(
-    routes: Map<string, InstanceWrapper<Controller>>,
+    routes: Map<string | symbol | Function, InstanceWrapper<Controller>>,
     moduleName: string,
-    basePath: string,
+    globalPrefix: string,
+    modulePath: string,
     applicationRef: HttpServer,
+    options: RouteResolutionOptions = {},
   ) {
     routes.forEach(instanceWrapper => {
       const { metatype } = instanceWrapper;
 
-      const host = this.getHostMetadata(metatype);
-      const paths = this.routerExplorer.extractRouterPath(
+      const host = this.getHostMetadata(metatype!);
+      const routerPaths = this.routerExplorer.extractRouterPath(
         metatype as Type<any>,
-        basePath,
       );
-      const controllerName = metatype.name;
+      const controllerVersion = this.getVersionMetadata(metatype!);
+      const controllerName = metatype!.name;
 
-      paths.forEach(path => {
-        this.logger.log(
-          CONTROLLER_MAPPING_MESSAGE(
-            controllerName,
-            this.routerExplorer.stripEndSlash(path),
-          ),
-        );
+      routerPaths.forEach(path => {
+        const pathsToLog = this.routePathFactory.create({
+          ctrlPath: path,
+          modulePath,
+          globalPrefix,
+        });
+        if (!controllerVersion) {
+          pathsToLog.forEach(path => {
+            const logMessage = CONTROLLER_MAPPING_MESSAGE(controllerName, path);
+            this.logger.log(logMessage);
+          });
+        } else {
+          pathsToLog.forEach(path => {
+            const logMessage = VERSIONED_CONTROLLER_MAPPING_MESSAGE(
+              controllerName,
+              path,
+              controllerVersion,
+            );
+            this.logger.log(logMessage);
+          });
+        }
+
+        const versioningOptions = this.applicationConfig.getVersioning();
+        const routePathMetadata: RoutePathMetadata = {
+          ctrlPath: path,
+          modulePath,
+          globalPrefix,
+          controllerVersion,
+          versioningOptions,
+        };
         this.routerExplorer.explore(
           instanceWrapper,
           moduleName,
           applicationRef,
-          path,
-          host,
+          host!,
+          routePathMetadata,
+          options,
         );
       });
     });
@@ -93,8 +161,13 @@ export class RoutesResolver implements Resolver {
     };
     const handler = this.routerExceptionsFilter.create({}, callback, undefined);
     const proxy = this.routerProxy.createProxy(callback, handler);
+    const prefix = this.applicationConfig.getGlobalPrefix();
+    // `ExcludeRouteMetadata` is core-only, so the adapter gets the `RouteInfo`
+    // shape the interface declares, resolved to the paths excluded routes are
+    // served at (`/v1/hello` rather than `hello` under URI versioning).
+    const excludedRoutes = this.routePathFactory.getExcludedRoutePaths();
     applicationRef.setNotFoundHandler &&
-      applicationRef.setNotFoundHandler(proxy, this.config.getGlobalPrefix());
+      applicationRef.setNotFoundHandler(proxy, prefix, excludedRoutes);
   }
 
   public registerExceptionHandler() {
@@ -104,7 +177,7 @@ export class RoutesResolver implements Resolver {
       res: TResponse,
       next: Function,
     ) => {
-      throw this.mapExternalException(err);
+      throw this.container.getHttpAdapterRef().mapException(err);
     };
     const handler = this.routerExceptionsFilter.create(
       {},
@@ -113,26 +186,35 @@ export class RoutesResolver implements Resolver {
     );
     const proxy = this.routerProxy.createExceptionLayerProxy(callback, handler);
     const applicationRef = this.container.getHttpAdapterRef();
+    const prefix = this.applicationConfig.getGlobalPrefix();
     applicationRef.setErrorHandler &&
-      applicationRef.setErrorHandler(proxy, this.config.getGlobalPrefix());
-  }
-
-  public mapExternalException(err: any) {
-    switch (true) {
-      case err instanceof SyntaxError:
-        return new BadRequestException(err.message);
-      default:
-        return err;
-    }
+      applicationRef.setErrorHandler(proxy, prefix);
   }
 
   private getModulePathMetadata(metatype: Type<unknown>): string | undefined {
-    return Reflect.getMetadata(MODULE_PATH, metatype);
+    const modulesContainer = this.container.getModules();
+    const modulePath = Reflect.getMetadata(
+      MODULE_PATH + modulesContainer.applicationId,
+      metatype,
+    );
+    return modulePath ?? Reflect.getMetadata(MODULE_PATH, metatype);
   }
 
   private getHostMetadata(
     metatype: Type<unknown> | Function,
   ): string | string[] | undefined {
     return Reflect.getMetadata(HOST_METADATA, metatype);
+  }
+
+  private getVersionMetadata(
+    metatype: Type<unknown> | Function,
+  ): VersionValue | undefined {
+    const versioningConfig = this.applicationConfig.getVersioning();
+    if (versioningConfig) {
+      return (
+        Reflect.getMetadata(VERSION_METADATA, metatype) ??
+        versioningConfig.defaultVersion
+      );
+    }
   }
 }

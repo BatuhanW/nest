@@ -1,9 +1,14 @@
-import { isUndefined } from '@nestjs/common/utils/shared.utils';
-import { KafkaHeaders } from '../enums/kafka-headers.enum';
-import { Deserializer, IncomingResponse } from '../interfaces';
+import { KafkaHeaders } from '../enums/kafka-headers.enum.js';
+import { Deserializer, IncomingResponse } from '../interfaces/index.js';
+import { isUndefined } from '@nestjs/common/internal';
 
-export class KafkaResponseDeserializer
-  implements Deserializer<any, IncomingResponse> {
+/**
+ * @publicApi
+ */
+export class KafkaResponseDeserializer implements Deserializer<
+  any,
+  IncomingResponse
+> {
   deserialize(message: any, options?: Record<string, any>): IncomingResponse {
     const id = message.headers[KafkaHeaders.CORRELATION_ID].toString();
     if (!isUndefined(message.headers[KafkaHeaders.NEST_ERR])) {
@@ -14,6 +19,11 @@ export class KafkaResponseDeserializer
       };
     }
     if (!isUndefined(message.headers[KafkaHeaders.NEST_IS_DISPOSED])) {
+      // A record cannot leave its value out, so the one that only completes
+      // the stream carries a null that is not a response
+      if (!isUndefined(message.headers[KafkaHeaders.NEST_NO_RESPONSE])) {
+        return { id, isDisposed: true };
+      }
       return {
         id,
         response: message.value,

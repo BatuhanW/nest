@@ -1,16 +1,16 @@
 import { Module } from '@nestjs/common';
 import { GraphQLModule } from '@nestjs/graphql';
-import { GraphqlOptions } from './graphql.options';
-import { PostsModule } from './posts/posts.module';
-import { PrismaModule } from './prisma/prisma.module';
+import { PostsModule } from './posts/posts.module.js';
+import { ApolloDriver, ApolloDriverConfig } from '@nestjs/apollo';
 
 @Module({
   imports: [
-    GraphQLModule.forRootAsync({
-      useClass: GraphqlOptions,
-    }),
-    PrismaModule,
     PostsModule,
+    GraphQLModule.forRoot<ApolloDriverConfig>({
+      driver: ApolloDriver,
+      typePaths: ['./**/*.graphql'],
+      installSubscriptionHandlers: true,
+    }),
   ],
 })
 export class AppModule {}

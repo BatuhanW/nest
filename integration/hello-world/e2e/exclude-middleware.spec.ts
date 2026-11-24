@@ -1,5 +1,6 @@
 import {
   Controller,
+  Delete,
   Get,
   INestApplication,
   MiddlewareConsumer,
@@ -7,9 +8,15 @@ import {
   Post,
   RequestMethod,
 } from '@nestjs/common';
+import { ExpressAdapter } from '@nestjs/platform-express';
+import { FastifyAdapter } from '@nestjs/platform-fastify';
+import { NodeAdapter } from '@nestjs/platform-node';
 import { Test } from '@nestjs/testing';
-import * as request from 'supertest';
-import { ApplicationModule } from '../src/app.module';
+import express from 'express';
+import { AddressInfo, connect } from 'net';
+import request from 'supertest';
+import { AppModule } from '../src/app.module.js';
+import { listenOnLoopback } from '../../_support/listen-on-loopback.js';
 
 const RETURN_VALUE = 'test';
 const MIDDLEWARE_VALUE = 'middleware';
@@ -41,27 +48,426 @@ class TestController {
     return RETURN_VALUE;
   }
 
+  @Get('legacy-wildcard/overview')
+  testLegacyWildcard() {
+    return RETURN_VALUE;
+  }
+
+  @Get('splat-wildcard/overview')
+  testSplatWildcard() {
+    return RETURN_VALUE;
+  }
+
   @Get('overview/:id')
   overviewById() {
+    return RETURN_VALUE;
+  }
+
+  @Get('multiple/exclude')
+  multipleExclude() {
     return RETURN_VALUE;
   }
 }
 
 @Module({
-  imports: [ApplicationModule],
+  imports: [AppModule],
   controllers: [TestController],
 })
 class TestModule {
   configure(consumer: MiddlewareConsumer) {
     consumer
       .apply((req, res, next) => res.send(MIDDLEWARE_VALUE))
-      .exclude('test', 'overview/:id', 'wildcard/(.*)', {
-        path: 'middleware',
-        method: RequestMethod.POST,
-      })
-      .forRoutes('*');
+      .exclude(
+        'test',
+        'overview/:id',
+        'wildcard/*',
+        'legacy-wildcard/(.*)',
+        'splat-wildcard/*splat',
+        {
+          path: 'middleware',
+          method: RequestMethod.POST,
+        },
+      )
+      .exclude('multiple/exclude')
+      .forRoutes('*path');
   }
 }
+
+@Controller('users')
+class UsersController {
+  @Get('login')
+  login() {
+    return RETURN_VALUE;
+  }
+
+  @Get(':id')
+  findOne() {
+    return RETURN_VALUE;
+  }
+}
+
+@Module({
+  controllers: [UsersController],
+})
+class RouteMatchingModule {
+  configure(consumer: MiddlewareConsumer) {
+    consumer
+      .apply((req, res, next) => res.send(MIDDLEWARE_VALUE))
+      .exclude('users/login')
+      .forRoutes(UsersController);
+  }
+}
+
+@Controller('profiles')
+class ProfilesController {
+  @Get(':id')
+  findOne() {
+    return RETURN_VALUE;
+  }
+
+  @Get(':id/avatar')
+  avatar() {
+    return RETURN_VALUE;
+  }
+}
+
+@Module({
+  controllers: [ProfilesController],
+})
+class RequestTargetModule {
+  configure(consumer: MiddlewareConsumer) {
+    consumer
+      .apply((req, res, next) => res.send(MIDDLEWARE_VALUE))
+      .exclude('profiles/:id/avatar')
+      .forRoutes(ProfilesController);
+  }
+}
+
+describe('Exclude middleware - request targets', () => {
+  let app: INestApplication;
+  let port: number;
+
+  /**
+   * "supertest" never sends a "#" in the request target, so the request has
+   * to be written to the socket manually.
+   */
+  const sendRawRequest = (requestTarget: string) =>
+    new Promise<{ statusCode: number; body: string }>((resolve, reject) => {
+      let response = '';
+      const socket = connect(port, '127.0.0.1', () => {
+        socket.write(
+          `GET ${requestTarget} HTTP/1.1\r\n` +
+            `Host: 127.0.0.1:${port}\r\n` +
+            `Connection: close\r\n\r\n`,
+        );
+      });
+      socket.setEncoding('utf8');
+      socket.on('data', chunk => (response += chunk));
+      socket.on('error', reject);
+      socket.on('end', () => {
+        const [head, body = ''] = response.split('\r\n\r\n');
+        resolve({ statusCode: Number(head.split(' ')[1]), body });
+      });
+    });
+
+  beforeEach(async () => {
+    app = (
+      await Test.createTestingModule({
+        imports: [RequestTargetModule],
+      }).compile()
+    ).createNestApplication();
+
+    await listenOnLoopback(app);
+    port = (app.getHttpServer().address() as AddressInfo).port;
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  it(`should exclude "/profiles/1/avatar" endpoint`, async () => {
+    const response = await sendRawRequest('/profiles/1/avatar');
+    expect(response.body).toBe(RETURN_VALUE);
+  });
+
+  it(`should not exclude "/profiles/1#/avatar", which the router serves with "/profiles/:id"`, async () => {
+    const response = await sendRawRequest('/profiles/1#/avatar');
+    expect(response.body).toBe(MIDDLEWARE_VALUE);
+  });
+});
+
+@Controller('invoices')
+class InvoicesController {
+  @Get()
+  findAll() {
+    return RETURN_VALUE;
+  }
+
+  @Get(':token')
+  findShared() {
+    return RETURN_VALUE;
+  }
+}
+
+@Module({
+  controllers: [InvoicesController],
+})
+class TrailingSlashModule {
+  configure(consumer: MiddlewareConsumer) {
+    consumer
+      .apply((req, res, next) => res.send(MIDDLEWARE_VALUE))
+      .exclude('invoices/*')
+      .forRoutes(InvoicesController);
+  }
+}
+
+describe('Exclude middleware - trailing slash', () => {
+  let app: INestApplication;
+
+  beforeEach(async () => {
+    app = (
+      await Test.createTestingModule({
+        imports: [TrailingSlashModule],
+      }).compile()
+    ).createNestApplication();
+
+    await listenOnLoopback(app);
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  it(`should exclude "/invoices/abc" endpoint`, () => {
+    return request(app.getHttpServer())
+      .get('/invoices/abc')
+      .expect(200, RETURN_VALUE);
+  });
+
+  it(`should not exclude "/invoices/", which the router serves with "/invoices"`, () => {
+    return request(app.getHttpServer())
+      .get('/invoices/')
+      .expect(200, MIDDLEWARE_VALUE);
+  });
+});
+
+@Controller('reports')
+class ReportsController {
+  // Registered first, so the router serves "/reports/" with it
+  @Get('{*path}')
+  read() {
+    return 'read';
+  }
+
+  @Get()
+  about() {
+    return RETURN_VALUE;
+  }
+}
+
+@Controller('exports')
+class ExportsController {
+  @Get()
+  list() {
+    return RETURN_VALUE;
+  }
+
+  // Serves DELETE "/exports/", which the "exports" exclusion covers too
+  @Delete('*')
+  remove() {
+    return 'removed';
+  }
+}
+
+const createOptionalTailModule = (...exclusions: string[]) => {
+  @Module({
+    controllers: [ReportsController, ExportsController],
+  })
+  class OptionalTailModule {
+    configure(consumer: MiddlewareConsumer) {
+      consumer
+        .apply((req, res, next) => res.send(MIDDLEWARE_VALUE))
+        .exclude(...exclusions)
+        .forRoutes(ReportsController, ExportsController);
+    }
+  }
+  return OptionalTailModule;
+};
+
+describe.each([
+  ['Express', () => undefined],
+  ['node', () => new NodeAdapter()],
+])(
+  'Exclude middleware - trailing slash next to an optional-tail route (%s)',
+  (_, createAdapter) => {
+    let app: INestApplication;
+
+    const createApp = async (...exclusions: string[]) => {
+      const testingModule = await Test.createTestingModule({
+        imports: [createOptionalTailModule(...exclusions)],
+      }).compile();
+      const adapter = createAdapter();
+      app = adapter
+        ? testingModule.createNestApplication(adapter)
+        : testingModule.createNestApplication();
+      await listenOnLoopback(app);
+    };
+
+    afterEach(async () => {
+      await app.close();
+    });
+
+    it(`should exclude "/reports" endpoint`, async () => {
+      await createApp('reports', 'exports');
+      await request(app.getHttpServer())
+        .get('/reports')
+        .expect(200, RETURN_VALUE);
+      await request(app.getHttpServer())
+        .get('/exports')
+        .expect(200, RETURN_VALUE);
+    });
+
+    it(`should not exclude "/reports/", which the router serves with "/reports/{*path}"`, async () => {
+      await createApp('reports', 'exports');
+      await request(app.getHttpServer())
+        .get('/reports/')
+        .expect(200, MIDDLEWARE_VALUE);
+      await request(app.getHttpServer())
+        .delete('/exports/')
+        .expect(200, MIDDLEWARE_VALUE);
+    });
+
+    it(`should exclude "/reports/" when "/reports/{*path}" is excluded too`, async () => {
+      await createApp('reports', 'reports/{*path}');
+      await request(app.getHttpServer()).get('/reports/').expect(200, 'read');
+      await request(app.getHttpServer()).get('/reports/a').expect(200, 'read');
+    });
+  },
+);
+
+@Controller('statements')
+class StatementsController {
+  @Get(':id.pdf')
+  published() {
+    return 'published';
+  }
+
+  @Get(':name')
+  internal() {
+    return RETURN_VALUE;
+  }
+}
+
+@Module({
+  controllers: [StatementsController],
+})
+class MixedSegmentModule {
+  configure(consumer: MiddlewareConsumer) {
+    consumer
+      .apply((req, res, next) => res.end(MIDDLEWARE_VALUE))
+      .exclude({ path: 'statements/:id.pdf', method: RequestMethod.GET })
+      .forRoutes(StatementsController);
+  }
+}
+
+describe.each([
+  ['Express', () => undefined],
+  ['Fastify', () => new FastifyAdapter()],
+  ['node', () => new NodeAdapter()],
+])('Exclude middleware - parameter next to text (%s)', (_, createAdapter) => {
+  let app: INestApplication;
+
+  beforeEach(async () => {
+    const testingModule = await Test.createTestingModule({
+      imports: [MixedSegmentModule],
+    }).compile();
+    const adapter = createAdapter();
+    app = adapter
+      ? testingModule.createNestApplication(adapter)
+      : testingModule.createNestApplication();
+    await listenOnLoopback(app);
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  it(`should exclude "/statements/1.pdf" endpoint`, () => {
+    return request(app.getHttpServer())
+      .get('/statements/1.pdf')
+      .expect(200, 'published');
+  });
+
+  it(`should not exclude "/statements/drafts" endpoint`, () => {
+    return request(app.getHttpServer())
+      .get('/statements/drafts')
+      .expect(200, MIDDLEWARE_VALUE);
+  });
+
+  it.each(['%0A', '%0D', '%E2%80%A8', '%E2%80%A9'])(
+    `should not exclude "/statements/1%s.pdf", a line terminator in the parameter`,
+    terminator => {
+      return request(app.getHttpServer())
+        .get(`/statements/1${terminator}.pdf`)
+        .expect(200, MIDDLEWARE_VALUE);
+    },
+  );
+});
+
+describe('Exclude middleware - route matching', () => {
+  let app: INestApplication;
+
+  const createApp = async (adapter?: ExpressAdapter) => {
+    const testingModule = await Test.createTestingModule({
+      imports: [RouteMatchingModule],
+    }).compile();
+    app = adapter
+      ? testingModule.createNestApplication(adapter)
+      : testingModule.createNestApplication();
+
+    await listenOnLoopback(app);
+  };
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  describe('by default', () => {
+    beforeEach(() => createApp());
+
+    it(`should exclude "/users/LOGIN", which the router serves with "/users/login"`, () => {
+      return request(app.getHttpServer())
+        .get('/users/LOGIN')
+        .expect(200, RETURN_VALUE);
+    });
+
+    it(`should exclude "/users/login/", which the router serves with "/users/login"`, () => {
+      return request(app.getHttpServer())
+        .get('/users/login/')
+        .expect(200, RETURN_VALUE);
+    });
+  });
+
+  describe('when the router is case-sensitive', () => {
+    beforeEach(() => {
+      const instance = express();
+      instance.set('case sensitive routing', true);
+      return createApp(new ExpressAdapter(instance));
+    });
+
+    it(`should exclude "/users/login" endpoint`, () => {
+      return request(app.getHttpServer())
+        .get('/users/login')
+        .expect(200, RETURN_VALUE);
+    });
+
+    it(`should not exclude "/users/LOGIN", which the router serves with "/users/:id"`, () => {
+      return request(app.getHttpServer())
+        .get('/users/LOGIN')
+        .expect(200, MIDDLEWARE_VALUE);
+    });
+  });
+});
 
 describe('Exclude middleware', () => {
   let app: INestApplication;
@@ -73,7 +479,7 @@ describe('Exclude middleware', () => {
       }).compile()
     ).createNestApplication();
 
-    await app.init();
+    await listenOnLoopback(app);
   });
 
   it(`should exclude "/test" endpoint`, () => {
@@ -107,6 +513,24 @@ describe('Exclude middleware', () => {
   it(`should exclude "/wildcard/overview" endpoint (by wildcard)`, () => {
     return request(app.getHttpServer())
       .get('/wildcard/overview')
+      .expect(200, RETURN_VALUE);
+  });
+
+  it(`should exclude "/legacy-wildcard/overview" endpoint (by wildcard, legacy syntax)`, () => {
+    return request(app.getHttpServer())
+      .get('/legacy-wildcard/overview')
+      .expect(200, RETURN_VALUE);
+  });
+
+  it(`should exclude "/splat-wildcard/overview" endpoint (by wildcard, new syntax)`, () => {
+    return request(app.getHttpServer())
+      .get('/splat-wildcard/overview')
+      .expect(200, RETURN_VALUE);
+  });
+
+  it(`should exclude "/multiple/exclude" endpoint`, () => {
+    return request(app.getHttpServer())
+      .get('/multiple/exclude')
       .expect(200, RETURN_VALUE);
   });
 

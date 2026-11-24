@@ -1,4 +1,4 @@
-import { RENDER_METADATA } from '../../constants';
+import { RENDER_METADATA } from '../../constants.js';
 
 /**
  * Route handler method Decorator.  Defines a template to be rendered by the controller.
@@ -7,7 +7,7 @@ import { RENDER_METADATA } from '../../constants';
  *
  * @param template name of the render engine template file
  *
- * @see [Model-View-Controller](https://docs.nestjs.com/techniques.mvc)
+ * @see [Model-View-Controller](https://docs.nestjs.com/techniques/mvc)
  *
  * @publicApi
  */

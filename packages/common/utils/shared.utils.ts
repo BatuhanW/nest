@@ -1,11 +1,10 @@
-/* eslint-disable @typescript-eslint/no-use-before-define */
-export const isUndefined = (obj: any): obj is undefined =>
+export const isUndefined = (obj: unknown): obj is undefined =>
   typeof obj === 'undefined';
 
-export const isObject = (fn: any): fn is object =>
+export const isObject = (fn: unknown): fn is object =>
   !isNil(fn) && typeof fn === 'object';
 
-export const isPlainObject = (fn: any): fn is object => {
+export const isPlainObject = (fn: unknown): fn is object => {
   if (!isObject(fn)) {
     return false;
   }
@@ -13,30 +12,65 @@ export const isPlainObject = (fn: any): fn is object => {
   if (proto === null) {
     return true;
   }
-  const ctor =
-    Object.prototype.hasOwnProperty.call(proto, 'constructor') &&
-    proto.constructor;
+  const ctor = Object.hasOwn(proto, 'constructor') && proto.constructor;
   return (
     typeof ctor === 'function' &&
-    ctor instanceof ctor &&
     Function.prototype.toString.call(ctor) ===
-      Function.prototype.toString.call(Object)
+      Function.prototype.toString.call(Object) &&
+    ctor instanceof ctor
   );
 };
 
 export const addLeadingSlash = (path?: string): string =>
-  path ? (path.charAt(0) !== '/' ? '/' + path : path) : '';
+  path && typeof path === 'string'
+    ? path.charAt(0) !== '/' && path.substring(0, 2) !== '{/'
+      ? '/' + path
+      : path
+    : '';
 
-/**
- * Deprecated. Use the "addLeadingSlash" function instead.
- * @deprecated
- */
-export const validatePath = addLeadingSlash;
+export const normalizePath = (path?: string): string => {
+  if (!path) {
+    return '/';
+  }
+  const normalized = ('/' + path.replace(/\/+$/, '')).replace(/\/+/g, '/');
+  // An optional group that starts with a slash ("{/:lang}") already holds the
+  // leading slash, and adding one would make it required (see addLeadingSlash)
+  return path.startsWith('{/') ? normalized.slice(1) : normalized;
+};
 
-export const isFunction = (fn: any): boolean => typeof fn === 'function';
-export const isString = (fn: any): fn is string => typeof fn === 'string';
-export const isConstructor = (fn: any): boolean => fn === 'constructor';
-export const isNil = (obj: any): obj is null | undefined =>
-  isUndefined(obj) || obj === null;
-export const isEmpty = (array: any): boolean => !(array && array.length > 0);
-export const isSymbol = (fn: any): fn is symbol => typeof fn === 'symbol';
+export const stripEndSlash = (path: string): string =>
+  path.endsWith('/') ? path.slice(0, -1) : path;
+
+export const isFunction = (val: unknown): val is Function =>
+  typeof val === 'function';
+
+export const isString = (val: unknown): val is string =>
+  typeof val === 'string';
+
+export const isNumber = (val: unknown): val is number =>
+  typeof val === 'number';
+
+export const isConstructor = (val: unknown): boolean => val === 'constructor';
+
+export const isNil = (val: unknown): val is null | undefined =>
+  isUndefined(val) || val === null;
+
+export const isEmpty = (value: unknown): boolean => {
+  if (isNil(value)) {
+    return true;
+  }
+  if (Array.isArray(value)) {
+    return value.length === 0;
+  }
+  return false;
+};
+
+export const isEmptyArray = (array: unknown): boolean => {
+  if (!Array.isArray(array)) {
+    return false;
+  }
+  return array.length === 0;
+};
+
+export const isSymbol = (val: unknown): val is symbol =>
+  typeof val === 'symbol';

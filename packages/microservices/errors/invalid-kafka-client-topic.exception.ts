@@ -1,5 +1,8 @@
-import { RuntimeException } from '@nestjs/core/errors/exceptions/runtime.exception';
+import { RuntimeException } from '@nestjs/core/internal';
 
+/**
+ * @publicApi
+ */
 export class InvalidKafkaClientTopicException extends RuntimeException {
   constructor(topic?: string) {
     super(

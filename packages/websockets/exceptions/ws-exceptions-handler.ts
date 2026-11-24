@@ -1,16 +1,41 @@
-import { ArgumentsHost } from '@nestjs/common';
-import { ExceptionFilterMetadata } from '@nestjs/common/interfaces/exceptions/exception-filter-metadata.interface';
-import { isEmpty } from '@nestjs/common/utils/shared.utils';
-import { InvalidExceptionFilterException } from '@nestjs/core/errors/exceptions/invalid-exception-filter.exception';
-import { WsException } from '../errors/ws-exception';
-import { BaseWsExceptionFilter } from './base-ws-exception-filter';
+import type { ArgumentsHost } from '@nestjs/common';
+import { WsException } from '../errors/ws-exception.js';
+import { BaseWsExceptionFilter } from './base-ws-exception-filter.js';
+import {
+  type ExceptionFilterMetadata,
+  selectExceptionFilterMetadata,
+  isEmptyArray,
+  isFunction,
+} from '@nestjs/common/internal';
+import { InvalidExceptionFilterException } from '@nestjs/core/internal';
 
+/**
+ * @publicApi
+ */
 export class WsExceptionsHandler extends BaseWsExceptionFilter {
   private filters: ExceptionFilterMetadata[] = [];
+  // The promises of asynchronous filters, for handle() to return
+  private readonly pendingFilterResults = new WeakMap<
+    ArgumentsHost,
+    PromiseLike<unknown>
+  >();
 
-  public handle(exception: Error | WsException | any, host: ArgumentsHost) {
+  /**
+   * Returns the promise of an asynchronous exception filter. The exception is
+   * being handled until it settles, so callers wait for it: the adapters
+   * count the message as being handled until then.
+   */
+  public handle(
+    exception: Error | WsException,
+    host: ArgumentsHost,
+  ): void | PromiseLike<unknown> {
     const client = host.switchToWs().getClient();
-    if (this.invokeCustomFilters(exception, host) || !client.emit) {
+    if (this.invokeCustomFilters(exception, host)) {
+      const pending = this.pendingFilterResults.get(host);
+      this.pendingFilterResults.delete(host);
+      return pending;
+    }
+    if (!client) {
       return;
     }
     super.catch(exception, host);
@@ -27,17 +52,16 @@ export class WsExceptionsHandler extends BaseWsExceptionFilter {
     exception: T,
     args: ArgumentsHost,
   ): boolean {
-    if (isEmpty(this.filters)) return false;
+    if (isEmptyArray(this.filters)) return false;
 
-    const filter = this.filters.find(({ exceptionMetatypes }) => {
-      const hasMetatype =
-        !exceptionMetatypes.length ||
-        exceptionMetatypes.some(
-          ExceptionMetatype => exception instanceof ExceptionMetatype,
-        );
-      return hasMetatype;
-    });
-    filter && filter.func(exception, args);
-    return !!filter;
+    const filter = selectExceptionFilterMetadata(this.filters, exception);
+    if (!filter) {
+      return false;
+    }
+    const result = filter.func(exception, args);
+    if (isFunction(result?.then)) {
+      this.pendingFilterResults.set(args, result);
+    }
+    return true;
   }
 }

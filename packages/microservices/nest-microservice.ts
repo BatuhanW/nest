@@ -1,62 +1,115 @@
-import {
+import type {
   CanActivate,
   ExceptionFilter,
   INestMicroservice,
+  ITransportServer,
   NestInterceptor,
   PipeTransform,
+  PreRequestHook,
   WebSocketAdapter,
 } from '@nestjs/common';
-import { Logger } from '@nestjs/common/services/logger.service';
-import { ApplicationConfig } from '@nestjs/core/application-config';
-import { MESSAGES } from '@nestjs/core/constants';
-import { optionalRequire } from '@nestjs/core/helpers/optional-require';
-import { NestContainer } from '@nestjs/core/injector/container';
-import { NestApplicationContext } from '@nestjs/core/nest-application-context';
-import { Transport } from './enums/transport.enum';
-import { CustomTransportStrategy } from './interfaces/custom-transport-strategy.interface';
-import { MicroserviceOptions } from './interfaces/microservice-configuration.interface';
-import { MicroservicesModule } from './microservices-module';
-import { Server } from './server/server';
-import { ServerFactory } from './server/server-factory';
+import { Transport } from './enums/transport.enum.js';
+import {
+  AsyncMicroserviceOptions,
+  MicroserviceOptions,
+} from './interfaces/microservice-configuration.interface.js';
+import { MicroservicesModule } from './microservices-module.js';
+import { ServerFactory } from './server/server-factory.js';
+import { Server } from './server/server.js';
+import type { NestMicroserviceOptions } from '@nestjs/common/internal';
+import { Logger } from '@nestjs/common';
+import {
+  type ApplicationConfig,
+  type NestContainer,
+  type GraphInspector,
+  NestApplicationContext,
+} from '@nestjs/core';
+import {
+  MESSAGES,
+  optionalRequire,
+  Injector,
+  makeSafeInstanceDecorator,
+} from '@nestjs/core/internal';
 
-const { SocketModule } = optionalRequire(
-  '@nestjs/websockets/socket-module',
-  () => require('@nestjs/websockets/socket-module'),
-);
+type CompleteMicroserviceOptions = NestMicroserviceOptions &
+  (MicroserviceOptions | AsyncMicroserviceOptions);
 
 export class NestMicroservice
-  extends NestApplicationContext
-  implements INestMicroservice {
-  private readonly logger = new Logger(NestMicroservice.name, true);
+  extends NestApplicationContext<NestMicroserviceOptions>
+  implements INestMicroservice
+{
+  protected readonly logger = new Logger(NestMicroservice.name, {
+    timestamp: true,
+  });
   private readonly microservicesModule = new MicroservicesModule();
-  private readonly socketModule = SocketModule ? new SocketModule() : null;
-  private microserviceConfig: MicroserviceOptions;
-  private server: Server & CustomTransportStrategy;
+  private socketModule: any = null;
+  private microserviceConfig: Exclude<
+    CompleteMicroserviceOptions,
+    AsyncMicroserviceOptions
+  >;
+  private serverInstance: Server;
   private isTerminated = false;
-  private isInitHookCalled = false;
+  private wasInitHookCalled = false;
+  private isConnectedToApplication = false;
+
+  /**
+   * Returns an observable that emits status changes.
+   */
+  get status() {
+    return this.serverInstance.status;
+  }
 
   constructor(
     container: NestContainer,
-    config: MicroserviceOptions = {},
+    config: CompleteMicroserviceOptions = {},
+    private readonly graphInspector: GraphInspector,
     private readonly applicationConfig: ApplicationConfig,
   ) {
-    super(container);
+    super(container, config);
 
-    this.microservicesModule.register(container, this.applicationConfig);
+    this.injector = new Injector({
+      preview: config.preview!,
+      instanceDecorator: config.instrument?.instanceDecorator,
+    });
+    this.microservicesModule.register(
+      container,
+      this.graphInspector,
+      this.applicationConfig,
+      this.appOptions,
+    );
     this.createServer(config);
     this.selectContextModule();
+
+    const modulesContainer = this.container.getModules();
+    modulesContainer.addRpcTarget(this.serverInstance);
   }
 
-  public createServer(config: MicroserviceOptions) {
+  public createServer(config: CompleteMicroserviceOptions) {
     try {
-      this.microserviceConfig = {
-        transport: Transport.TCP,
-        ...config,
-      } as any;
-      const { strategy } = config as any;
-      this.server = strategy
-        ? strategy
-        : ServerFactory.create(this.microserviceConfig);
+      if ('useFactory' in config) {
+        const resolvedConfig = this.resolveAsyncOptions(config);
+        this.microserviceConfig = resolvedConfig;
+
+        // Inject custom strategy
+        if ('strategy' in resolvedConfig) {
+          this.serverInstance = resolvedConfig.strategy as Server;
+          return;
+        }
+      } else {
+        this.microserviceConfig = {
+          transport: Transport.TCP,
+          ...config,
+        } as MicroserviceOptions;
+
+        if ('strategy' in config) {
+          this.serverInstance = config.strategy as Server;
+          return;
+        }
+      }
+
+      this.serverInstance = ServerFactory.create(
+        this.microserviceConfig,
+      ) as Server;
     } catch (e) {
       this.logger.error(e);
       throw e;
@@ -64,45 +117,172 @@ export class NestMicroservice
   }
 
   public async registerModules(): Promise<any> {
+    if (this.isConnectedToApplication) {
+      // The hybrid application sets up the container it shares with the
+      // microservice itself: it binds the gateways, to its HTTP server and
+      // with its own global enhancers, assigns the clients and calls the
+      // lifecycle hooks
+      !this.appOptions.preview && this.registerListeners();
+      this.setIsInitialized(true);
+      return;
+    }
+    await this.loadSocketModule();
+    // A gateway with its own port is listening as soon as it is registered,
+    // which is before the lifecycle hooks have run. Its clients are turned
+    // away until the hooks below have completed.
+    // Optional calls, as an older "@nestjs/websockets" may not implement them
+    this.socketModule?.rejectClients?.();
     this.socketModule &&
-      this.socketModule.register(this.container, this.applicationConfig);
-    this.microservicesModule.setupClients(this.container);
+      (await this.socketModule.register(
+        this.container,
+        this.applicationConfig,
+        this.graphInspector,
+        this.appOptions,
+      ));
 
-    this.registerListeners();
+    if (!this.appOptions.preview) {
+      this.microservicesModule.setupClients(this.container);
+      this.registerListeners();
+    }
+
     this.setIsInitialized(true);
 
-    if (!this.isInitHookCalled) {
+    if (!this.wasInitHookCalled) {
       await this.callInitHook();
       await this.callBootstrapHook();
     }
+    this.socketModule?.acceptClients?.();
   }
 
   public registerListeners() {
-    this.microservicesModule.setupListeners(this.container, this.server);
+    this.microservicesModule.setupListeners(
+      this.container,
+      this.serverInstance,
+    );
   }
 
+  /**
+   * Registers a web socket adapter that will be used for Gateways.
+   * Use to override the default `socket.io` library.
+   *
+   * @param {WebSocketAdapter} adapter
+   * @returns {this}
+   */
   public useWebSocketAdapter(adapter: WebSocketAdapter): this {
+    if (this.isInitialized) {
+      this.logger.warn(
+        'Cannot apply WebSocket adapter: registration must occur before initialization.',
+      );
+    }
     this.applicationConfig.setIoAdapter(adapter);
     return this;
   }
 
+  /**
+   * Registers global exception filters (will be used for every pattern handler).
+   *
+   * @param {...ExceptionFilter} filters
+   */
   public useGlobalFilters(...filters: ExceptionFilter[]): this {
+    if (this.isInitialized) {
+      this.logger.warn(
+        'Cannot apply global exception filters: registration must occur before initialization.',
+      );
+    }
+
+    filters = this.applyInstanceDecoratorIfRegistered<ExceptionFilter>(
+      ...filters,
+    );
     this.applicationConfig.useGlobalFilters(...filters);
+    filters.forEach(item =>
+      this.graphInspector.insertOrphanedEnhancer({
+        subtype: 'filter',
+        ref: item,
+      }),
+    );
     return this;
   }
 
+  /**
+   * Registers global pipes (will be used for every pattern handler).
+   *
+   * @param {...PipeTransform} pipes
+   */
   public useGlobalPipes(...pipes: PipeTransform<any>[]): this {
+    if (this.isInitialized) {
+      this.logger.warn(
+        'Global pipes registered after initialization will not be applied.',
+      );
+    }
+
+    pipes = this.applyInstanceDecoratorIfRegistered<PipeTransform<any>>(
+      ...pipes,
+    );
     this.applicationConfig.useGlobalPipes(...pipes);
+    pipes.forEach(item =>
+      this.graphInspector.insertOrphanedEnhancer({
+        subtype: 'pipe',
+        ref: item,
+      }),
+    );
     return this;
   }
 
+  /**
+   * Registers global interceptors (will be used for every pattern handler).
+   *
+   * @param {...NestInterceptor} interceptors
+   */
   public useGlobalInterceptors(...interceptors: NestInterceptor[]): this {
+    if (this.isInitialized) {
+      this.logger.warn(
+        'Cannot apply global interceptors: registration must occur before initialization.',
+      );
+    }
+
+    interceptors = this.applyInstanceDecoratorIfRegistered<NestInterceptor>(
+      ...interceptors,
+    );
     this.applicationConfig.useGlobalInterceptors(...interceptors);
+    interceptors.forEach(item =>
+      this.graphInspector.insertOrphanedEnhancer({
+        subtype: 'interceptor',
+        ref: item,
+      }),
+    );
     return this;
   }
 
   public useGlobalGuards(...guards: CanActivate[]): this {
+    if (this.isInitialized) {
+      this.logger.warn(
+        'Cannot apply global guards: registration must occur before initialization.',
+      );
+    }
+
+    guards = this.applyInstanceDecoratorIfRegistered<CanActivate>(...guards);
     this.applicationConfig.useGlobalGuards(...guards);
+    guards.forEach(item =>
+      this.graphInspector.insertOrphanedEnhancer({
+        subtype: 'guard',
+        ref: item,
+      }),
+    );
+    return this;
+  }
+
+  /**
+   * Registers a global preRequest hook (executed before all enhancers for every pattern handler).
+   *
+   * @param {...PreRequestHook} hooks
+   */
+  public registerPreRequestHook(...hooks: PreRequestHook[]): this {
+    if (this.isInitialized) {
+      this.logger.warn(
+        'Cannot apply global preRequest hooks: registration must occur before initialization.',
+      );
+    }
+    this.applicationConfig.registerPreRequestHook(...hooks);
     return this;
   }
 
@@ -110,41 +290,133 @@ export class NestMicroservice
     if (this.isInitialized) {
       return this;
     }
-    await super.init();
-    await this.registerModules();
+
+    try {
+      // Lazy-load optional socket module (ESM-compatible)
+      await this.loadSocketModule();
+      // Calls the init hooks as well, as on "listen()", once the gateways,
+      // clients and listeners are set up
+      await this.registerModules();
+    } finally {
+      this.flushLogsIfAutoFlushEnabled();
+    }
     return this;
   }
 
-  public listen(callback: () => void) {
-    this.listenAsync().then(callback);
+  /**
+   * Starts the microservice.
+   *
+   * @returns {void}
+   */
+  public async listen(): Promise<any> {
+    this.assertNotInPreviewMode('listen');
+    if (!this.isInitialized) {
+      try {
+        await this.registerModules();
+      } catch (err) {
+        // The server never starts, so its callback below can't flush them.
+        this.flushLogsIfAutoFlushEnabled();
+        throw err;
+      }
+    }
+
+    return new Promise<any>((resolve, reject) => {
+      this.serverInstance.listen((err, info) => {
+        this.flushLogsIfAutoFlushEnabled();
+        if (err) {
+          return reject(err as Error);
+        }
+        this.logger.log(MESSAGES.MICROSERVICE_READY);
+        resolve(info);
+      });
+    });
   }
 
-  public async listenAsync(): Promise<any> {
-    !this.isInitialized && (await this.registerModules());
-
-    this.logger.log(MESSAGES.MICROSERVICE_READY);
-    return new Promise<void>(resolve => this.server.listen(resolve));
-  }
-
+  /**
+   * Terminates the application.
+   *
+   * @returns {Promise<void>}
+   */
   public async close(): Promise<any> {
-    await this.server.close();
+    await this.serverInstance.close();
     if (this.isTerminated) {
+      // A hybrid application flags every connected microservice as terminated
+      // before closing it, because the parent owns the shared container and
+      // runs the lifecycle hooks itself - running them here as well would
+      // execute the whole chain twice. The process signal listeners this
+      // instance registered on its own are not shared, though, so they still
+      // have to be detached here; nothing else holds a reference to them.
+      this.unsubscribeFromProcessSignals();
       return;
     }
     this.setIsTerminated(true);
     await this.closeApplication();
   }
 
+  /**
+   * Sets the flag indicating that the application is initialized.
+   * @param isInitialized Value to set
+   */
   public setIsInitialized(isInitialized: boolean) {
     this.isInitialized = isInitialized;
   }
 
+  /**
+   * Sets the flag indicating that the application is terminated.
+   * @param isTerminated Value to set
+   */
   public setIsTerminated(isTerminated: boolean) {
     this.isTerminated = isTerminated;
   }
 
+  /**
+   * Sets the flag indicating that the init hook was called.
+   * @param isInitHookCalled Value to set
+   */
   public setIsInitHookCalled(isInitHookCalled: boolean) {
-    this.isInitHookCalled = isInitHookCalled;
+    this.wasInitHookCalled = isInitHookCalled;
+  }
+
+  /**
+   * Sets the flag indicating that the microservice is connected to a hybrid
+   * application, which sets up the container they share (gateways, clients
+   * and lifecycle hooks).
+   * @param isConnectedToApplication Value to set
+   */
+  public setIsConnectedToApplication(isConnectedToApplication: boolean) {
+    this.isConnectedToApplication = isConnectedToApplication;
+  }
+
+  /**
+   * Registers an event listener for the given event.
+   * @param event Event name
+   * @param callback Callback to be executed when the event is emitted
+   */
+  public on(event: string | number | symbol, callback: Function) {
+    if ('on' in this.serverInstance) {
+      return this.serverInstance.on(event as string, callback);
+    }
+    throw new Error('"on" method not supported by the underlying server');
+  }
+
+  /**
+   * Returns an instance of the underlying server/broker instance,
+   * or a group of servers if there are more than one.
+   */
+  public unwrap<T>(): T {
+    if ('unwrap' in this.serverInstance) {
+      return this.serverInstance.unwrap();
+    }
+    throw new Error('"unwrap" method not supported by the underlying server');
+  }
+
+  /**
+   * Returns the underlying transport server instance.
+   * Use this to close only the transport (port/connection) without
+   * triggering the full application shutdown lifecycle.
+   */
+  public getTransportServer(): ITransportServer {
+    return this.serverInstance;
   }
 
   protected async closeApplication(): Promise<any> {
@@ -156,11 +428,40 @@ export class NestMicroservice
   }
 
   protected async dispose(): Promise<void> {
-    await this.server.close();
     if (this.isTerminated) {
       return;
     }
+    await this.serverInstance.close();
     this.socketModule && (await this.socketModule.close());
     this.microservicesModule && (await this.microservicesModule.close());
+  }
+
+  protected resolveAsyncOptions(config: AsyncMicroserviceOptions) {
+    const args = config.inject?.map(token =>
+      this.get(token, { strict: false }),
+    );
+    return config.useFactory(...args);
+  }
+
+  private applyInstanceDecoratorIfRegistered<T>(...instances: T[]): T[] {
+    if (this.appOptions.instrument?.instanceDecorator) {
+      const decorate = makeSafeInstanceDecorator(
+        this.appOptions.instrument.instanceDecorator,
+      );
+      return instances.map(instance => decorate(instance) as T);
+    }
+    return instances;
+  }
+
+  private async loadSocketModule() {
+    if (!this.socketModule) {
+      const socketModule = await optionalRequire(
+        '@nestjs/websockets/socket-module',
+        () => import('@nestjs/websockets/socket-module.js'),
+      );
+      if (socketModule?.SocketModule) {
+        this.socketModule = new socketModule.SocketModule();
+      }
+    }
   }
 }

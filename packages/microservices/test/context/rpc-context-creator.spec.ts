@@ -1,20 +1,23 @@
-import { ExecutionContextHost } from '@nestjs/core/helpers/execution-context-host';
-import { expect } from 'chai';
-import { of } from 'rxjs';
-import * as sinon from 'sinon';
-import { Injectable, UseGuards, UsePipes } from '../../../common';
-import { CUSTOM_ROUTE_AGRS_METADATA } from '../../../common/constants';
+import { ExecutionContextHost } from '@nestjs/core/helpers/execution-context-host.js';
+import { firstValueFrom, lastValueFrom, Observable, of, toArray } from 'rxjs';
+import { CallHandler, Injectable, UseGuards, UsePipes } from '../../../common';
+import { CUSTOM_ROUTE_ARGS_METADATA } from '../../../common/constants';
 import { ApplicationConfig } from '../../../core/application-config';
 import { GuardsConsumer } from '../../../core/guards/guards-consumer';
 import { GuardsContextCreator } from '../../../core/guards/guards-context-creator';
 import { NestContainer } from '../../../core/injector/container';
+import { InstanceWrapper } from '../../../core/injector/instance-wrapper';
 import { InterceptorsConsumer } from '../../../core/interceptors/interceptors-consumer';
 import { InterceptorsContextCreator } from '../../../core/interceptors/interceptors-context-creator';
 import { PipesConsumer } from '../../../core/pipes/pipes-consumer';
 import { PipesContextCreator } from '../../../core/pipes/pipes-context-creator';
 import { ExceptionFiltersContext } from '../../context/exception-filters-context';
-import { RpcContextCreator } from '../../context/rpc-context-creator';
+import {
+  getHandlerObservableNotifier,
+  RpcContextCreator,
+} from '../../context/rpc-context-creator';
 import { RpcProxy } from '../../context/rpc-proxy';
+import { Payload } from '../../decorators/payload.decorator';
 import { RpcParamtype } from '../../enums/rpc-paramtype.enum';
 import { RpcParamsFactory } from '../../factories/rpc-params-factory';
 import { RpcException } from '../../index';
@@ -49,6 +52,20 @@ describe('RpcContextCreator', () => {
     test(data: string) {
       return of(false);
     }
+
+    testString(data: string) {
+      return 'plain-value';
+    }
+
+    testNumber(data: string) {
+      return 42;
+    }
+
+    testUndefined(data: string) {}
+
+    testArray(data: string) {
+      return [1, 2];
+    }
   }
 
   beforeEach(() => {
@@ -58,7 +75,7 @@ describe('RpcContextCreator', () => {
       container,
       new ApplicationConfig() as any,
     );
-    sinon.stub(rpcProxy, 'create').callsFake(a => a);
+    vi.spyOn(rpcProxy, 'create').mockImplementation(a => a);
 
     pipesCreator = new PipesContextCreator(container);
     pipesConsumer = new PipesConsumer();
@@ -78,33 +95,52 @@ describe('RpcContextCreator', () => {
     instance = new Test();
     module = 'test';
   });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   describe('create', () => {
     it('should create exception handler', () => {
-      const handlerCreateSpy = sinon.spy(exceptionFiltersContext, 'create');
+      const handlerCreateSpy = vi.spyOn(exceptionFiltersContext, 'create');
       contextCreator.create(instance, instance.test, module, 'test');
-      expect(
-        handlerCreateSpy.calledWith(instance, instance.test as any, module),
-      ).to.be.true;
+      expect(handlerCreateSpy).toHaveBeenCalledWith(
+        instance,
+        instance.test as any,
+        module,
+        expect.anything(),
+        undefined,
+      );
     });
     it('should create pipes context', () => {
-      const pipesCreateSpy = sinon.spy(pipesCreator, 'create');
+      const pipesCreateSpy = vi.spyOn(pipesCreator, 'create');
       contextCreator.create(instance, instance.test, module, 'test');
-      expect(pipesCreateSpy.calledWith(instance, instance.test as any, module))
-        .to.be.true;
+      expect(pipesCreateSpy).toHaveBeenCalledWith(
+        instance,
+        instance.test as any,
+        module,
+        expect.anything(),
+        undefined,
+      );
     });
     it('should create guards context', () => {
-      const guardsCreateSpy = sinon.spy(guardsContextCreator, 'create');
+      const guardsCreateSpy = vi.spyOn(guardsContextCreator, 'create');
       contextCreator.create(instance, instance.test, module, 'test');
-      expect(guardsCreateSpy.calledWith(instance, instance.test, module)).to.be
-        .true;
+      expect(guardsCreateSpy).toHaveBeenCalledWith(
+        instance,
+        instance.test,
+        module,
+        expect.anything(),
+        undefined,
+      );
     });
     describe('when proxy called', () => {
       it('should call guards consumer `tryActivate`', async () => {
-        const tryActivateSpy = sinon.spy(guardsConsumer, 'tryActivate');
-        sinon
-          .stub(guardsContextCreator, 'create')
-          .callsFake(() => [{ canActivate: () => true }]);
-        const proxy = await contextCreator.create(
+        const tryActivateSpy = vi.spyOn(guardsConsumer, 'tryActivate');
+        vi.spyOn(guardsContextCreator, 'create').mockImplementation(
+          () => [{ canActivate: () => true }] as any,
+        );
+        const proxy = contextCreator.create(
           instance,
           instance.test,
           module,
@@ -113,15 +149,15 @@ describe('RpcContextCreator', () => {
         const data = 'test';
         await proxy(data);
 
-        expect(tryActivateSpy.called).to.be.true;
+        expect(tryActivateSpy).toHaveBeenCalled();
       });
       describe('when can not activate', () => {
-        it('should throws forbidden exception', async () => {
-          sinon
-            .stub(guardsConsumer, 'tryActivate')
-            .callsFake(async () => false);
+        it('should throw forbidden exception', async () => {
+          vi.spyOn(guardsConsumer, 'tryActivate').mockImplementation(
+            async () => false,
+          );
 
-          const proxy = await contextCreator.create(
+          const proxy = contextCreator.create(
             instance,
             instance.test,
             module,
@@ -130,28 +166,162 @@ describe('RpcContextCreator', () => {
           const data = 'test';
 
           proxy(null, data).catch(err =>
-            expect(err).to.be.instanceOf(RpcException),
+            expect(err).toBeInstanceOf(RpcException),
           );
         });
       });
     });
+    describe('when the "constructor" of the controller prototype was overwritten', () => {
+      it('should apply the class-level guards of the registered class', async () => {
+        class Mixin {}
+        @UseGuards({ canActivate: () => false })
+        class MixedIn {
+          handle() {
+            return of('handled');
+          }
+        }
+        // What mixin helpers copying every property of the prototype do
+        MixedIn.prototype.constructor = Mixin;
+        new InstanceWrapper({ metatype: MixedIn });
+
+        const controller = new MixedIn();
+        const proxy = contextCreator.create(
+          controller,
+          controller.handle,
+          module,
+          'handle',
+        );
+        await expect(proxy('data')).rejects.toBeInstanceOf(RpcException);
+      });
+      it('should apply the pipes bound to the parameters of its own handlers', async () => {
+        class Mixin {}
+        class MixedIn {
+          handle(@Payload({ transform: () => 'piped' }) data: string) {
+            return of(data);
+          }
+        }
+        // What mixin helpers copying every property of the prototype do
+        MixedIn.prototype.constructor = Mixin;
+        new InstanceWrapper({ metatype: MixedIn });
+
+        const controller = new MixedIn();
+        const proxy = contextCreator.create(
+          controller,
+          controller.handle,
+          module,
+          'handle',
+        );
+        expect(await firstValueFrom(await proxy('data'))).toBe('piped');
+      });
+    });
+  });
+
+  describe('getHandlerObservableNotifier', () => {
+    class Controller {
+      handle(data: string): unknown {
+        return data;
+      }
+    }
+    const passThrough = {
+      intercept: (_context: unknown, next: CallHandler) => next.handle(),
+    };
+
+    const callProxy = async (
+      handle: () => unknown,
+      context: object,
+      { interceptors = [passThrough], hooks = [] as unknown[] } = {},
+    ) => {
+      const container: any = new NestContainer();
+      const interceptorsContextCreator = new InterceptorsContextCreator(
+        container,
+      );
+      vi.spyOn(interceptorsContextCreator, 'create').mockReturnValue(
+        interceptors as any,
+      );
+      const creator = new RpcContextCreator(
+        rpcProxy,
+        exceptionFiltersContext,
+        pipesCreator as any,
+        pipesConsumer as any,
+        guardsContextCreator as any,
+        guardsConsumer as any,
+        interceptorsContextCreator as any,
+        new InterceptorsConsumer() as any,
+        { getGlobalPreRequestHooks: () => hooks } as any,
+      );
+      const controller = new Controller();
+      controller.handle = handle;
+
+      const proxy = creator.create(controller, handle, module, 'handle');
+      const result = await proxy('data', context);
+      await lastValueFrom(result, { defaultValue: undefined });
+    };
+
+    it.each([
+      ['returns', () => of('value')],
+      ['resolves to', async () => of('value')],
+    ])(
+      'should report through the context that the handler %s an Observable',
+      async (_, handle) => {
+        const context = {};
+        const onHandlerObservable = vi.fn();
+
+        await callProxy(handle, context);
+        getHandlerObservableNotifier(context)!.subscribe(onHandlerObservable);
+
+        expect(onHandlerObservable).toHaveBeenCalledOnce();
+      },
+    );
+    it.each([
+      ['returns', () => 'value'],
+      ['resolves to', async () => 'value'],
+    ])('should not report that the handler %s a value', async (_, handle) => {
+      const context = {};
+      const onHandlerObservable = vi.fn();
+
+      await callProxy(handle, context);
+      getHandlerObservableNotifier(context)!.subscribe(onHandlerObservable);
+
+      expect(onHandlerObservable).not.toHaveBeenCalled();
+    });
+    it('should report it when only pre-request hooks wrap the result', async () => {
+      const context = {};
+      const onHandlerObservable = vi.fn();
+
+      await callProxy(() => of('value'), context, {
+        interceptors: [],
+        hooks: [(_ctx: unknown, next: () => Observable<unknown>) => next()],
+      });
+      getHandlerObservableNotifier(context)!.subscribe(onHandlerObservable);
+
+      expect(onHandlerObservable).toHaveBeenCalledOnce();
+    });
+    it('should not track the context when the result is not wrapped', async () => {
+      const context = {};
+
+      await callProxy(() => of('value'), context, { interceptors: [] });
+
+      expect(getHandlerObservableNotifier(context)).toBeUndefined();
+    });
   });
 
   describe('reflectCallbackParamtypes', () => {
-    it('should returns paramtypes array', () => {
+    it('should return paramtypes array', () => {
       const paramtypes = contextCreator.reflectCallbackParamtypes(
         instance,
         instance.test,
       );
-      expect(paramtypes).to.be.eql([String]);
+      expect(paramtypes).toEqual([String]);
     });
   });
 
   describe('createGuardsFn', () => {
     it('should throw exception when "tryActivate" returns false', () => {
-      const guardsFn = contextCreator.createGuardsFn([null], null, null);
-      sinon.stub(guardsConsumer, 'tryActivate').callsFake(async () => false);
-      guardsFn([]).catch(err => expect(err).to.not.be.undefined);
+      const guardsFn = contextCreator.createGuardsFn([null], null!, null!)!;
+      vi.spyOn(guardsConsumer, 'tryActivate').mockImplementation(
+        async () => false,
+      );
+      guardsFn([]).catch(err => expect(err).not.toBeUndefined());
     });
   });
 
@@ -160,7 +330,7 @@ describe('RpcContextCreator', () => {
       const metadata = {
         [RpcParamtype.PAYLOAD]: { index: 0, data: 'test', pipes: [] },
         [RpcParamtype.CONTEXT]: { index: 2, data: 'test', pipes: [] },
-        [`key${CUSTOM_ROUTE_AGRS_METADATA}`]: {
+        [`key${CUSTOM_ROUTE_ARGS_METADATA}`]: {
           index: 3,
           data: 'custom',
           pipes: [],
@@ -177,36 +347,208 @@ describe('RpcContextCreator', () => {
       const expectedValues = [
         { index: 0, type: RpcParamtype.PAYLOAD, data: 'test' },
         { index: 2, type: RpcParamtype.CONTEXT, data: 'test' },
-        { index: 3, type: `key${CUSTOM_ROUTE_AGRS_METADATA}`, data: 'custom' },
+        { index: 3, type: `key${CUSTOM_ROUTE_ARGS_METADATA}`, data: 'custom' },
       ];
-      expect(values[0]).to.deep.include(expectedValues[0]);
-      expect(values[1]).to.deep.include(expectedValues[1]);
-      expect(values[2]).to.deep.include(expectedValues[2]);
+      expect(values[0]).toMatchObject(expectedValues[0]);
+      expect(values[1]).toMatchObject(expectedValues[1]);
+      expect(values[2]).toMatchObject(expectedValues[2]);
     });
   });
   describe('getParamValue', () => {
-    let consumerApplySpy: sinon.SinonSpy;
+    let consumerApplySpy: any;
     const value = 3,
       metatype = null,
-      transforms = [{ transform: sinon.spy() }];
+      transforms = [{ transform: vi.fn() }];
 
     beforeEach(() => {
-      consumerApplySpy = sinon.spy(pipesConsumer, 'apply');
+      consumerApplySpy = vi.spyOn(pipesConsumer, 'apply');
     });
-    it('should call "consumer.apply"', () => {
-      contextCreator.getParamValue(
+    it('should call "consumer.apply"', async () => {
+      await contextCreator.getParamValue(
         value,
         { metatype, type: RpcParamtype.PAYLOAD, data: null },
         transforms,
       );
-      expect(consumerApplySpy.called).to.be.true;
+      expect(consumerApplySpy).toHaveBeenCalled();
+    });
+  });
+  describe('createPipesFn without pipes', () => {
+    const param = (
+      index: number,
+      extractValue: (...args: any[]) => unknown,
+      type: number | string = 'test',
+    ) => ({ index, type, data: undefined as any, pipes: [], extractValue });
+
+    it('fills the args without returning a promise', () => {
+      const pipesFn = contextCreator.createPipesFn(
+        [],
+        [
+          param(1, (first: unknown) => first),
+          param(0, (_first: unknown, second: unknown) => second),
+        ],
+      )!;
+      const args: unknown[] = [undefined, undefined];
+
+      expect(pipesFn(args, 'a', 'b')).toBeUndefined();
+      expect(args).toEqual(['b', 'a']);
+    });
+    it('settles a thenable value, calling "then()" once', async () => {
+      const thenable = { then: vi.fn(resolve => resolve('settled')) };
+      const pipesFn = contextCreator.createPipesFn(
+        [],
+        [param(0, () => thenable)],
+      )!;
+      const args: unknown[] = [undefined];
+
+      await pipesFn(args);
+
+      expect(args).toEqual(['settled']);
+      expect(thenable.then).toHaveBeenCalledOnce();
+    });
+    it('runs every extractor and rejects with the first error', async () => {
+      const first = new Error('first');
+      const last = vi.fn(() => 'last');
+      const pipesFn = contextCreator.createPipesFn(
+        [],
+        [
+          param(0, () => {
+            throw first;
+          }),
+          param(1, () => {
+            throw new Error('second');
+          }),
+          param(2, last),
+        ],
+      )!;
+
+      await expect(pipesFn([])).rejects.toBe(first);
+      expect(last).toHaveBeenCalledOnce();
+    });
+    it('rejects with an extractor error before an earlier thenable rejects', async () => {
+      const error = new Error('extractor');
+      const thenable = {
+        then: vi.fn((_resolve, reject) => reject(new Error('thenable'))),
+      };
+      const pipesFn = contextCreator.createPipesFn(
+        [],
+        [
+          param(0, () => thenable),
+          param(1, () => {
+            throw error;
+          }),
+        ],
+      )!;
+
+      await expect(pipesFn([])).rejects.toBe(error);
+      expect(thenable.then).toHaveBeenCalledOnce();
+    });
+  });
+  describe('createPipesFn with pipes', () => {
+    it('runs the global pipes, then the param pipes, with the metadata of the param on every call', async () => {
+      const globalPipe = { transform: vi.fn(async value => `${value}-g`) };
+      const paramPipe = { transform: vi.fn(value => `${value}-p`) };
+      const pipesFn = contextCreator.createPipesFn(
+        [globalPipe],
+        [
+          {
+            index: 0,
+            type: 'test',
+            data: 'id',
+            pipes: [paramPipe],
+            extractValue: () => '42',
+          },
+          {
+            index: 1,
+            type: 'test',
+            data: undefined as any,
+            pipes: [],
+            extractValue: () => '7',
+          },
+        ],
+      )!;
+      const args: unknown[] = [undefined, undefined];
+
+      await pipesFn(args);
+      await pipesFn(args);
+
+      expect(args).toEqual(['42-g-p', '7-g']);
+      expect(globalPipe.transform).toHaveBeenCalledTimes(4);
+      expect(globalPipe.transform).toHaveBeenCalledWith('42', {
+        metatype: undefined,
+        type: 'custom',
+        data: 'id',
+        schema: undefined,
+      });
+      expect(paramPipe.transform).toHaveBeenCalledTimes(2);
+    });
+    it('keeps a pipeless param synchronous next to a piped one', async () => {
+      const pipe = { transform: vi.fn(async value => `${value}-p`) };
+      const pipesFn = contextCreator.createPipesFn(
+        [],
+        [
+          {
+            index: 0,
+            type: 'test',
+            data: undefined as any,
+            pipes: [pipe],
+            extractValue: () => 'a',
+          },
+          {
+            index: 1,
+            type: 'test',
+            data: undefined as any,
+            pipes: [],
+            extractValue: () => 'b',
+          },
+        ],
+      )!;
+      const args: unknown[] = [undefined, undefined];
+
+      const result = pipesFn(args);
+
+      expect(result).toBeInstanceOf(Promise);
+      expect(args[1]).toBe('b');
+      await result;
+      expect(args).toEqual(['a-p', 'b']);
+    });
+    it("starts each param's pipes right after extracting it", async () => {
+      const order: string[] = [];
+      const pipe = {
+        transform: (value: string) => {
+          order.push(`transform ${value}`);
+          return value;
+        },
+      };
+      const query = (index: number) => ({
+        index,
+        type: 'test',
+        data: undefined as any,
+        pipes: [],
+        extractValue: () => {
+          order.push(`extract ${index}`);
+          return `${index}`;
+        },
+      });
+      const pipesFn = contextCreator.createPipesFn(
+        [pipe],
+        [query(0), query(1)],
+      )!;
+
+      await pipesFn([]);
+
+      expect(order).toEqual([
+        'extract 0',
+        'transform 0',
+        'extract 1',
+        'transform 1',
+      ]);
     });
   });
   describe('createPipesFn', () => {
     describe('when "paramsOptions" is empty', () => {
       it('returns null', async () => {
         const pipesFn = contextCreator.createPipesFn([], []);
-        expect(pipesFn).to.be.null;
+        expect(pipesFn).toBeNull();
       });
     });
     describe('when "paramsOptions" is not empty', () => {
@@ -217,15 +559,453 @@ describe('RpcContextCreator', () => {
             {
               index: 1,
               type: 'test',
-              data: null,
+              data: null!,
               pipes: [],
               extractValue: () => null,
             },
           ],
-        );
+        )!;
         await pipesFn([]);
-        expect(pipesFn).to.be.a('function');
+        expect(pipesFn).toBeTypeOf('function');
       });
+    });
+    describe('when the pipe of a parameter fails', () => {
+      const param = (index: number, transform: () => unknown) => ({
+        index,
+        type: 'test',
+        data: null!,
+        pipes: [{ transform }],
+        extractValue: () => null,
+      });
+
+      it('should fail once the pipes of the other parameters have settled', async () => {
+        const error = new RpcException('Validation failed');
+        let finishLookup!: () => void;
+        const lookup = new Promise<string>(resolve => {
+          finishLookup = () => resolve('entity');
+        });
+        const pipesFn = contextCreator.createPipesFn(
+          [],
+          [param(1, () => Promise.reject(error)), param(2, () => lookup)],
+        )!;
+
+        let settled = false;
+        const result = pipesFn([]).finally(() => (settled = true));
+        result.catch(() => undefined);
+        await new Promise(resolve => setImmediate(resolve));
+        expect(settled).toBe(false);
+
+        finishLookup();
+        await expect(result).rejects.toBe(error);
+      });
+
+      it('should fail with the error that came first', async () => {
+        const first = new Error('first');
+        const pipesFn = contextCreator.createPipesFn(
+          [],
+          [
+            param(
+              1,
+              () =>
+                new Promise((_, reject) =>
+                  setImmediate(() => reject(new Error('second'))),
+                ),
+            ),
+            param(2, () => Promise.reject(first)),
+          ],
+        )!;
+
+        await expect(pipesFn([])).rejects.toBe(first);
+      });
+    });
+  });
+
+  describe('preRequest hooks', () => {
+    function makeCreatorWithHooks(hooks: any[]) {
+      const container: any = new NestContainer();
+      const localRpcProxy = new RpcProxy();
+      const localExceptionFiltersContext = new ExceptionFiltersContext(
+        container,
+        new ApplicationConfig() as any,
+      );
+      vi.spyOn(localRpcProxy, 'create').mockImplementation(a => a);
+
+      const mockConfig = {
+        getGlobalPreRequestHooks: () => hooks,
+      } as any;
+
+      return new RpcContextCreator(
+        localRpcProxy,
+        localExceptionFiltersContext,
+        new PipesContextCreator(container) as any,
+        new PipesConsumer() as any,
+        new GuardsContextCreator(container) as any,
+        new GuardsConsumer() as any,
+        new InterceptorsContextCreator(container) as any,
+        new InterceptorsConsumer() as any,
+        mockConfig,
+      );
+    }
+
+    it('should not flatten a string returned by the handler', async () => {
+      const hookFn = (_ctx: any, next: () => Observable<unknown>) => next();
+      const creator = makeCreatorWithHooks([hookFn]);
+
+      const proxy = creator.create(
+        instance,
+        instance.testString,
+        module,
+        'testString',
+      );
+      const result = await proxy('data');
+
+      await expect(firstValueFrom(result as Observable<unknown>)).resolves.toBe(
+        'plain-value',
+      );
+    });
+
+    it('should support a handler returning a number', async () => {
+      const hookFn = (_ctx: any, next: () => Observable<unknown>) => next();
+      const creator = makeCreatorWithHooks([hookFn]);
+
+      const proxy = creator.create(
+        instance,
+        instance.testNumber,
+        module,
+        'testNumber',
+      );
+      const result = await proxy('data');
+
+      await expect(firstValueFrom(result as Observable<unknown>)).resolves.toBe(
+        42,
+      );
+    });
+
+    it('should emit undefined once for a handler returning nothing', async () => {
+      const hookFn = (_ctx: any, next: () => Observable<unknown>) => next();
+      const creator = makeCreatorWithHooks([hookFn]);
+
+      const proxy = creator.create(
+        instance,
+        instance.testUndefined,
+        module,
+        'testUndefined',
+      );
+      const result = await proxy('data');
+
+      await expect(
+        lastValueFrom((result as Observable<unknown>).pipe(toArray())),
+      ).resolves.toEqual([undefined]);
+    });
+
+    it('should emit an array returned by the handler as a single value', async () => {
+      const hookFn = (_ctx: any, next: () => Observable<unknown>) => next();
+      const creator = makeCreatorWithHooks([hookFn]);
+
+      const proxy = creator.create(
+        instance,
+        instance.testArray,
+        module,
+        'testArray',
+      );
+      const result = await proxy('data');
+
+      await expect(
+        lastValueFrom((result as Observable<unknown>).pipe(toArray())),
+      ).resolves.toEqual([[1, 2]]);
+    });
+
+    it('should still unwrap an observable returned by the handler', async () => {
+      const hookFn = (_ctx: any, next: () => Observable<unknown>) => next();
+      const creator = makeCreatorWithHooks([hookFn]);
+
+      const proxy = creator.create(instance, instance.test, module, 'test');
+      const result = await proxy('data');
+
+      await expect(firstValueFrom(result as Observable<unknown>)).resolves.toBe(
+        false,
+      );
+    });
+
+    it('should execute preRequest hook before guards', async () => {
+      const executionOrder: string[] = [];
+
+      const hookFn = (_ctx: any, next: () => Observable<unknown>) => {
+        executionOrder.push('hook');
+        return next();
+      };
+
+      const creator = makeCreatorWithHooks([hookFn]);
+      vi.spyOn(
+        new GuardsContextCreator(new NestContainer() as any),
+        'create',
+      ).mockReturnValue([] as any);
+
+      const localGuardsConsumer = new GuardsConsumer();
+      vi.spyOn(localGuardsConsumer, 'tryActivate').mockImplementation(
+        async () => {
+          executionOrder.push('guard');
+          return true;
+        },
+      );
+
+      const container: any = new NestContainer();
+      const localRpcProxy = new RpcProxy();
+      const localExceptionFiltersContext = new ExceptionFiltersContext(
+        container,
+        new ApplicationConfig() as any,
+      );
+      vi.spyOn(localRpcProxy, 'create').mockImplementation(a => a);
+      const mockConfig = { getGlobalPreRequestHooks: () => [hookFn] } as any;
+      const localGuardsContextCreator = new GuardsContextCreator(container);
+      vi.spyOn(localGuardsContextCreator, 'create').mockReturnValue([
+        {
+          canActivate: () => {
+            executionOrder.push('guard');
+            return true;
+          },
+        },
+      ] as any);
+
+      const hookCreator = new RpcContextCreator(
+        localRpcProxy,
+        localExceptionFiltersContext,
+        new PipesContextCreator(container) as any,
+        new PipesConsumer() as any,
+        localGuardsContextCreator as any,
+        new GuardsConsumer() as any,
+        new InterceptorsContextCreator(container) as any,
+        new InterceptorsConsumer() as any,
+        mockConfig,
+      );
+
+      const proxy = hookCreator.create(instance, instance.test, module, 'test');
+      const result = await proxy('data');
+      if (result && typeof (result as any).subscribe === 'function') {
+        await new Promise<void>(resolve => {
+          (result as Observable<unknown>).subscribe({
+            complete: resolve,
+            error: resolve,
+          });
+        });
+      }
+
+      expect(executionOrder[0]).toBe('hook');
+      expect(executionOrder[1]).toBe('guard');
+    });
+
+    it('should chain multiple hooks in registration order', async () => {
+      const order: string[] = [];
+
+      const hook1 = (_ctx: any, next: () => Observable<unknown>) => {
+        order.push('hook1');
+        return next();
+      };
+      const hook2 = (_ctx: any, next: () => Observable<unknown>) => {
+        order.push('hook2');
+        return next();
+      };
+
+      const container: any = new NestContainer();
+      const localRpcProxy = new RpcProxy();
+      vi.spyOn(localRpcProxy, 'create').mockImplementation(a => a);
+      const mockConfig = {
+        getGlobalPreRequestHooks: () => [hook1, hook2],
+      } as any;
+      const localGuardsContextCreator = new GuardsContextCreator(container);
+      vi.spyOn(localGuardsContextCreator, 'create').mockReturnValue([
+        {
+          canActivate: () => {
+            order.push('guard');
+            return true;
+          },
+        },
+      ] as any);
+
+      const hookCreator = new RpcContextCreator(
+        localRpcProxy,
+        new ExceptionFiltersContext(container, new ApplicationConfig() as any),
+        new PipesContextCreator(container) as any,
+        new PipesConsumer() as any,
+        localGuardsContextCreator as any,
+        new GuardsConsumer() as any,
+        new InterceptorsContextCreator(container) as any,
+        new InterceptorsConsumer() as any,
+        mockConfig,
+      );
+
+      const proxy = hookCreator.create(instance, instance.test, module, 'test');
+      const result = await proxy('data');
+      if (result && typeof (result as any).subscribe === 'function') {
+        await new Promise<void>(resolve => {
+          (result as Observable<unknown>).subscribe({
+            complete: resolve,
+            error: resolve,
+          });
+        });
+      }
+
+      expect(order).toEqual(['hook1', 'hook2', 'guard']);
+    });
+
+    it('should not call hook when no hooks are registered (fast-path)', async () => {
+      const hookFn = vi.fn((_ctx: any, next: () => Observable<unknown>) =>
+        next(),
+      );
+      const creator = makeCreatorWithHooks([]);
+
+      const guardSpy = vi.spyOn(guardsConsumer, 'tryActivate');
+      vi.spyOn(guardsContextCreator, 'create').mockImplementation(
+        () => [{ canActivate: () => true }] as any,
+      );
+
+      contextCreator = new RpcContextCreator(
+        rpcProxy,
+        exceptionFiltersContext,
+        pipesCreator as any,
+        pipesConsumer as any,
+        guardsContextCreator as any,
+        guardsConsumer as any,
+        new InterceptorsContextCreator(new NestContainer() as any) as any,
+        new InterceptorsConsumer() as any,
+        { getGlobalPreRequestHooks: () => [] } as any,
+      );
+
+      const proxy = contextCreator.create(
+        instance,
+        instance.test,
+        module,
+        'test',
+      );
+      await proxy('data');
+      expect(hookFn).not.toHaveBeenCalled();
+      expect(guardSpy).toHaveBeenCalled();
+    });
+
+    it('should provide ExecutionContext with getClass() and getHandler() to the hook', async () => {
+      let capturedContext: any;
+
+      const hookFn = (ctx: any, next: () => Observable<unknown>) => {
+        capturedContext = ctx;
+        return next();
+      };
+
+      const container: any = new NestContainer();
+      const localRpcProxy = new RpcProxy();
+      vi.spyOn(localRpcProxy, 'create').mockImplementation(a => a);
+      const mockConfig = { getGlobalPreRequestHooks: () => [hookFn] } as any;
+      const localGuardsContextCreator = new GuardsContextCreator(container);
+      vi.spyOn(localGuardsContextCreator, 'create').mockReturnValue([] as any);
+
+      const hookCreator = new RpcContextCreator(
+        localRpcProxy,
+        new ExceptionFiltersContext(container, new ApplicationConfig() as any),
+        new PipesContextCreator(container) as any,
+        new PipesConsumer() as any,
+        localGuardsContextCreator as any,
+        new GuardsConsumer() as any,
+        new InterceptorsContextCreator(container) as any,
+        new InterceptorsConsumer() as any,
+        mockConfig,
+      );
+
+      const proxy = hookCreator.create(instance, instance.test, module, 'test');
+      const result = await proxy('data');
+      if (result && typeof (result as any).subscribe === 'function') {
+        await new Promise<void>(resolve => {
+          (result as Observable<unknown>).subscribe({
+            complete: resolve,
+            error: resolve,
+          });
+        });
+      }
+
+      expect(capturedContext).not.toBeUndefined();
+      expect(capturedContext.getClass()).toBe(Test);
+      expect(capturedContext.getHandler()).toBe(instance.test);
+      expect(capturedContext.getType()).toBe('rpc');
+    });
+
+    it('should provide the registered class to the hook when the "constructor" of the controller prototype was overwritten', async () => {
+      class Mixin {}
+      class MixedIn {
+        handle() {
+          return of('handled');
+        }
+      }
+      // What mixin helpers copying every property of the prototype do
+      MixedIn.prototype.constructor = Mixin;
+      new InstanceWrapper({ metatype: MixedIn });
+
+      let capturedClass: unknown;
+      const hookFn = (ctx: any, next: () => Observable<unknown>) => {
+        capturedClass = ctx.getClass();
+        return next();
+      };
+      const creator = makeCreatorWithHooks([hookFn]);
+
+      const controller = new MixedIn();
+      const proxy = creator.create(
+        controller,
+        controller.handle,
+        module,
+        'handle',
+      );
+      const result = await proxy('data');
+
+      await expect(firstValueFrom(result as Observable<unknown>)).resolves.toBe(
+        'handled',
+      );
+      expect(capturedClass).toBe(MixedIn);
+    });
+
+    it('should simulate ALS context available in guard (AsyncLocalStorage scenario)', async () => {
+      const store = new Map<string, string>();
+      let correlationIdInGuard: string | undefined;
+
+      const hookFn = (_ctx: any, next: () => Observable<unknown>) => {
+        store.set('correlationId', 'test-id-123');
+        return next();
+      };
+
+      const container: any = new NestContainer();
+      const localRpcProxy = new RpcProxy();
+      vi.spyOn(localRpcProxy, 'create').mockImplementation(a => a);
+      const mockConfig = { getGlobalPreRequestHooks: () => [hookFn] } as any;
+      const localGuardsContextCreator = new GuardsContextCreator(container);
+      vi.spyOn(localGuardsContextCreator, 'create').mockReturnValue([
+        {
+          canActivate: () => {
+            correlationIdInGuard = store.get('correlationId');
+            return true;
+          },
+        },
+      ] as any);
+
+      const hookCreator = new RpcContextCreator(
+        localRpcProxy,
+        new ExceptionFiltersContext(container, new ApplicationConfig() as any),
+        new PipesContextCreator(container) as any,
+        new PipesConsumer() as any,
+        localGuardsContextCreator as any,
+        new GuardsConsumer() as any,
+        new InterceptorsContextCreator(container) as any,
+        new InterceptorsConsumer() as any,
+        mockConfig,
+      );
+
+      const proxy = hookCreator.create(instance, instance.test, module, 'test');
+      const result = await proxy('data');
+      if (result && typeof (result as any).subscribe === 'function') {
+        await new Promise<void>(resolve => {
+          (result as Observable<unknown>).subscribe({
+            complete: resolve,
+            error: resolve,
+          });
+        });
+      }
+
+      expect(correlationIdInGuard).toBe('test-id-123');
     });
   });
 });

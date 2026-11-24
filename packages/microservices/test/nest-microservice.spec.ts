@@ -1,0 +1,488 @@
+import { Logger } from '@nestjs/common';
+import { ApplicationConfig } from '@nestjs/core/application-config.js';
+import { GraphInspector } from '@nestjs/core/inspector/graph-inspector.js';
+import { Transport } from '@nestjs/microservices/enums/index.js';
+import { AsyncMicroserviceOptions } from '@nestjs/microservices/interfaces/index.js';
+import { NestMicroservice } from '@nestjs/microservices/nest-microservice.js';
+import { Server, ServerTCP } from '@nestjs/microservices/server/index.js';
+
+const createMockGraphInspector = (): GraphInspector =>
+  ({
+    insertOrphanedEnhancer: vi.fn(),
+  }) as unknown as GraphInspector;
+
+const createMockAppConfig = (): ApplicationConfig =>
+  ({
+    useGlobalFilters: vi.fn(),
+    useGlobalPipes: vi.fn(),
+    useGlobalGuards: vi.fn(),
+    useGlobalInterceptors: vi.fn(),
+    setIoAdapter: vi.fn(),
+  }) as unknown as ApplicationConfig;
+
+const mockContainer = {
+  getModuleCompiler: vi.fn(),
+  getModules: () =>
+    Object.assign(new Map(), {
+      addRpcTarget: vi.fn(),
+    }),
+  get: () => null,
+  getHttpAdapterHost: () => undefined,
+} as any;
+
+describe('NestMicroservice', () => {
+  let mockGraphInspector: GraphInspector;
+  let mockAppConfig: ApplicationConfig;
+
+  beforeEach(() => {
+    mockGraphInspector = createMockGraphInspector();
+    mockAppConfig = createMockAppConfig();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('should use ServerFactory if no strategy is provided', () => {
+    const instance = new NestMicroservice(
+      mockContainer,
+      { transport: Transport.TCP },
+      mockGraphInspector,
+      mockAppConfig,
+    );
+
+    expect((instance as any).serverInstance).toBeInstanceOf(ServerTCP);
+  });
+
+  it('should use provided strategy if present in config', () => {
+    const strategy = new (class extends Server {
+      listen = vi.fn();
+      close = vi.fn();
+      on = vi.fn();
+      unwrap = vi.fn();
+    })();
+
+    const instance = new NestMicroservice(
+      mockContainer,
+      { strategy },
+      mockGraphInspector,
+      mockAppConfig,
+    );
+
+    expect((instance as any).serverInstance).toBe(strategy);
+  });
+
+  it('should use strategy resolved from useFactory config', () => {
+    const strategy = new (class extends Server {
+      listen = vi.fn();
+      close = vi.fn();
+      on = vi.fn();
+      unwrap = vi.fn();
+    })();
+    const asyncConfig: AsyncMicroserviceOptions = {
+      useFactory: () => ({ strategy }),
+      inject: [],
+    };
+
+    const instance = new NestMicroservice(
+      mockContainer,
+      asyncConfig,
+      mockGraphInspector,
+      mockAppConfig,
+    );
+
+    expect((instance as any).serverInstance).toBe(strategy);
+  });
+
+  it('should call listen() on server when listen() is called', async () => {
+    const listenSpy = vi.fn((cb: () => void) => cb());
+    const strategy = new (class extends Server {
+      listen = listenSpy;
+      close = vi.fn();
+      on = vi.fn();
+      unwrap = vi.fn();
+    })();
+
+    const instance = new NestMicroservice(
+      mockContainer,
+      { strategy },
+      mockGraphInspector,
+      mockAppConfig,
+    );
+
+    await instance.listen();
+    expect(listenSpy).toHaveBeenCalledOnce();
+  });
+
+  it('should call the lifecycle hooks once when init() is called', async () => {
+    const strategy = new (class extends Server {
+      listen = vi.fn();
+      close = vi.fn();
+      on = vi.fn();
+      unwrap = vi.fn();
+    })();
+
+    const instance = new NestMicroservice(
+      mockContainer,
+      { strategy },
+      mockGraphInspector,
+      mockAppConfig,
+    );
+    const callInitHookSpy = vi.spyOn(instance as any, 'callInitHook');
+    const callBootstrapHookSpy = vi.spyOn(instance as any, 'callBootstrapHook');
+
+    await instance.init();
+    expect(callInitHookSpy).toHaveBeenCalledOnce();
+    expect(callBootstrapHookSpy).toHaveBeenCalledOnce();
+  });
+
+  describe('registerModules', () => {
+    const createInstance = () => {
+      const strategy = new (class extends Server {
+        listen = vi.fn();
+        close = vi.fn();
+        on = vi.fn();
+        unwrap = vi.fn();
+      })();
+      const instance = new NestMicroservice(
+        mockContainer,
+        { strategy },
+        mockGraphInspector,
+        mockAppConfig,
+      );
+      const socketModule = { register: vi.fn() };
+      (instance as any).socketModule = socketModule;
+      return { instance, socketModule };
+    };
+
+    it('should bind the gateways', async () => {
+      const { instance, socketModule } = createInstance();
+
+      await instance.registerModules();
+      expect(socketModule.register).toHaveBeenCalledOnce();
+    });
+
+    it('should leave the gateways to the application it is connected to', async () => {
+      const { instance, socketModule } = createInstance();
+      instance.setIsConnectedToApplication(true);
+
+      await instance.registerModules();
+      expect(socketModule.register).not.toHaveBeenCalled();
+    });
+
+    it('should make the gateways turn clients away until the lifecycle hooks have completed', async () => {
+      const { instance } = createInstance();
+      const calls: string[] = [];
+      (instance as any).socketModule = {
+        rejectClients: () => calls.push('rejectClients'),
+        register: () => calls.push('register'),
+        acceptClients: () => calls.push('acceptClients'),
+      };
+      vi.spyOn(instance as any, 'callInitHook').mockImplementation(
+        async () => void calls.push('callInitHook'),
+      );
+      vi.spyOn(instance as any, 'callBootstrapHook').mockImplementation(
+        async () => void calls.push('callBootstrapHook'),
+      );
+
+      await instance.registerModules();
+      expect(calls).toEqual([
+        'rejectClients',
+        'register',
+        'callInitHook',
+        'callBootstrapHook',
+        'acceptClients',
+      ]);
+    });
+
+    it('should assign the clients, register the listeners and call the lifecycle hooks', async () => {
+      const { instance } = createInstance();
+      const microservicesModule = (instance as any).microservicesModule;
+      const setupClientsSpy = vi.spyOn(microservicesModule, 'setupClients');
+      const setupListenersSpy = vi.spyOn(microservicesModule, 'setupListeners');
+      const callInitHookSpy = vi.spyOn(instance as any, 'callInitHook');
+      const callBootstrapHookSpy = vi.spyOn(
+        instance as any,
+        'callBootstrapHook',
+      );
+
+      await instance.registerModules();
+      expect(setupClientsSpy).toHaveBeenCalledOnce();
+      expect(setupListenersSpy).toHaveBeenCalledOnce();
+      expect(callInitHookSpy).toHaveBeenCalledOnce();
+      expect(callBootstrapHookSpy).toHaveBeenCalledOnce();
+    });
+
+    it('should leave the clients and the lifecycle hooks to the application it is connected to', async () => {
+      const { instance } = createInstance();
+      const microservicesModule = (instance as any).microservicesModule;
+      const setupClientsSpy = vi.spyOn(microservicesModule, 'setupClients');
+      const setupListenersSpy = vi.spyOn(microservicesModule, 'setupListeners');
+      const callInitHookSpy = vi.spyOn(instance as any, 'callInitHook');
+      const callBootstrapHookSpy = vi.spyOn(
+        instance as any,
+        'callBootstrapHook',
+      );
+      instance.setIsConnectedToApplication(true);
+
+      await instance.registerModules();
+      expect(setupClientsSpy).not.toHaveBeenCalled();
+      expect(setupListenersSpy).toHaveBeenCalledOnce();
+      expect(callInitHookSpy).not.toHaveBeenCalled();
+      expect(callBootstrapHookSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  it('should delegate unwrap() to server', () => {
+    const unwrapStub = vi.fn().mockReturnValue('core');
+    const strategy = new (class extends Server {
+      listen = vi.fn();
+      close = vi.fn();
+      on = vi.fn();
+      unwrap = unwrapStub;
+    })();
+
+    const instance = new NestMicroservice(
+      mockContainer,
+      { strategy },
+      mockGraphInspector,
+      mockAppConfig,
+    );
+
+    expect(instance.unwrap()).toBe('core');
+  });
+
+  it('should delegate on() to server', () => {
+    const onStub = vi.fn();
+    const strategy = new (class extends Server {
+      listen = vi.fn();
+      close = vi.fn();
+      on = onStub;
+      unwrap = vi.fn();
+    })();
+
+    const instance = new NestMicroservice(
+      mockContainer,
+      { strategy },
+      mockGraphInspector,
+      mockAppConfig,
+    );
+
+    const cb = () => {};
+    instance.on('test:event', cb);
+    expect(onStub).toHaveBeenCalledWith('test:event', cb);
+  });
+
+  describe('registerPreRequestHook', () => {
+    it('should delegate to applicationConfig.registerPreRequestHook', () => {
+      const mockConfig = {
+        ...createMockAppConfig(),
+        registerPreRequestHook: vi.fn(),
+      } as unknown as ApplicationConfig;
+
+      const instance = new NestMicroservice(
+        mockContainer,
+        { transport: Transport.TCP },
+        mockGraphInspector,
+        mockConfig,
+      );
+
+      const hook = (_ctx: any, next: any) => next();
+      instance.registerPreRequestHook(hook);
+
+      expect(mockConfig.registerPreRequestHook).toHaveBeenCalledWith(hook);
+    });
+
+    it('should warn when called after initialization', () => {
+      const mockConfig = {
+        ...createMockAppConfig(),
+        registerPreRequestHook: vi.fn(),
+      } as unknown as ApplicationConfig;
+
+      const instance = new NestMicroservice(
+        mockContainer,
+        { transport: Transport.TCP },
+        mockGraphInspector,
+        mockConfig,
+      );
+
+      const warnSpy = vi.spyOn((instance as any).logger, 'warn');
+      (instance as any).isInitialized = true;
+
+      const hook = (_ctx: any, next: any) => next();
+      instance.registerPreRequestHook(hook);
+
+      expect(warnSpy).toHaveBeenCalled();
+    });
+
+    it('should return this for fluent API chaining', () => {
+      const mockConfig = {
+        ...createMockAppConfig(),
+        registerPreRequestHook: vi.fn(),
+      } as unknown as ApplicationConfig;
+
+      const instance = new NestMicroservice(
+        mockContainer,
+        { transport: Transport.TCP },
+        mockGraphInspector,
+        mockConfig,
+      );
+
+      const hook = (_ctx: any, next: any) => next();
+      const result = instance.registerPreRequestHook(hook);
+
+      expect(result).toBe(instance);
+    });
+  });
+
+  describe('close', () => {
+    const createInstance = () => {
+      const strategy = new (class extends Server {
+        listen = vi.fn();
+        close = vi.fn();
+        on = vi.fn();
+        unwrap = vi.fn();
+      })();
+
+      return new NestMicroservice(
+        mockContainer,
+        { strategy },
+        mockGraphInspector,
+        mockAppConfig,
+      );
+    };
+
+    it('should detach process signal listeners when the parent application already marked it as terminated', async () => {
+      const instance = createInstance();
+      const baseline = process.listenerCount('SIGTERM');
+
+      instance.enableShutdownHooks(['SIGTERM']);
+      expect(process.listenerCount('SIGTERM')).to.equal(baseline + 1);
+
+      // A hybrid application flags every connected microservice as terminated
+      // before closing it, so that the parent - and not the microservice -
+      // runs the shared lifecycle hooks.
+      instance.setIsTerminated(true);
+      await instance.close();
+
+      expect(process.listenerCount('SIGTERM')).to.equal(baseline);
+    });
+
+    it('should not run the lifecycle hooks again when already terminated', async () => {
+      const instance = createInstance();
+      const closeApplicationSpy = vi.spyOn(instance as any, 'closeApplication');
+
+      instance.setIsTerminated(true);
+      await instance.close();
+
+      expect(closeApplicationSpy).not.toHaveBeenCalled();
+    });
+
+    it('should detach process signal listeners on a regular close', async () => {
+      const instance = createInstance();
+      const baseline = process.listenerCount('SIGTERM');
+
+      instance.enableShutdownHooks(['SIGTERM']);
+      await instance.close();
+
+      expect(process.listenerCount('SIGTERM')).to.equal(baseline);
+    });
+  });
+
+  describe('buffered logs', () => {
+    let processStdoutWriteSpy: ReturnType<typeof vi.fn>;
+
+    const createFailingInstance = (
+      createConfig: (strategy: Server) => any = strategy => ({ strategy }),
+    ) => {
+      const strategy = new (class extends Server {
+        listen = vi.fn();
+        close = vi.fn();
+        on = vi.fn();
+        unwrap = vi.fn();
+      })();
+      const instance = new NestMicroservice(
+        mockContainer,
+        createConfig(strategy),
+        mockGraphInspector,
+        mockAppConfig,
+      );
+      vi.spyOn(instance, 'registerModules').mockRejectedValue(
+        new Error('init failed'),
+      );
+      return instance;
+    };
+
+    beforeEach(() => {
+      processStdoutWriteSpy = vi
+        .spyOn(process.stdout, 'write')
+        .mockImplementation(() => true);
+      Logger.attachBuffer();
+      new Logger('Bootstrap').log('buffered message');
+    });
+
+    afterEach(() => {
+      Logger.detachBuffer();
+      Logger['logBuffer'] = [];
+      processStdoutWriteSpy.mockRestore();
+    });
+
+    const printed = () =>
+      processStdoutWriteSpy.mock.calls.map(([chunk]) => String(chunk));
+
+    it('should flush them when init() fails', async () => {
+      const instance = createFailingInstance();
+
+      await expect(instance.init()).rejects.toThrow('init failed');
+
+      expect(printed().some(line => line.includes('buffered message'))).toBe(
+        true,
+      );
+      expect(Logger['isBufferAttached']).toBe(false);
+    });
+
+    it('should keep them buffered when autoFlushLogs is false on an async config', async () => {
+      const instance = createFailingInstance(strategy => ({
+        useFactory: () => ({ strategy }),
+        inject: [],
+        autoFlushLogs: false,
+      }));
+
+      await expect(instance.init()).rejects.toThrow('init failed');
+
+      expect(printed().some(line => line.includes('buffered message'))).toBe(
+        false,
+      );
+      expect(Logger['isBufferAttached']).toBe(true);
+    });
+
+    it('should flush them when listen() fails to initialize', async () => {
+      const instance = createFailingInstance();
+
+      await expect(instance.listen()).rejects.toThrow('init failed');
+
+      expect(printed().some(line => line.includes('buffered message'))).toBe(
+        true,
+      );
+      expect(Logger['isBufferAttached']).toBe(false);
+    });
+  });
+
+  it('should return the transport server instance via getTransportServer()', () => {
+    const strategy = new (class extends Server {
+      listen = vi.fn();
+      close = vi.fn();
+      on = vi.fn();
+      unwrap = vi.fn();
+    })();
+
+    const instance = new NestMicroservice(
+      mockContainer,
+      { strategy },
+      mockGraphInspector,
+      mockAppConfig,
+    );
+
+    expect(instance.getTransportServer()).toBe(strategy);
+  });
+});

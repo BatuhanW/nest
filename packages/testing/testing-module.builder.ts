@@ -1,29 +1,67 @@
-import { Logger, LoggerService, Module } from '@nestjs/common';
-import { ModuleMetadata } from '@nestjs/common/interfaces';
-import { ApplicationConfig } from '@nestjs/core/application-config';
-import { NestContainer } from '@nestjs/core/injector/container';
-import { InstanceLoader } from '@nestjs/core/injector/instance-loader';
-import { MetadataScanner } from '@nestjs/core/metadata-scanner';
-import { DependenciesScanner } from '@nestjs/core/scanner';
-import { OverrideBy, OverrideByFactoryOptions } from './interfaces';
-import { TestingLogger } from './services/testing-logger.service';
-import { TestingModule } from './testing-module';
+import {
+  Logger,
+  type LoggerService,
+  Module,
+  type ModuleMetadata,
+} from '@nestjs/common';
+import {
+  MockFactory,
+  OverrideBy,
+  OverrideByFactoryOptions,
+} from './interfaces/index.js';
+import { OverrideModule } from './interfaces/override-module.interface.js';
+import { TestingLogger } from './services/testing-logger.service.js';
+import { TestingInjector } from './testing-injector.js';
+import { TestingInstanceLoader } from './testing-instance-loader.js';
+import { TestingModule } from './testing-module.js';
+import type { NestApplicationContextOptions } from '@nestjs/common/internal';
+import {
+  ApplicationConfig,
+  NestContainer,
+  GraphInspector,
+  type MetadataScanner,
+} from '@nestjs/core';
+import {
+  NoopGraphInspector,
+  UuidFactory,
+  UuidFactoryMode,
+  type ModuleDefinition,
+  type ModuleOverride,
+  DependenciesScanner,
+} from '@nestjs/core/internal';
 
+/**
+ * @publicApi
+ */
+export type TestingModuleOptions = Pick<
+  NestApplicationContextOptions,
+  'moduleIdGeneratorAlgorithm'
+>;
+
+/**
+ * @publicApi
+ */
 export class TestingModuleBuilder {
   private readonly applicationConfig = new ApplicationConfig();
-  private readonly container = new NestContainer(this.applicationConfig);
-  private readonly overloadsMap = new Map();
-  private readonly scanner: DependenciesScanner;
-  private readonly instanceLoader = new InstanceLoader(this.container);
+  private readonly container: NestContainer;
+  private readonly providerOverloadsMap = new Map();
+  // Kept apart from the providers: one class can be both a provider and an
+  // enhancer (guard, interceptor, pipe or filter), each overridden on its own
+  private readonly injectableOverloadsMap = new Map();
+  private readonly moduleOverloadsMap = new Map<
+    ModuleDefinition,
+    ModuleDefinition
+  >();
   private readonly module: any;
   private testingLogger: LoggerService;
+  private mocker?: MockFactory;
 
-  constructor(metadataScanner: MetadataScanner, metadata: ModuleMetadata) {
-    this.scanner = new DependenciesScanner(
-      this.container,
-      metadataScanner,
-      this.applicationConfig,
-    );
+  constructor(
+    private readonly metadataScanner: MetadataScanner,
+    metadata: ModuleMetadata,
+    options?: TestingModuleOptions,
+  ) {
+    this.container = new NestContainer(this.applicationConfig, options);
     this.module = this.createModule(metadata);
   }
 
@@ -34,6 +72,11 @@ export class TestingModuleBuilder {
 
   public overridePipe<T = any>(typeOrToken: T): OverrideBy {
     return this.override(typeOrToken, false);
+  }
+
+  public useMocker(mocker: MockFactory): TestingModuleBuilder {
+    this.mocker = mocker;
+    return this;
   }
 
   public overrideFilter<T = any>(typeOrToken: T): OverrideBy {
@@ -52,21 +95,60 @@ export class TestingModuleBuilder {
     return this.override(typeOrToken, true);
   }
 
-  public async compile(): Promise<TestingModule> {
+  public overrideModule(moduleToOverride: ModuleDefinition): OverrideModule {
+    return {
+      useModule: newModule => {
+        this.moduleOverloadsMap.set(moduleToOverride, newModule);
+        return this;
+      },
+    };
+  }
+
+  public async compile(
+    options: Pick<NestApplicationContextOptions, 'snapshot' | 'preview'> = {},
+  ): Promise<TestingModule> {
     this.applyLogger();
-    await this.scanner.scan(this.module);
+
+    let graphInspector: GraphInspector;
+    if (options?.snapshot) {
+      graphInspector = new GraphInspector(this.container);
+      UuidFactory.mode = UuidFactoryMode.Deterministic;
+    } else {
+      graphInspector = NoopGraphInspector;
+      UuidFactory.mode = UuidFactoryMode.Random;
+    }
+
+    const scanner = new DependenciesScanner(
+      this.container,
+      this.metadataScanner,
+      graphInspector,
+      this.applicationConfig,
+    );
+    await scanner.scan(this.module, {
+      overrides: this.getModuleOverloads(),
+    });
 
     this.applyOverloadsMap();
-    await this.instanceLoader.createInstancesOfDependencies();
-    this.scanner.applyApplicationProviders();
+    await this.createInstancesOfDependencies(graphInspector, options);
+    scanner.applyApplicationProviders();
 
     const root = this.getRootModule();
-    return new TestingModule(this.container, [], root, this.applicationConfig);
+    const testingModule = new TestingModule(
+      this.container,
+      graphInspector,
+      root,
+      this.applicationConfig,
+    );
+    await testingModule['preloadLazyPackages']();
+    return testingModule;
   }
 
   private override<T = any>(typeOrToken: T, isProvider: boolean): OverrideBy {
+    const overloads = isProvider
+      ? this.providerOverloadsMap
+      : this.injectableOverloadsMap;
     const addOverload = (options: any) => {
-      this.overloadsMap.set(typeOrToken, {
+      overloads.set(typeOrToken, {
         ...options,
         isProvider,
       });
@@ -87,14 +169,45 @@ export class TestingModuleBuilder {
   }
 
   private applyOverloadsMap() {
-    [...this.overloadsMap.entries()].forEach(([item, options]) => {
+    const overloads = [
+      ...this.providerOverloadsMap.entries(),
+      ...this.injectableOverloadsMap.entries(),
+    ];
+    overloads.forEach(([item, options]) => {
       this.container.replace(item, options);
     });
   }
 
+  private getModuleOverloads(): ModuleOverride[] {
+    const overloads = [...this.moduleOverloadsMap.entries()];
+    return overloads.map(([moduleToReplace, newModule]) => ({
+      moduleToReplace,
+      newModule,
+    }));
+  }
+
   private getRootModule() {
     const modules = this.container.getModules().values();
-    return modules.next().value;
+    return modules.next().value!;
+  }
+
+  private async createInstancesOfDependencies(
+    graphInspector: GraphInspector,
+    options: { preview?: boolean; snapshot?: boolean },
+  ) {
+    const injector = new TestingInjector({
+      preview: options?.preview ?? false,
+      snapshot: options?.snapshot ?? false,
+    });
+    const instanceLoader = new TestingInstanceLoader(
+      this.container,
+      injector,
+      graphInspector,
+    );
+    await instanceLoader.createInstancesOfDependencies(
+      this.container.getModules(),
+      this.mocker,
+    );
   }
 
   private createModule(metadata: ModuleMetadata) {

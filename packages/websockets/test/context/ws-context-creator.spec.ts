@@ -1,22 +1,23 @@
-import { ExecutionContextHost } from '@nestjs/core/helpers/execution-context-host';
-import { expect } from 'chai';
+import { ExecutionContextHost } from '@nestjs/core/helpers/execution-context-host.js';
 import { of } from 'rxjs';
-import * as sinon from 'sinon';
-import { Injectable, UseGuards, UsePipes } from '../../../common';
-import { CUSTOM_ROUTE_AGRS_METADATA } from '../../../common/constants';
-import { GuardsConsumer } from '../../../core/guards/guards-consumer';
-import { GuardsContextCreator } from '../../../core/guards/guards-context-creator';
-import { NestContainer } from '../../../core/injector/container';
-import { InterceptorsConsumer } from '../../../core/interceptors/interceptors-consumer';
-import { InterceptorsContextCreator } from '../../../core/interceptors/interceptors-context-creator';
-import { PipesConsumer } from '../../../core/pipes/pipes-consumer';
-import { PipesContextCreator } from '../../../core/pipes/pipes-context-creator';
-import { ExceptionFiltersContext } from '../../context/exception-filters-context';
-import { WsContextCreator } from '../../context/ws-context-creator';
-import { WsProxy } from '../../context/ws-proxy';
-import { WsParamtype } from '../../enums/ws-paramtype.enum';
-import { WsParamsFactory } from '../../factories/ws-params-factory';
-import { WsException } from '../../index';
+import { CUSTOM_ROUTE_ARGS_METADATA } from '../../../common/constants.js';
+import { Injectable, UseGuards, UsePipes } from '../../../common/index.js';
+import { GuardsConsumer } from '../../../core/guards/guards-consumer.js';
+import { GuardsContextCreator } from '../../../core/guards/guards-context-creator.js';
+import { STATIC_CONTEXT } from '../../../core/injector/constants.js';
+import { NestContainer } from '../../../core/injector/container.js';
+import { InstanceWrapper } from '../../../core/injector/instance-wrapper.js';
+import { InterceptorsConsumer } from '../../../core/interceptors/interceptors-consumer.js';
+import { InterceptorsContextCreator } from '../../../core/interceptors/interceptors-context-creator.js';
+import { PipesConsumer } from '../../../core/pipes/pipes-consumer.js';
+import { PipesContextCreator } from '../../../core/pipes/pipes-context-creator.js';
+import { MESSAGE_METADATA } from '../../constants.js';
+import { ExceptionFiltersContext } from '../../context/exception-filters-context.js';
+import { WsContextCreator } from '../../context/ws-context-creator.js';
+import { WsProxy } from '../../context/ws-proxy.js';
+import { WsParamtype } from '../../enums/ws-paramtype.enum.js';
+import { WsParamsFactory } from '../../factories/ws-params-factory.js';
+import { MessageBody, WsException } from '../../index.js';
 
 @Injectable()
 class TestGuard {
@@ -52,7 +53,7 @@ describe('WsContextCreator', () => {
 
   beforeEach(() => {
     wsProxy = new WsProxy();
-    sinon.stub(wsProxy, 'create').callsFake(a => a);
+    vi.spyOn(wsProxy, 'create').mockImplementation(a => a);
 
     exceptionFiltersContext = new ExceptionFiltersContext(
       new NestContainer() as any,
@@ -77,31 +78,45 @@ describe('WsContextCreator', () => {
   });
   describe('create', () => {
     it('should create exception handler', () => {
-      const handlerCreateSpy = sinon.spy(exceptionFiltersContext, 'create');
+      const handlerCreateSpy = vi.spyOn(exceptionFiltersContext, 'create');
       contextCreator.create(instance, instance.test, module, 'create');
-      expect(
-        handlerCreateSpy.calledWith(instance, instance.test as any, module),
-      ).to.be.true;
+      expect(handlerCreateSpy).toHaveBeenCalledWith(
+        instance,
+        instance.test as any,
+        module,
+        STATIC_CONTEXT,
+        undefined,
+      );
     });
     it('should create pipes context', () => {
-      const pipesCreateSpy = sinon.spy(pipesCreator, 'create');
+      const pipesCreateSpy = vi.spyOn(pipesCreator, 'create');
       contextCreator.create(instance, instance.test, module, 'create');
-      expect(pipesCreateSpy.calledWith(instance, instance.test, module)).to.be
-        .true;
+      expect(pipesCreateSpy).toHaveBeenCalledWith(
+        instance,
+        instance.test,
+        module,
+        STATIC_CONTEXT,
+        undefined,
+      );
     });
     it('should create guards context', () => {
-      const guardsCreateSpy = sinon.spy(guardsContextCreator, 'create');
+      const guardsCreateSpy = vi.spyOn(guardsContextCreator, 'create');
       contextCreator.create(instance, instance.test, module, 'create');
-      expect(guardsCreateSpy.calledWith(instance, instance.test, module)).to.be
-        .true;
+      expect(guardsCreateSpy).toHaveBeenCalledWith(
+        instance,
+        instance.test,
+        module,
+        STATIC_CONTEXT,
+        undefined,
+      );
     });
     describe('when proxy called', () => {
       it('should call guards consumer `tryActivate`', async () => {
-        const tryActivateSpy = sinon.spy(guardsConsumer, 'tryActivate');
-        sinon
-          .stub(guardsContextCreator, 'create')
-          .callsFake(() => [{ canActivate: () => true }]);
-        const proxy = await contextCreator.create(
+        const tryActivateSpy = vi.spyOn(guardsConsumer, 'tryActivate');
+        vi.spyOn(guardsContextCreator, 'create').mockImplementation(
+          () => [{ canActivate: () => true }] as any,
+        );
+        const proxy = contextCreator.create(
           instance,
           instance.test,
           module,
@@ -110,14 +125,14 @@ describe('WsContextCreator', () => {
         const data = 'test';
         await proxy(null, data);
 
-        expect(tryActivateSpy.called).to.be.true;
+        expect(tryActivateSpy).toHaveBeenCalled();
       });
       describe('when can not activate', () => {
-        it('should throws forbidden exception', async () => {
-          sinon
-            .stub(guardsConsumer, 'tryActivate')
-            .callsFake(async () => false);
-          const proxy = await contextCreator.create(
+        it('should throw forbidden exception', () => {
+          vi.spyOn(guardsConsumer, 'tryActivate').mockImplementation(
+            async () => false,
+          );
+          const proxy = contextCreator.create(
             instance,
             instance.test,
             module,
@@ -125,28 +140,116 @@ describe('WsContextCreator', () => {
           );
           const data = 'test';
           proxy(null, data).catch(err =>
-            expect(err).to.be.instanceOf(WsException),
+            expect(err).toBeInstanceOf(WsException),
           );
         });
+      });
+    });
+    describe('when two gateways have the same class name', () => {
+      const createChatGateway = (field: string) => {
+        class ChatGateway {
+          handle(@MessageBody(field) value: unknown) {
+            return value;
+          }
+        }
+        return ChatGateway;
+      };
+
+      it('should pass each gateway its own message body', async () => {
+        const chat = new (createChatGateway('text'))();
+        const orders = new (createChatGateway('orderId'))();
+        const chatProxy = contextCreator.create(
+          chat,
+          chat.handle,
+          module,
+          'handle',
+        );
+        const ordersProxy = contextCreator.create(
+          orders,
+          orders.handle,
+          module,
+          'handle',
+        );
+        const data = { text: 'hello', orderId: 42 };
+
+        expect(await chatProxy(null, data)).toBe('hello');
+        expect(await ordersProxy(null, data)).toBe(42);
+      });
+      it('should reuse the cached metadata for the same gateway class', () => {
+        const ChatGateway = createChatGateway('text');
+        const metadata = contextCreator.getMetadata(
+          new ChatGateway(),
+          'handle',
+          'ws',
+        );
+
+        expect(
+          contextCreator.getMetadata(new ChatGateway(), 'handle', 'ws'),
+        ).toBe(metadata);
+      });
+    });
+    describe('when the "constructor" of the gateway prototype was overwritten', () => {
+      it('should apply the class-level guards of the registered class', async () => {
+        class Mixin {}
+        @UseGuards({ canActivate: () => false })
+        class MixedIn {
+          handle() {
+            return 'handled';
+          }
+        }
+        // What mixin helpers copying every property of the prototype do
+        MixedIn.prototype.constructor = Mixin;
+        new InstanceWrapper({ metatype: MixedIn });
+
+        const gateway = new MixedIn();
+        const proxy = contextCreator.create(
+          gateway,
+          gateway.handle,
+          module,
+          'handle',
+        );
+        await expect(proxy(null, 'data')).rejects.toBeInstanceOf(WsException);
+      });
+      it('should apply the pipes bound to the parameters of its own handlers', async () => {
+        class Mixin {}
+        class MixedIn {
+          handle(@MessageBody({ transform: () => 'piped' }) data: string) {
+            return data;
+          }
+        }
+        // What mixin helpers copying every property of the prototype do
+        MixedIn.prototype.constructor = Mixin;
+        new InstanceWrapper({ metatype: MixedIn });
+
+        const gateway = new MixedIn();
+        const proxy = contextCreator.create(
+          gateway,
+          gateway.handle,
+          module,
+          'handle',
+        );
+        expect(await proxy(null, 'data')).toBe('piped');
       });
     });
   });
 
   describe('reflectCallbackParamtypes', () => {
-    it('should returns paramtypes array', () => {
+    it('should return paramtypes array', () => {
       const paramtypes = contextCreator.reflectCallbackParamtypes(
         instance,
         instance.test,
       );
-      expect(paramtypes).to.be.eql([String, Number]);
+      expect(paramtypes).toEqual([String, Number]);
     });
   });
 
   describe('createGuardsFn', () => {
     it('should throw exception when "tryActivate" returns false', () => {
-      const guardsFn = contextCreator.createGuardsFn([null], null, null);
-      sinon.stub(guardsConsumer, 'tryActivate').callsFake(async () => false);
-      guardsFn([]).catch(err => expect(err).to.not.be.undefined);
+      const guardsFn = contextCreator.createGuardsFn([null], null!, null!)!;
+      vi.spyOn(guardsConsumer, 'tryActivate').mockImplementation(
+        async () => false,
+      );
+      guardsFn([]).catch(err => expect(err).not.toBeUndefined());
     });
   });
 
@@ -155,7 +258,7 @@ describe('WsContextCreator', () => {
       const metadata = {
         [WsParamtype.SOCKET]: { index: 0, data: 'test', pipes: [] },
         [WsParamtype.PAYLOAD]: { index: 2, data: 'test', pipes: [] },
-        [`key${CUSTOM_ROUTE_AGRS_METADATA}`]: {
+        [`key${CUSTOM_ROUTE_ARGS_METADATA}`]: {
           index: 3,
           data: 'custom',
           pipes: [],
@@ -172,35 +275,207 @@ describe('WsContextCreator', () => {
       const expectedValues = [
         { index: 0, type: WsParamtype.SOCKET, data: 'test' },
         { index: 2, type: WsParamtype.PAYLOAD, data: 'test' },
-        { index: 3, type: `key${CUSTOM_ROUTE_AGRS_METADATA}`, data: 'custom' },
+        { index: 3, type: `key${CUSTOM_ROUTE_ARGS_METADATA}`, data: 'custom' },
       ];
-      expect(values[0]).to.deep.include(expectedValues[0]);
-      expect(values[1]).to.deep.include(expectedValues[1]);
+      expect(values[0]).toMatchObject(expectedValues[0]);
+      expect(values[1]).toMatchObject(expectedValues[1]);
     });
   });
   describe('getParamValue', () => {
-    let consumerApplySpy: sinon.SinonSpy;
+    let consumerApplySpy: ReturnType<typeof vi.fn>;
     const value = 3,
       metatype = null,
-      transforms = [{ transform: sinon.spy() }];
+      transforms = [{ transform: vi.fn() }];
 
     beforeEach(() => {
-      consumerApplySpy = sinon.spy(pipesConsumer, 'apply');
+      consumerApplySpy = vi.spyOn(pipesConsumer, 'apply');
     });
-    it('should call "consumer.apply"', () => {
-      contextCreator.getParamValue(
+    it('should call "consumer.apply"', async () => {
+      await contextCreator.getParamValue(
         value,
         { metatype, type: WsParamtype.PAYLOAD, data: null },
         transforms,
       );
-      expect(consumerApplySpy.called).to.be.true;
+      expect(consumerApplySpy).toHaveBeenCalled();
+    });
+  });
+  describe('createPipesFn without pipes', () => {
+    const param = (
+      index: number,
+      extractValue: (...args: any[]) => unknown,
+      type: number | string = 'test',
+    ) => ({ index, type, data: undefined as any, pipes: [], extractValue });
+
+    it('fills the args without returning a promise', () => {
+      const pipesFn = contextCreator.createPipesFn(
+        [],
+        [
+          param(1, (first: unknown) => first),
+          param(0, (_first: unknown, second: unknown) => second),
+        ],
+      )!;
+      const args: unknown[] = [undefined, undefined];
+
+      expect(pipesFn(args, 'a', 'b')).toBeUndefined();
+      expect(args).toEqual(['b', 'a']);
+    });
+    it('settles a thenable value, calling "then()" once', async () => {
+      const thenable = { then: vi.fn(resolve => resolve('settled')) };
+      const pipesFn = contextCreator.createPipesFn(
+        [],
+        [param(0, () => thenable)],
+      )!;
+      const args: unknown[] = [undefined];
+
+      await pipesFn(args);
+
+      expect(args).toEqual(['settled']);
+      expect(thenable.then).toHaveBeenCalledOnce();
+    });
+    it('runs every extractor and rejects with the first error', async () => {
+      const first = new Error('first');
+      const last = vi.fn(() => 'last');
+      const pipesFn = contextCreator.createPipesFn(
+        [],
+        [
+          param(0, () => {
+            throw first;
+          }),
+          param(1, () => {
+            throw new Error('second');
+          }),
+          param(2, last),
+        ],
+      )!;
+
+      await expect(pipesFn([])).rejects.toBe(first);
+      expect(last).toHaveBeenCalledOnce();
+    });
+    it('rejects with an extractor error before an earlier thenable rejects', async () => {
+      const error = new Error('extractor');
+      const thenable = {
+        then: vi.fn((_resolve, reject) => reject(new Error('thenable'))),
+      };
+      const pipesFn = contextCreator.createPipesFn(
+        [],
+        [
+          param(0, () => thenable),
+          param(1, () => {
+            throw error;
+          }),
+        ],
+      )!;
+
+      await expect(pipesFn([])).rejects.toBe(error);
+      expect(thenable.then).toHaveBeenCalledOnce();
+    });
+  });
+  describe('createPipesFn with pipes', () => {
+    it('runs the global pipes, then the param pipes, with the metadata of the param on every call', async () => {
+      const globalPipe = { transform: vi.fn(async value => `${value}-g`) };
+      const paramPipe = { transform: vi.fn(value => `${value}-p`) };
+      const pipesFn = contextCreator.createPipesFn(
+        [globalPipe],
+        [
+          {
+            index: 0,
+            type: 'test',
+            data: 'id',
+            pipes: [paramPipe],
+            extractValue: () => '42',
+          },
+          {
+            index: 1,
+            type: 'test',
+            data: undefined as any,
+            pipes: [],
+            extractValue: () => '7',
+          },
+        ],
+      )!;
+      const args: unknown[] = [undefined, undefined];
+
+      await pipesFn(args);
+      await pipesFn(args);
+
+      expect(args).toEqual(['42-g-p', '7-g']);
+      expect(globalPipe.transform).toHaveBeenCalledTimes(4);
+      expect(globalPipe.transform).toHaveBeenCalledWith('42', {
+        metatype: undefined,
+        type: 'custom',
+        data: 'id',
+        schema: undefined,
+      });
+      expect(paramPipe.transform).toHaveBeenCalledTimes(2);
+    });
+    it('keeps a pipeless param synchronous next to a piped one', async () => {
+      const pipe = { transform: vi.fn(async value => `${value}-p`) };
+      const pipesFn = contextCreator.createPipesFn(
+        [],
+        [
+          {
+            index: 0,
+            type: 'test',
+            data: undefined as any,
+            pipes: [pipe],
+            extractValue: () => 'a',
+          },
+          {
+            index: 1,
+            type: 'test',
+            data: undefined as any,
+            pipes: [],
+            extractValue: () => 'b',
+          },
+        ],
+      )!;
+      const args: unknown[] = [undefined, undefined];
+
+      const result = pipesFn(args);
+
+      expect(result).toBeInstanceOf(Promise);
+      expect(args[1]).toBe('b');
+      await result;
+      expect(args).toEqual(['a-p', 'b']);
+    });
+    it("starts each param's pipes right after extracting it", async () => {
+      const order: string[] = [];
+      const pipe = {
+        transform: (value: string) => {
+          order.push(`transform ${value}`);
+          return value;
+        },
+      };
+      const query = (index: number) => ({
+        index,
+        type: 'test',
+        data: undefined as any,
+        pipes: [],
+        extractValue: () => {
+          order.push(`extract ${index}`);
+          return `${index}`;
+        },
+      });
+      const pipesFn = contextCreator.createPipesFn(
+        [pipe],
+        [query(0), query(1)],
+      )!;
+
+      await pipesFn([]);
+
+      expect(order).toEqual([
+        'extract 0',
+        'transform 0',
+        'extract 1',
+        'transform 1',
+      ]);
     });
   });
   describe('createPipesFn', () => {
     describe('when "paramsOptions" is empty', () => {
       it('returns null', async () => {
         const pipesFn = contextCreator.createPipesFn([], []);
-        expect(pipesFn).to.be.null;
+        expect(pipesFn).toBeNull();
       });
     });
     describe('when "paramsOptions" is not empty', () => {
@@ -211,15 +486,139 @@ describe('WsContextCreator', () => {
             {
               index: 1,
               type: 'test',
-              data: null,
+              data: null!,
               pipes: [],
               extractValue: () => null,
             },
           ],
-        );
+        )!;
         await pipesFn([]);
-        expect(pipesFn).to.be.a('function');
+        expect(pipesFn).toBeTypeOf('function');
       });
     });
+    describe('when the pipe of a parameter fails', () => {
+      it('should fail once the pipes of the other parameters have settled', async () => {
+        const error = new WsException('Validation failed');
+        let finishLookup!: () => void;
+        const lookup = new Promise<string>(resolve => {
+          finishLookup = () => resolve('entity');
+        });
+        const param = (index: number, transform: () => unknown) => ({
+          index,
+          type: 'test',
+          data: null!,
+          pipes: [{ transform }],
+          extractValue: () => null,
+        });
+        const pipesFn = contextCreator.createPipesFn(
+          [],
+          [param(1, () => Promise.reject(error)), param(2, () => lookup)],
+        )!;
+
+        let settled = false;
+        const result = pipesFn([]).finally(() => (settled = true));
+        result.catch(() => undefined);
+        await new Promise(resolve => setImmediate(resolve));
+        expect(settled).toBe(false);
+
+        finishLookup();
+        await expect(result).rejects.toBe(error);
+      });
+
+      it('should fail with the error that came first', async () => {
+        const first = new Error('first');
+        const pipesFn = contextCreator.createPipesFn(
+          [],
+          [
+            {
+              index: 1,
+              type: 'test',
+              data: null!,
+              pipes: [
+                {
+                  transform: () =>
+                    new Promise((_, reject) =>
+                      setImmediate(() => reject(new Error('second'))),
+                    ),
+                },
+              ],
+              extractValue: () => null,
+            },
+            {
+              index: 2,
+              type: 'test',
+              data: null!,
+              pipes: [{ transform: () => Promise.reject(first) }],
+              extractValue: () => null,
+            },
+          ],
+        )!;
+
+        await expect(pipesFn([])).rejects.toBe(first);
+      });
+    });
+  });
+});
+
+describe('WsContextCreator (pattern forwarding)', () => {
+  @Injectable()
+  class PatternTest {
+    handle(client: unknown, data: unknown) {
+      return of(true);
+    }
+  }
+
+  let creator: WsContextCreator;
+  let recordedArgs: unknown[];
+
+  beforeEach(() => {
+    recordedArgs = [];
+
+    const guardsConsumer = new GuardsConsumer();
+    vi.spyOn(guardsConsumer, 'tryActivate').mockImplementation(
+      async (_guards, args: any[]) => {
+        recordedArgs = [...args];
+        return true;
+      },
+    );
+
+    const guardsContextCreator = new GuardsContextCreator(new NestContainer());
+    vi.spyOn(guardsContextCreator, 'create').mockImplementation(
+      () => [{ canActivate: () => true }] as any,
+    );
+
+    creator = new WsContextCreator(
+      // the real proxy, so the pattern it appends is part of the result
+      new WsProxy(),
+      new ExceptionFiltersContext(new NestContainer() as any),
+      new PipesContextCreator(new NestContainer() as any) as any,
+      new PipesConsumer() as any,
+      guardsContextCreator as any,
+      guardsConsumer as any,
+      new InterceptorsContextCreator(new NestContainer()) as any,
+      new InterceptorsConsumer() as any,
+    );
+  });
+
+  it('appends the message pattern to the arguments exactly once', async () => {
+    const instance = new PatternTest();
+    Reflect.defineMetadata(MESSAGE_METADATA, 'myEvent', instance.handle);
+
+    const proxy = creator.create(instance, instance.handle, 'test', 'handle');
+    await proxy('client', { some: 'payload' });
+
+    expect(recordedArgs.filter(arg => arg === 'myEvent')).toHaveLength(1);
+    expect(recordedArgs[recordedArgs.length - 1]).toEqual('myEvent');
+  });
+
+  it('keeps the pattern reachable through getPattern()', async () => {
+    const instance = new PatternTest();
+    Reflect.defineMetadata(MESSAGE_METADATA, 'myEvent', instance.handle);
+
+    const proxy = creator.create(instance, instance.handle, 'test', 'handle');
+    await proxy('client', { some: 'payload' });
+
+    const host = new ExecutionContextHost(recordedArgs);
+    expect(host.switchToWs().getPattern()).toEqual('myEvent');
   });
 });

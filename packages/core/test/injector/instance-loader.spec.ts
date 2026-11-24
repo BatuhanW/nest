@@ -1,165 +1,190 @@
-import { expect } from 'chai';
-import * as sinon from 'sinon';
-import { Injectable } from '../../../common';
-import { Controller } from '../../../common/decorators/core/controller.decorator';
-import { NestContainer } from '../../injector/container';
-import { Injector } from '../../injector/injector';
-import { InstanceLoader } from '../../injector/instance-loader';
-import { InstanceWrapper } from '../../injector/instance-wrapper';
+import { Controller } from '../../../common/decorators/core/controller.decorator.js';
+import { Injectable } from '../../../common/index.js';
+import { NestContainer } from '../../injector/container.js';
+import { Injector } from '../../injector/injector.js';
+import { InstanceLoader } from '../../injector/instance-loader.js';
+import { InstanceWrapper } from '../../injector/instance-wrapper.js';
+import { GraphInspector } from '../../inspector/graph-inspector.js';
 
 describe('InstanceLoader', () => {
-  let loader: InstanceLoader;
-  let container: NestContainer;
-  let mockContainer: sinon.SinonMock;
-
   @Controller('')
-  class TestRoute {}
+  class TestCtrl {}
 
   @Injectable()
   class TestProvider {}
 
+  let loader: InstanceLoader;
+  let injector: Injector;
+  let container: NestContainer;
+  let graphInspector: GraphInspector;
+  let inspectInstanceWrapperStub: ReturnType<typeof vi.fn>;
+  let moduleMock: Record<string, any>;
+
   beforeEach(() => {
     container = new NestContainer();
-    loader = new InstanceLoader(container);
-    mockContainer = sinon.mock(container);
-  });
+    graphInspector = new GraphInspector(container);
 
-  it('should call "loadPrototype" for each provider and route in each module', async () => {
-    const injector = new Injector();
-    (loader as any).injector = injector;
+    inspectInstanceWrapperStub = vi.spyOn(
+      graphInspector,
+      'inspectInstanceWrapper',
+    );
 
-    const module = {
+    injector = new Injector();
+    loader = new InstanceLoader(container, injector, graphInspector);
+
+    moduleMock = {
+      imports: new Set(),
       providers: new Map(),
       controllers: new Map(),
       injectables: new Map(),
+      exports: new Set(),
       metatype: { name: 'test' },
     };
-    const providerWrapper: InstanceWrapper = {
+
+    const modules = new Map();
+    modules.set('Test', moduleMock);
+    vi.spyOn(container, 'getModules').mockReturnValue(modules);
+  });
+
+  it('should call "loadPrototype" for every provider and controller in every module', async () => {
+    const providerWrapper = new InstanceWrapper({
       instance: null,
       metatype: TestProvider,
-    } as any;
-    const routeWrapper: InstanceWrapper = {
+      token: 'TestProvider',
+    });
+    const ctrlWrapper = new InstanceWrapper({
       instance: null,
-      metatype: TestRoute,
-    } as any;
+      metatype: TestCtrl,
+      token: 'TestRoute',
+    });
 
-    module.providers.set('TestProvider', providerWrapper);
-    module.controllers.set('TestRoute', routeWrapper);
+    moduleMock.providers.set('TestProvider', providerWrapper);
+    moduleMock.controllers.set('TestRoute', ctrlWrapper);
 
-    const modules = new Map();
-    modules.set('Test', module);
-    mockContainer.expects('getModules').returns(modules);
+    const loadProviderPrototypeStub = vi
+      .spyOn(injector, 'loadPrototype')
+      .mockImplementation(() => ({}) as any);
 
-    const loadProviderPrototypeStub = sinon.stub(injector, 'loadPrototype');
-
-    sinon.stub(injector, 'loadController');
-    sinon.stub(injector, 'loadProvider');
+    vi.spyOn(injector, 'loadController').mockImplementation(() => ({}) as any);
+    vi.spyOn(injector, 'loadProvider').mockImplementation(() => ({}) as any);
 
     await loader.createInstancesOfDependencies();
-    expect(
-      loadProviderPrototypeStub.calledWith(providerWrapper, module.providers),
-    ).to.be.true;
-    expect(
-      loadProviderPrototypeStub.calledWith(routeWrapper, module.controllers),
-    ).to.be.true;
+
+    expect(loadProviderPrototypeStub).toHaveBeenCalledWith(
+      providerWrapper,
+      moduleMock.providers,
+    );
+    expect(loadProviderPrototypeStub).toHaveBeenCalledWith(
+      ctrlWrapper,
+      moduleMock.controllers,
+    );
   });
 
-  it('should call "loadProvider" for each provider in each module', async () => {
-    const injector = new Injector();
-    (loader as any).injector = injector;
+  describe('for every provider in every module', () => {
+    const testProviderToken = 'TestProvider';
 
-    const module = {
-      providers: new Map(),
-      controllers: new Map(),
-      injectables: new Map(),
-      metatype: { name: 'test' },
-    };
-    const testComp = new InstanceWrapper({
-      instance: null,
-      metatype: TestProvider,
-      name: 'TestProvider',
+    let loadProviderStub: ReturnType<typeof vi.fn>;
+
+    beforeEach(async () => {
+      const testProviderWrapper = new InstanceWrapper({
+        instance: null,
+        metatype: TestProvider,
+        name: testProviderToken,
+        token: testProviderToken,
+      });
+      moduleMock.providers.set(testProviderToken, testProviderWrapper);
+
+      loadProviderStub = vi
+        .spyOn(injector, 'loadProvider')
+        .mockImplementation(() => ({}) as any);
+      vi.spyOn(injector, 'loadController').mockImplementation(
+        () => ({}) as any,
+      );
+
+      await loader.createInstancesOfDependencies();
     });
-    module.providers.set('TestProvider', testComp);
 
-    const modules = new Map();
-    modules.set('Test', module);
-    mockContainer.expects('getModules').returns(modules);
+    it('should call "loadProvider"', async () => {
+      expect(loadProviderStub).toHaveBeenCalledWith(
+        moduleMock.providers.get(testProviderToken),
+        moduleMock as any,
+      );
+    });
 
-    const loadProviderStub = sinon.stub(injector, 'loadProvider');
-    sinon.stub(injector, 'loadController');
-
-    await loader.createInstancesOfDependencies();
-    expect(
-      loadProviderStub.calledWith(
-        module.providers.get('TestProvider'),
-        module as any,
-      ),
-    ).to.be.true;
+    it('should call "inspectInstanceWrapper"', async () => {
+      expect(inspectInstanceWrapperStub).toHaveBeenCalledWith(
+        moduleMock.providers.get(testProviderToken),
+        moduleMock as any,
+      );
+    });
   });
 
-  it('should call "loadController" for each route in each module', async () => {
-    const injector = new Injector();
-    (loader as any).injector = injector;
+  describe('for every controller in every module', () => {
+    let loadControllerStub: ReturnType<typeof vi.fn>;
 
-    const module = {
-      providers: new Map(),
-      controllers: new Map(),
-      injectables: new Map(),
-      metatype: { name: 'test' },
-    };
-    const wrapper = new InstanceWrapper({
-      name: 'TestRoute',
-      instance: null,
-      metatype: TestRoute,
+    beforeEach(async () => {
+      const wrapper = new InstanceWrapper({
+        name: 'TestRoute',
+        token: 'TestRoute',
+        instance: null,
+        metatype: TestCtrl,
+      });
+      moduleMock.controllers.set('TestRoute', wrapper);
+
+      vi.spyOn(injector, 'loadProvider').mockImplementation(() => ({}) as any);
+      loadControllerStub = vi
+        .spyOn(injector, 'loadController')
+        .mockImplementation(() => ({}) as any);
+
+      await loader.createInstancesOfDependencies();
     });
-    module.controllers.set('TestRoute', wrapper);
-
-    const modules = new Map();
-    modules.set('Test', module);
-    mockContainer.expects('getModules').returns(modules);
-
-    sinon.stub(injector, 'loadProvider');
-    const loadRoutesStub = sinon.stub(injector, 'loadController');
-
-    await loader.createInstancesOfDependencies();
-    expect(
-      loadRoutesStub.calledWith(
-        module.controllers.get('TestRoute'),
-        module as any,
-      ),
-    ).to.be.true;
+    it('should call "loadController"', async () => {
+      expect(loadControllerStub).toHaveBeenCalledWith(
+        moduleMock.controllers.get('TestRoute'),
+        moduleMock as any,
+      );
+    });
+    it('should call "inspectInstanceWrapper"', async () => {
+      expect(inspectInstanceWrapperStub).toHaveBeenCalledWith(
+        moduleMock.controllers.get('TestRoute'),
+        moduleMock as any,
+      );
+    });
   });
 
-  it('should call "loadInjectable" for each injectable in each module', async () => {
-    const injector = new Injector();
-    (loader as any).injector = injector;
+  describe('for every injectable in every module', () => {
+    let loadInjectableStub: ReturnType<typeof vi.fn>;
 
-    const module = {
-      providers: new Map(),
-      controllers: new Map(),
-      injectables: new Map(),
-      metatype: { name: 'test' },
-    };
-    const testComp = new InstanceWrapper({
-      instance: null,
-      metatype: TestProvider,
-      name: 'TestProvider',
+    beforeEach(async () => {
+      const testInjectable = new InstanceWrapper({
+        instance: null,
+        metatype: TestProvider,
+        name: 'TestProvider',
+        token: 'TestProvider',
+      });
+      moduleMock.injectables.set('TestProvider', testInjectable);
+
+      loadInjectableStub = vi
+        .spyOn(injector, 'loadInjectable')
+        .mockImplementation(() => ({}) as any);
+      vi.spyOn(injector, 'loadController').mockImplementation(
+        () => ({}) as any,
+      );
+
+      await loader.createInstancesOfDependencies();
     });
-    module.injectables.set('TestProvider', testComp);
 
-    const modules = new Map();
-    modules.set('Test', module);
-    mockContainer.expects('getModules').returns(modules);
-
-    const loadInjectableStub = sinon.stub(injector, 'loadInjectable');
-    sinon.stub(injector, 'loadController');
-
-    await loader.createInstancesOfDependencies();
-    expect(
-      loadInjectableStub.calledWith(
-        module.injectables.get('TestProvider'),
-        module as any,
-      ),
-    ).to.be.true;
+    it('should call "loadInjectable"', async () => {
+      expect(loadInjectableStub).toHaveBeenCalledWith(
+        moduleMock.injectables.get('TestProvider'),
+        moduleMock as any,
+      );
+    });
+    it('should call "inspectInstanceWrapper"', async () => {
+      expect(inspectInstanceWrapperStub).toHaveBeenCalledWith(
+        moduleMock.injectables.get('TestProvider'),
+        moduleMock as any,
+      );
+    });
   });
 });

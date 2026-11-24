@@ -1,7 +1,7 @@
 import { NestFactory } from '@nestjs/core';
 import { MicroserviceOptions } from '@nestjs/microservices';
-import { AppModule } from './app.module';
-import { grpcClientOptions } from './grpc-client.options';
+import { AppModule } from './app.module.js';
+import { grpcClientOptions } from './grpc-client.options.js';
 
 async function bootstrap() {
   /**
@@ -15,14 +15,14 @@ async function bootstrap() {
    *    protoPath: join(__dirname, './hero/hero.proto'),
    *  }
    * });
-   * await app.listenAsync();
+   * await app.listen();
    *
    */
   const app = await NestFactory.create(AppModule);
   app.connectMicroservice<MicroserviceOptions>(grpcClientOptions);
 
-  await app.startAllMicroservicesAsync();
+  await app.startAllMicroservices();
   await app.listen(3001);
   console.log(`Application is running on: ${await app.getUrl()}`);
 }
-bootstrap();
+await bootstrap();

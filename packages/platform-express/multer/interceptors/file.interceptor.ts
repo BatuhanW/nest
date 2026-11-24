@@ -1,21 +1,33 @@
 import {
-  CallHandler,
-  ExecutionContext,
+  type CallHandler,
+  type ExecutionContext,
   Inject,
   mixin,
-  NestInterceptor,
+  type NestInterceptor,
   Optional,
-  Type,
+  type Type,
 } from '@nestjs/common';
-import * as multer from 'multer';
+import multer from 'multer';
 import { Observable } from 'rxjs';
-import { MULTER_MODULE_OPTIONS } from '../files.constants';
-import { MulterModuleOptions } from '../interfaces';
-import { MulterOptions } from '../interfaces/multer-options.interface';
-import { transformException } from '../multer/multer.utils';
+import { MULTER_MODULE_OPTIONS } from '../files.constants.js';
+import { MulterModuleOptions } from '../interfaces/index.js';
+import { MulterOptions } from '../interfaces/multer-options.interface.js';
+import {
+  applyDefaultLimits,
+  mergeMulterOptions,
+  rejectPrototypePoisoning,
+  removeFilesOnPipeRejection,
+  runMulter,
+} from '../multer/multer.utils.js';
 
 type MulterInstance = any;
 
+/**
+ * @param fieldName
+ * @param localOptions
+ *
+ * @publicApi
+ */
 export function FileInterceptor(
   fieldName: string,
   localOptions?: MulterOptions,
@@ -28,10 +40,9 @@ export function FileInterceptor(
       @Inject(MULTER_MODULE_OPTIONS)
       options: MulterModuleOptions = {},
     ) {
-      this.multer = (multer as any)({
-        ...options,
-        ...localOptions,
-      });
+      this.multer = (multer as any)(
+        applyDefaultLimits(mergeMulterOptions(options, localOptions)),
+      );
     }
 
     async intercept(
@@ -40,22 +51,23 @@ export function FileInterceptor(
     ): Promise<Observable<any>> {
       const ctx = context.switchToHttp();
 
-      await new Promise<void>((resolve, reject) =>
-        this.multer.single(fieldName)(
-          ctx.getRequest(),
-          ctx.getResponse(),
-          (err: any) => {
-            if (err) {
-              const error = transformException(err);
-              return reject(error);
-            }
-            resolve();
-          },
-        ),
+      await runMulter(
+        this.multer.single(fieldName),
+        ctx.getRequest(),
+        ctx.getResponse(),
       );
-      return next.handle();
+      await rejectPrototypePoisoning(this.multer.storage, ctx.getRequest());
+      return next
+        .handle()
+        .pipe(
+          removeFilesOnPipeRejection(
+            this.multer.storage,
+            ctx.getRequest(),
+            ctx.getResponse(),
+          ),
+        );
     }
   }
   const Interceptor = mixin(MixinInterceptor);
-  return Interceptor as Type<NestInterceptor>;
+  return Interceptor;
 }

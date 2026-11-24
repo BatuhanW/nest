@@ -1,0 +1,884 @@
+import {
+  BadRequestException,
+  HttpException,
+  RequestMethod,
+  StreamableFile,
+  UnauthorizedException,
+} from '@nestjs/common';
+import { ExpressAdapter } from '@nestjs/platform-express';
+import { EventEmitter } from 'events';
+import express from 'express';
+import createHttpError from 'http-errors';
+import { PassThrough, Readable, Writable } from 'stream';
+import request from 'supertest';
+
+describe('ExpressAdapter', () => {
+  afterEach(() => vi.restoreAllMocks());
+  let expressAdapter: ExpressAdapter;
+
+  beforeEach(() => {
+    expressAdapter = new ExpressAdapter();
+  });
+
+  describe('setErrorHandler', () => {
+    it.each([
+      { prefix: 'api', path: '/api' },
+      { prefix: '/api', path: '/api' },
+      { prefix: 'api/', path: '/api' },
+      { prefix: '/api/', path: '/api' },
+      { prefix: 'api/v1/', path: '/api/v1' },
+    ])(
+      'should mount the error handler at $path and the root for prefix $prefix',
+      ({ prefix, path }) => {
+        const expressInstance = expressAdapter.getInstance();
+        const useSpy = vi.spyOn(expressInstance, 'use');
+        const handler = vi.fn();
+
+        expressAdapter.setErrorHandler(handler, prefix);
+
+        expect(useSpy).toHaveBeenCalledTimes(2);
+        expect(useSpy).toHaveBeenCalledWith(path, expect.any(Function));
+        expect(useSpy).toHaveBeenCalledWith(handler);
+      },
+    );
+
+    it.each([undefined, '', '/'])(
+      'should mount only the root error handler for prefix %j',
+      prefix => {
+        const useSpy = vi.spyOn(expressAdapter.getInstance(), 'use');
+        const handler = vi.fn();
+
+        expressAdapter.setErrorHandler(handler, prefix);
+
+        expect(useSpy).toHaveBeenCalledExactlyOnceWith(handler);
+      },
+    );
+  });
+
+  describe('setNotFoundHandler', () => {
+    it.each([
+      { prefix: 'api', path: '/api' },
+      { prefix: '/api', path: '/api' },
+      { prefix: 'api/', path: '/api' },
+      { prefix: '/api/', path: '/api' },
+      { prefix: 'api/v1/', path: '/api/v1' },
+    ])(
+      'should mount the not-found handler at $path for prefix $prefix',
+      ({ prefix, path }) => {
+        const expressInstance = expressAdapter.getInstance();
+        const useSpy = vi.spyOn(expressInstance, 'use');
+
+        expressAdapter.setNotFoundHandler(vi.fn(), prefix);
+
+        expect(useSpy).toHaveBeenCalledExactlyOnceWith(
+          path,
+          expect.any(Function),
+        );
+      },
+    );
+
+    it.each([undefined, '', '/'])(
+      'should mount only the root not-found handler for prefix %j',
+      prefix => {
+        const useSpy = vi.spyOn(expressAdapter.getInstance(), 'use');
+
+        expressAdapter.setNotFoundHandler(vi.fn(), prefix);
+
+        expect(useSpy).toHaveBeenCalledExactlyOnceWith(expect.any(Function));
+      },
+    );
+
+    it('should mount the handler on every excluded path, for every method', () => {
+      // An excluded path lives at the root, so the prefix router never sees a
+      // request for it. `all`, not the method the exclusion names: the methods
+      // it leaves out are the misses this answers.
+      const expressInstance = expressAdapter.getInstance();
+      const allSpy = vi.spyOn(expressInstance, 'all');
+      const handler = vi.fn();
+
+      expressAdapter.setNotFoundHandler(handler, 'api', [
+        { path: 'hello', method: RequestMethod.GET },
+        { path: '/health/{*splat}', method: RequestMethod.ALL },
+      ]);
+
+      expect(allSpy).toHaveBeenCalledTimes(2);
+      expect(allSpy).toHaveBeenCalledWith('/hello', handler);
+      expect(allSpy).toHaveBeenCalledWith('/health/{*splat}', handler);
+    });
+
+    it('should mount nothing extra when nothing is excluded', () => {
+      const expressInstance = expressAdapter.getInstance();
+      const allSpy = vi.spyOn(expressInstance, 'all');
+
+      expressAdapter.setNotFoundHandler(vi.fn(), 'api', []);
+
+      expect(allSpy).not.toHaveBeenCalled();
+    });
+
+    it('should ignore excluded paths when there is no prefix', () => {
+      // Without a prefix the root handler already covers them, so a second
+      // mount would only add a route that can never be reached first.
+      const expressInstance = expressAdapter.getInstance();
+      const allSpy = vi.spyOn(expressInstance, 'all');
+
+      expressAdapter.setNotFoundHandler(vi.fn(), undefined, [
+        { path: 'hello', method: RequestMethod.GET },
+      ]);
+
+      expect(allSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('getRouteMatchingOptions', () => {
+    it('should match paths case-insensitively and ignore a trailing slash by default', () => {
+      expect(expressAdapter.getRouteMatchingOptions()).toEqual({
+        caseSensitive: false,
+        ignoreTrailingSlash: true,
+      });
+    });
+
+    it('should follow the "case sensitive routing" and "strict routing" settings', () => {
+      const app = express();
+      app.set('case sensitive routing', true);
+      app.set('strict routing', true);
+
+      expect(new ExpressAdapter(app).getRouteMatchingOptions()).toEqual({
+        caseSensitive: true,
+        ignoreTrailingSlash: false,
+      });
+    });
+
+    it('should ignore settings changed after the router was created, as the router does', () => {
+      const app = express();
+      app.use((_req, _res, next) => next());
+      app.set('case sensitive routing', true);
+      app.set('strict routing', true);
+
+      expect(new ExpressAdapter(app).getRouteMatchingOptions()).toEqual({
+        caseSensitive: false,
+        ignoreTrailingSlash: true,
+      });
+    });
+  });
+
+  describe('createMiddlewareFactory', () => {
+    // Plain-path routes such as forRoutes('*') carry no request method
+    // (see RoutesMapper.getRouteInfoFromPath).
+    const NO_REQUEST_METHOD = -1 as RequestMethod;
+
+    it.each([
+      {
+        method: NO_REQUEST_METHOD,
+        path: '/api$',
+        expressMethod: 'all',
+        registeredPath: '/api',
+      },
+      {
+        method: NO_REQUEST_METHOD,
+        path: '/api/v1$',
+        expressMethod: 'all',
+        registeredPath: '/api/v1',
+      },
+      {
+        method: RequestMethod.GET,
+        path: '/api$',
+        expressMethod: 'get',
+        registeredPath: '/api',
+      },
+    ] as const)(
+      'should register the exact-match path $path through "$expressMethod" at $registeredPath',
+      ({ method, path, expressMethod, registeredPath }) => {
+        const expressInstance = expressAdapter.getInstance();
+        const routeSpy = vi.spyOn(expressInstance, expressMethod);
+        const useSpy = vi.spyOn(expressInstance, 'use');
+        const handler = vi.fn();
+
+        expressAdapter.createMiddlewareFactory(method)(path, handler);
+
+        expect(routeSpy).toHaveBeenCalledExactlyOnceWith(
+          registeredPath,
+          expect.any(Function),
+        );
+        expect(useSpy).not.toHaveBeenCalled();
+      },
+    );
+
+    it('should register the middleware itself on the exact-match path', () => {
+      const allSpy = vi.spyOn(expressAdapter.getInstance(), 'all');
+      const middleware = vi.fn();
+
+      expressAdapter.createMiddlewareFactory(NO_REQUEST_METHOD)(
+        '/api$',
+        middleware,
+      );
+
+      // "/api" also matches "/api/", which "/api/*path" would not
+      expect(allSpy).toHaveBeenCalledExactlyOnceWith('/api', middleware);
+    });
+  });
+
+  describe('registerParserMiddleware', () => {
+    it('should register the express built-in parsers for json and urlencoded payloads', () => {
+      const expressInstance = express();
+      const jsonParserInstance = express.json();
+      const urlencodedInstance = express.urlencoded();
+      const jsonParserSpy = vi
+        .spyOn(express, 'json')
+        .mockReturnValue(jsonParserInstance as any);
+      const urlencodedParserSpy = vi
+        .spyOn(express, 'urlencoded')
+        .mockReturnValue(urlencodedInstance as any);
+      const useSpy = vi.spyOn(expressInstance, 'use');
+      const expressAdapter = new ExpressAdapter(expressInstance);
+      useSpy.mockClear();
+
+      expressAdapter.registerParserMiddleware();
+
+      expect(useSpy).toHaveBeenCalledTimes(2);
+      expect(useSpy).toHaveBeenCalledWith(jsonParserInstance);
+      expect(useSpy).toHaveBeenCalledWith(urlencodedInstance);
+      expect(jsonParserSpy).toHaveBeenCalledWith({});
+      expect(urlencodedParserSpy).toHaveBeenCalledWith({ extended: true });
+    });
+
+    it('should not register default parsers if custom parsers have already been registered', () => {
+      const expressInstance = express();
+      expressInstance.use(function jsonParser() {});
+      expressInstance.use(function urlencodedParser() {});
+      const useSpy = vi.spyOn(expressInstance, 'use');
+      const expressAdapter = new ExpressAdapter(expressInstance);
+      useSpy.mockClear();
+
+      expressAdapter.registerParserMiddleware();
+
+      expect(useSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('reply', () => {
+    const createResponse = () => ({
+      status: vi.fn(),
+      send: vi.fn(),
+      json: vi.fn(),
+      getHeader: vi.fn(),
+      setHeader: vi.fn(),
+    });
+
+    it('should apply the given status code', () => {
+      const response = createResponse();
+
+      expressAdapter.reply(response, { message: 'Oops' }, 404);
+
+      expect(response.status).toHaveBeenCalledWith(404);
+    });
+
+    it('should not apply any status code when it is omitted', () => {
+      const response = createResponse();
+
+      expressAdapter.reply(response, { message: 'Hello' });
+
+      expect(response.status).not.toHaveBeenCalled();
+    });
+
+    it('should apply falsy status codes instead of dropping them', () => {
+      // "0" and "NaN" are falsy, but they were still passed in. Forwarding them
+      // lets express reject the value, whereas skipping the call leaves the
+      // status that was set before the handler ran (200/201), so an error would
+      // be sent with a successful status code.
+      for (const statusCode of [0, NaN]) {
+        const response = createResponse();
+
+        expressAdapter.reply(response, { message: 'Oops' }, statusCode);
+
+        expect(response.status).toHaveBeenCalledWith(statusCode);
+      }
+    });
+
+    it.each([
+      'application/json; charset=utf-8',
+      'application/problem+json',
+      'application/vnd.api+json; charset=utf-8',
+      'Application/JSON',
+    ])('should keep the "%s" JSON content type for error bodies', type => {
+      const response = createResponse();
+      response.getHeader.mockReturnValue(type);
+      const warnSpy = vi
+        .spyOn((expressAdapter as any).logger, 'warn')
+        .mockImplementation(() => {});
+
+      expressAdapter.reply(response, { statusCode: 400, message: 'Oops' }, 400);
+
+      expect(response.setHeader).not.toHaveBeenCalled();
+      expect(warnSpy).not.toHaveBeenCalled();
+      expect(response.json).toHaveBeenCalled();
+    });
+
+    it('should force a JSON content type for error bodies sent with a non-JSON content type', () => {
+      const response = createResponse();
+      response.getHeader.mockReturnValue('text/html');
+
+      expressAdapter.reply(response, { statusCode: 400, message: 'Oops' }, 400);
+
+      expect(response.setHeader).toHaveBeenCalledWith(
+        'Content-Type',
+        'application/json',
+      );
+    });
+
+    it('should force a JSON content type for error bodies without a "statusCode"', () => {
+      const response = createResponse();
+      response.getHeader.mockReturnValue('text/html');
+      const warnSpy = vi
+        .spyOn((expressAdapter as any).logger, 'warn')
+        .mockImplementation(() => {});
+      // A custom HttpException body, e.g. new HttpException({ ... }, 404)
+      const body = { status: 404, error: '<img src=x onerror=alert(1)>' };
+
+      expressAdapter.reply(response, body, 404);
+
+      expect(response.setHeader).toHaveBeenCalledWith(
+        'Content-Type',
+        'application/json',
+      );
+      expect(warnSpy).toHaveBeenCalled();
+      expect(response.json).toHaveBeenCalledWith(body);
+    });
+
+    it('should send the standard body of the status for an Error body', () => {
+      const response = Object.assign(createResponse(), { statusCode: 200 });
+      response.status.mockImplementation(code => (response.statusCode = code));
+      const error = Object.assign(new Error('invalid signature'), {
+        config: { headers: { authorization: 'Bearer secret' } },
+      });
+      const exception = new UnauthorizedException(error);
+
+      expressAdapter.reply(response, exception.getResponse(), 401);
+
+      expect(response.json).toHaveBeenCalledExactlyOnceWith({
+        statusCode: 401,
+        message: 'Unauthorized',
+      });
+      expect(response.send).not.toHaveBeenCalled();
+    });
+
+    it('should keep the content type of a text body sent with an error status', () => {
+      const response = createResponse();
+      response.getHeader.mockReturnValue('text/html');
+
+      expressAdapter.reply(response, '<h1>Not found</h1>', 404);
+
+      expect(response.setHeader).not.toHaveBeenCalled();
+      expect(response.send).toHaveBeenCalledWith('<h1>Not found</h1>');
+    });
+
+    describe('when the body is a StreamableFile', () => {
+      const createStreamResponse = () =>
+        Object.assign(new PassThrough(), {
+          getHeader: vi.fn(),
+          setHeader: vi.fn(),
+        });
+
+      it('should destroy the source stream when the client disconnects', async () => {
+        const source = new PassThrough();
+        const errorHandler = vi.fn();
+        const errorLogger = vi.fn();
+        const file = new StreamableFile(source)
+          .setErrorHandler(errorHandler)
+          .setErrorLogger(errorLogger);
+        const response = createStreamResponse();
+
+        expressAdapter.reply(response, file);
+        source.write('partial');
+        response.destroy();
+
+        await vi.waitFor(() => expect(source.destroyed).toBe(true));
+        expect(errorHandler).not.toHaveBeenCalled();
+        expect(errorLogger).not.toHaveBeenCalled();
+      });
+
+      it('should destroy the source streams of pipelined responses when the connection closes', async () => {
+        // Responses queued behind an unread one on the same connection: they
+        // have no socket of their own, and may never be closed themselves
+        const connection = Object.assign(new EventEmitter(), {
+          destroyed: false,
+        });
+        const sources = Array.from({ length: 3 }, () => new PassThrough());
+        for (const source of sources) {
+          const response = Object.assign(createStreamResponse(), {
+            req: { method: 'GET', socket: connection },
+          });
+          expressAdapter.reply(response, new StreamableFile(source));
+          source.write('partial');
+        }
+        expect(connection.listenerCount('close')).toBe(1);
+
+        connection.emit('close');
+
+        await vi.waitFor(() =>
+          expect(sources.every(source => source.destroyed)).toBe(true),
+        );
+      });
+
+      it('should destroy the source stream when the client disconnected before the reply', async () => {
+        const source = new PassThrough();
+        const response = createStreamResponse();
+        response.destroy();
+        await new Promise(resolve => setImmediate(resolve));
+
+        expressAdapter.reply(response, new StreamableFile(source));
+
+        await vi.waitFor(() => expect(source.destroyed).toBe(true));
+      });
+
+      it('should report a source that failed before the reply to the error handler', async () => {
+        // e.g. ENOENT from `fs.createReadStream()` while an interceptor awaits
+        const source = new PassThrough();
+        const errorHandler = vi.fn();
+        const file = new StreamableFile(source).setErrorHandler(errorHandler);
+        const response = createStreamResponse();
+        const error = new Error('ENOENT');
+        source.destroy(error);
+        await new Promise(resolve => setImmediate(resolve));
+
+        expressAdapter.reply(response, file);
+
+        expect(errorHandler).toHaveBeenCalledWith(error, response);
+        expect(response.setHeader).not.toHaveBeenCalled();
+      });
+
+      it.each(['image/', 'pdf', 'image/png'])(
+        'should answer a source that fails with a plain-text 400 (type "%s")',
+        async type => {
+          // e.g. a type built from a file name without an extension, and a
+          // file that does not exist
+          expressAdapter.getInstance().get('/', (_req, res) => {
+            const source = new PassThrough();
+            const file = new StreamableFile(source, { type }).setErrorLogger(
+              () => {},
+            );
+            expressAdapter.reply(res, file);
+            source.destroy(new Error('ENOENT'));
+          });
+
+          await request(expressAdapter.getInstance())
+            .get('/')
+            .timeout(2000)
+            .expect(400, 'Bad Request')
+            .expect('Content-Type', 'text/plain; charset=utf-8');
+        },
+      );
+
+      it('should destroy the response when the error handler throws', async () => {
+        const logger = vi
+          .spyOn((expressAdapter as any).logger, 'error')
+          .mockImplementation(() => {});
+        const source = new PassThrough();
+        const handlerError = new TypeError('invalid media type');
+        const file = new StreamableFile(source).setErrorHandler(() => {
+          throw handlerError;
+        });
+        const response = createStreamResponse();
+
+        expressAdapter.reply(response, file);
+        source.destroy(new Error('ENOENT'));
+
+        await vi.waitFor(() => expect(response.destroyed).toBe(true));
+        expect(logger).toHaveBeenCalledWith(handlerError);
+      });
+
+      it('should set the Content-Length of the file', () => {
+        const response = createStreamResponse();
+
+        expressAdapter.reply(
+          response,
+          new StreamableFile(Buffer.from('hello world'), { length: 11 }),
+        );
+
+        expect(response.setHeader).toHaveBeenCalledWith('Content-Length', 11);
+      });
+
+      it('should leave out the Content-Length when the Transfer-Encoding is set', () => {
+        const response = createStreamResponse();
+        response.getHeader.mockImplementation(name =>
+          name === 'Transfer-Encoding' ? 'chunked' : undefined,
+        );
+
+        expressAdapter.reply(
+          response,
+          new StreamableFile(Buffer.from('hello world'), { length: 11 }),
+        );
+
+        expect(response.setHeader).not.toHaveBeenCalledWith(
+          'Content-Length',
+          expect.anything(),
+        );
+      });
+
+      it('should not destroy a source that has ended', async () => {
+        const source = new PassThrough({ autoDestroy: false });
+        const response = createStreamResponse();
+        response.resume();
+
+        expressAdapter.reply(response, new StreamableFile(source));
+        source.end('done');
+        await new Promise(resolve => response.once('end', resolve));
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(source.readableEnded).toBe(true);
+        expect(source.destroyed).toBe(false);
+      });
+
+      it('should keep the source open while the response is being written', async () => {
+        const source = new PassThrough();
+        const response = createStreamResponse();
+        const chunks: Buffer[] = [];
+        response.on('data', chunk => chunks.push(chunk));
+
+        expressAdapter.reply(response, new StreamableFile(source));
+        source.write('first');
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(source.destroyed).toBe(false);
+        source.end('second');
+        await new Promise(resolve => response.once('end', resolve));
+        expect(Buffer.concat(chunks).toString()).toBe('firstsecond');
+      });
+
+      describe('when the source is in object mode', () => {
+        it('should send the strings and bytes it emits', async () => {
+          const source = Readable.from([
+            'first ',
+            Buffer.from('second '),
+            new Uint8Array([116, 104, 105, 114, 100]),
+          ]);
+          const response = createStreamResponse();
+          const chunks: Buffer[] = [];
+          response.on('data', chunk => chunks.push(chunk));
+
+          expressAdapter.reply(response, new StreamableFile(source));
+          await new Promise(resolve => response.once('end', resolve));
+
+          expect(Buffer.concat(chunks).toString()).toBe('first second third');
+        });
+
+        it('should write an empty first chunk, which sends the headers early', async () => {
+          const source = Readable.from(['', 'later']);
+          const response = createStreamResponse();
+          const write = vi.spyOn(response, 'write');
+          response.resume();
+
+          expressAdapter.reply(response, new StreamableFile(source));
+          await new Promise(resolve => response.once('end', resolve));
+
+          expect(write.mock.calls.map(([chunk]) => chunk)).toEqual([
+            '',
+            'later',
+          ]);
+        });
+
+        it.each([
+          ['an object', { id: 1 }],
+          ['an array', ['a', 'b']],
+          ['a number', 42],
+        ])(
+          'should fail the stream on %s without writing it',
+          async (_, chunk) => {
+            const errorHandler = vi.fn();
+            const response = createStreamResponse();
+            const write = vi.spyOn(response, 'write');
+            response.resume();
+            // The chunk first, last (the source may have ended before it
+            // is written) and in between
+            const sources = [
+              Readable.from([chunk]),
+              Readable.from(['first', chunk]),
+              Readable.from(['first', chunk, 'last']),
+            ];
+
+            for (const source of sources) {
+              const file = new StreamableFile(source).setErrorHandler(
+                errorHandler,
+              );
+              expressAdapter.reply(response, file);
+            }
+
+            await vi.waitFor(() =>
+              expect(errorHandler).toHaveBeenCalledTimes(sources.length),
+            );
+            expect(errorHandler).toHaveBeenCalledWith(
+              expect.objectContaining({
+                name: 'TypeError',
+                message: expect.stringContaining(
+                  'A StreamableFile can only send string and Uint8Array chunks',
+                ),
+              }),
+              response,
+            );
+            expect(write).not.toHaveBeenCalledWith(chunk, expect.anything());
+            expect(write).not.toHaveBeenCalledWith(chunk);
+            for (const source of sources) {
+              expect(source.destroyed).toBe(true);
+              expect(source.readableEnded).toBe(false);
+            }
+          },
+        );
+
+        it('should answer 400 for such a chunk before any data', async () => {
+          expressAdapter.getInstance().get('/', (_req, res) => {
+            const file = new StreamableFile(
+              Readable.from([{ id: 1 }]),
+            ).setErrorLogger(() => {});
+            expressAdapter.reply(res, file);
+          });
+
+          await request(expressAdapter.getInstance())
+            .get('/')
+            .timeout(2000)
+            .expect(400, 'Bad Request');
+        });
+
+        it('should abort the response for such a chunk after some data', async () => {
+          const response = createStreamResponse();
+          const end = vi.spyOn(response, 'end');
+          let headersSent = false;
+          Object.defineProperty(response, 'headersSent', {
+            get: () => headersSent,
+          });
+          response.on('data', () => (headersSent = true));
+          const file = new StreamableFile(
+            Readable.from(['first', ['a', 'b']]),
+          ).setErrorLogger(() => {});
+
+          expressAdapter.reply(response, file);
+
+          await vi.waitFor(() => expect(response.destroyed).toBe(true));
+          expect(headersSent).toBe(true);
+          expect(end).not.toHaveBeenCalled();
+        });
+
+        it('should end the response for a source that has already ended', async () => {
+          const source = Readable.from([]);
+          source.resume();
+          await new Promise(resolve => source.once('end', resolve));
+          const response = createStreamResponse();
+          response.resume();
+
+          expressAdapter.reply(response, new StreamableFile(source));
+
+          await new Promise(resolve => response.once('end', resolve));
+        });
+      });
+
+      describe('for a HEAD request', () => {
+        // Node discards what is written to a HEAD response, so its write()
+        // never applies backpressure
+        const createHeadResponse = () =>
+          Object.assign(
+            new Writable({
+              write(_chunk, _encoding, callback) {
+                callback();
+              },
+            }),
+            {
+              req: { method: 'HEAD' },
+              getHeader: vi.fn(),
+              setHeader: vi.fn(),
+            },
+          );
+
+        it('should end the response without reading the whole source', async () => {
+          const chunkCount = 1000;
+          const chunk = Buffer.alloc(1024);
+          let reads = 0;
+          const source = new Readable({
+            read() {
+              this.push(++reads > chunkCount ? null : chunk);
+            },
+          });
+          const response = createHeadResponse();
+
+          expressAdapter.reply(response, new StreamableFile(source));
+          await new Promise(resolve => response.once('finish', resolve));
+          await vi.waitFor(() => expect(source.destroyed).toBe(true));
+
+          expect(reads).toBeLessThan(chunkCount);
+        });
+
+        it('should end the response when the source has no data', async () => {
+          const file = new StreamableFile(Buffer.alloc(0));
+          await new Promise(resolve => setImmediate(resolve));
+          const response = createHeadResponse();
+
+          expressAdapter.reply(response, file);
+
+          await new Promise(resolve => response.once('finish', resolve));
+          expect(response.writableEnded).toBe(true);
+        });
+
+        it('should end the response when the source has already ended', async () => {
+          const source = new Readable({ read() {} });
+          source.push(null);
+          source.resume();
+          await new Promise(resolve => source.once('end', resolve));
+          const response = createHeadResponse();
+
+          expressAdapter.reply(response, new StreamableFile(source));
+
+          await new Promise(resolve => response.once('finish', resolve));
+          expect(response.writableEnded).toBe(true);
+        });
+
+        it('should leave an error opening the source to the error handler', async () => {
+          const errorHandler = vi.fn();
+          const source = new Readable({
+            read() {
+              this.destroy(new Error('ENOENT'));
+            },
+          });
+          const response = createHeadResponse();
+
+          expressAdapter.reply(
+            response,
+            new StreamableFile(source).setErrorHandler(errorHandler),
+          );
+          await vi.waitFor(() =>
+            expect(errorHandler).toHaveBeenCalledWith(
+              expect.objectContaining({ message: 'ENOENT' }),
+              response,
+            ),
+          );
+
+          expect(response.writableEnded).toBe(false);
+        });
+      });
+    });
+  });
+
+  describe('render', () => {
+    // Renders "<view>:<variables>" without a template on disk
+    class InlineView {
+      readonly path: string;
+      constructor(readonly name: string) {
+        this.path = name;
+      }
+      render(
+        options: Record<string, unknown>,
+        callback: (err: Error | null, html?: string) => void,
+      ) {
+        const { name, user } = options;
+        callback(null, `${this.name}:${JSON.stringify({ name, user })}`);
+      }
+    }
+
+    beforeEach(() => {
+      expressAdapter.getInstance().set('view', InlineView);
+    });
+
+    it('should render the variables the handler returned with res.locals', async () => {
+      const viewModel = { name: 'Corner Shop' };
+      expressAdapter.getInstance().get('/', (_req, res) => {
+        res.locals.user = 'alice';
+        expressAdapter.render(res, 'index', viewModel);
+      });
+
+      await request(expressAdapter.getInstance())
+        .get('/')
+        .expect(200, 'index:{"name":"Corner Shop","user":"alice"}');
+    });
+
+    it('should not add the res.locals of the request to the returned value', async () => {
+      // e.g. a view model the controller keeps between requests
+      const viewModel = { name: 'Corner Shop' };
+      expressAdapter.getInstance().get('/', (_req, res) => {
+        res.locals.user = 'alice';
+        expressAdapter.render(res, 'index', viewModel);
+      });
+
+      await request(expressAdapter.getInstance()).get('/').expect(200);
+
+      expect(viewModel).toEqual({ name: 'Corner Shop' });
+      expect(JSON.stringify(viewModel)).toBe('{"name":"Corner Shop"}');
+    });
+
+    it('should pass on a value that is not an object as it is', () => {
+      const response = { render: vi.fn() };
+
+      expressAdapter.render(response, 'index', undefined);
+
+      expect(response.render).toHaveBeenCalledWith('index', undefined);
+    });
+  });
+
+  describe('mapException', () => {
+    it('should map URIError with status code to BadRequestException', () => {
+      // What the router throws for a malformed parameter
+      const error = Object.assign(new URIError("Failed to decode param '%'"), {
+        status: 400,
+      });
+      const result = expressAdapter.mapException(error) as BadRequestException;
+      expect(result).toBeInstanceOf(BadRequestException);
+      expect(result.getResponse()).toEqual(
+        expect.objectContaining({ message: "Failed to decode param '%'" }),
+      );
+      expect(result.cause).toBe(error);
+    });
+
+    it('should map SyntaxError with status code to BadRequestException', () => {
+      // What body-parser throws for malformed JSON
+      const error = createHttpError(400, new SyntaxError('Unexpected token'));
+      const result = expressAdapter.mapException(error) as BadRequestException;
+      expect(result).toBeInstanceOf(BadRequestException);
+      expect(result.cause).toBe(error);
+    });
+
+    it.each([
+      // e.g. a view that decodes a query param, as a template engine reports it
+      [
+        'URIError',
+        new URIError(
+          'views/login.ejs:3\n 1| <%# internal note %>\n\nURI malformed',
+        ),
+      ],
+      ['SyntaxError', new SyntaxError('views/login.ejs:5\n\nUnexpected token')],
+    ])('should not map a %s without a status code', (_, error) => {
+      expect(expressAdapter.mapException(error)).toBe(error);
+    });
+
+    it('should not map a SyntaxError of another status code', () => {
+      const error = Object.assign(new SyntaxError('internal detail'), {
+        status: 500,
+      });
+      expect(expressAdapter.mapException(error)).toBe(error);
+    });
+
+    it('should return error if it is not handler Error', () => {
+      const error = new Error('Test error');
+      const result = expressAdapter.mapException(error);
+      expect(result).toBe(error);
+    });
+
+    it('should map an http-errors error to an HttpException with its status', () => {
+      const error = createHttpError(413, 'request entity too large');
+      const result = expressAdapter.mapException(error) as HttpException;
+      expect(result).toBeInstanceOf(HttpException);
+      expect(result.getStatus()).toBe(413);
+      expect(result.getResponse()).toBe('request entity too large');
+      expect(result.cause).toBe(error);
+    });
+
+    it('should not expose the message of an http-errors error with expose: false', () => {
+      const error = createHttpError(404, 'internal detail', { expose: false });
+      const result = expressAdapter.mapException(error) as HttpException;
+      expect(result.getStatus()).toBe(404);
+      expect(result.getResponse()).toBe('Not Found');
+    });
+
+    it.each([500, 503])(
+      'should not map an http-errors error with status %i',
+      status => {
+        const error = createHttpError(status, 'internal detail');
+        expect(expressAdapter.mapException(error)).toBe(error);
+      },
+    );
+  });
+});

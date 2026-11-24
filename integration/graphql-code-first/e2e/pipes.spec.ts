@@ -1,19 +1,20 @@
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import * as request from 'supertest';
-import { ApplicationModule } from '../src/app.module';
+import request from 'supertest';
+import { AppModule } from '../src/app.module.js';
+import { listenOnLoopback } from '../../_support/listen-on-loopback.js';
 
 describe('GraphQL Pipes', () => {
   let app: INestApplication;
 
   beforeEach(async () => {
     const module = await Test.createTestingModule({
-      imports: [ApplicationModule],
+      imports: [AppModule],
     }).compile();
 
     app = module.createNestApplication();
     app.useGlobalPipes(new ValidationPipe());
-    await app.init();
+    await listenOnLoopback(app);
   });
 
   it(`should throw an error`, () => {
@@ -30,17 +31,13 @@ describe('GraphQL Pipes', () => {
         errors: [
           {
             extensions: {
-              code: 'INTERNAL_SERVER_ERROR',
-              exception: {
-                message: 'Bad Request Exception',
-                response: {
-                  message: [
-                    'description must be longer than or equal to 30 characters',
-                  ],
-                  error: 'Bad Request',
-                  statusCode: 400,
-                },
-                status: 400,
+              code: 'BAD_REQUEST',
+              originalError: {
+                error: 'Bad Request',
+                message: [
+                  'description must be longer than or equal to 30 characters',
+                ],
+                statusCode: 400,
               },
             },
             locations: [

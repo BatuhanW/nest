@@ -1,5 +1,13 @@
-import { INestApplication } from '@nestjs/common';
-import { ServeStaticOptions } from './serve-static-options.interface';
+import type { HttpServer, INestApplication } from '@nestjs/common';
+import type { Express } from 'express';
+import type { Server as CoreHttpServer } from 'http';
+import type { Server as CoreHttpsServer } from 'https';
+import {
+  NestExpressBodyParserOptionsFor,
+  NestExpressBodyParserType,
+} from './nest-express-body-parser.interface.js';
+import { ServeStaticOptions } from './serve-static-options.interface.js';
+import type { CorsOptions, CorsOptionsDelegate } from '@nestjs/common/internal';
 
 /**
  * Interface describing methods on NestExpressApplication.
@@ -8,7 +16,31 @@ import { ServeStaticOptions } from './serve-static-options.interface';
  *
  * @publicApi
  */
-export interface NestExpressApplication extends INestApplication {
+export interface NestExpressApplication<
+  TServer extends CoreHttpServer | CoreHttpsServer = CoreHttpServer,
+> extends INestApplication<TServer> {
+  /**
+   * Returns the underlying HTTP adapter bounded to the Express.js app.
+   *
+   * @returns {HttpServer}
+   */
+  getHttpAdapter(): HttpServer<Express.Request, Express.Response, Express>;
+
+  /**
+   * Starts the application.
+   *
+   * @param {number|string} port
+   * @param {string} [hostname]
+   * @param {Function} [callback] Optional callback
+   * @returns {Promise} A Promise that, when resolved, is a reference to the underlying HttpServer.
+   */
+  listen(port: number | string, callback?: () => void): Promise<TServer>;
+  listen(
+    port: number | string,
+    hostname: string,
+    callback?: () => void,
+  ): Promise<TServer>;
+
   /**
    * A wrapper function around native `express.set()` method.
    *
@@ -56,6 +88,31 @@ export interface NestExpressApplication extends INestApplication {
    * @returns {this}
    */
   useStaticAssets(path: string, options?: ServeStaticOptions): this;
+
+  enableCors(options?: CorsOptions | CorsOptionsDelegate<any>): void;
+
+  /**
+   * Register Express body parsers on the fly. Will respect
+   * the application's `rawBody` option.
+   *
+   * @example
+   * const app = await NestFactory.create<NestExpressApplication>(
+   *   AppModule,
+   *   { rawBody: true }
+   * );
+   * app.useBodyParser('json', { limit: '50mb' });
+   *
+   * The accepted options are narrowed by the `parser` argument, so
+   * `useBodyParser('json', ...)` only accepts `express.json` options,
+   * `useBodyParser('urlencoded', ...)` only accepts `express.urlencoded`
+   * options, and so on.
+   *
+   * @returns {this}
+   */
+  useBodyParser<ParserType extends NestExpressBodyParserType>(
+    parser: ParserType,
+    options?: NestExpressBodyParserOptionsFor<ParserType>,
+  ): this;
 
   /**
    * Sets one or multiple base directories for templates (views).

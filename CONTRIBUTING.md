@@ -19,13 +19,13 @@ Help us keep Nest open and inclusive. Please read and follow our [Code of Conduc
 
 ## <a name="question"></a> Got a Question or Problem?
 
-**Do not open issues for general support questions as we want to keep GitHub issues for bug reports and feature requests.** You've got much better chances of getting your question answered on [Stack Overflow](https://stackoverflow.com/questions/tagged/nestjs) where the questions should be tagged with tag `nestjs`.
+**Do not open issues for general support questions as we want to keep GitHub issues for bug reports and feature requests.** You've got much better chances of getting your question answered on [Stack Overflow][stackoverflow] where the questions should be tagged with tag `nestjs`.
 
 Stack Overflow is a much better place to ask questions since:
 
 <!-- - there are thousands of people willing to help on Stack Overflow [maybe one day] -->
 
-- questions and answers stay available for public viewing so your question / answer might help someone else
+- questions and answers stay available for public viewing so your question / answer might help someone else.
 - Stack Overflow's voting system assures that the best answers are prominently visible.
 
 To save your and our time, we will systematically close all issues that are requests for general support and redirect people to Stack Overflow.
@@ -56,7 +56,7 @@ Please consider what kind of change it is:
 
 Before you submit an issue, please search the issue tracker, maybe an issue for your problem already exists and the discussion might inform you of workarounds readily available.
 
-We want to fix all the issues as soon as possible, but before fixing a bug we need to reproduce and confirm it. In order to reproduce bugs we will systematically ask you to provide a minimal reproduction scenario using a repository or [Gist](https://gist.github.com/). Having a live, reproducible scenario gives us wealth of important information without going back & forth to you with additional questions like:
+We want to fix all the issues as soon as possible, but before fixing a bug, we need to reproduce and confirm it. In order to reproduce bugs we will systematically ask you to provide a minimal reproduction scenario using a repository or [Gist](https://gist.github.com/). Having a live, reproducible scenario gives us a wealth of important information without going back & forth to you with additional questions like:
 
 - version of NestJS used
 - 3rd-party libraries and their versions
@@ -69,9 +69,9 @@ A minimal reproduce scenario using a repository or Gist allows us to quickly con
 
 <!-- We will be insisting on a minimal reproduce scenario in order to save maintainers time and ultimately be able to fix more bugs. Interestingly, from our experience users often find coding problems themselves while preparing a minimal plunk. We understand that sometimes it might be hard to extract essentials bits of code from a larger code-base but we really need to isolate the problem before we can fix it. -->
 
-Unfortunately, we are not able to investigate / fix bugs without a minimal reproduction, so if we don't hear back from you we are going to close an issue that don't have enough info to be reproduced.
+Unfortunately, we are not able to investigate / fix bugs without a minimal reproduction, so if we don't hear back from you we are going to close an issue that doesn't have enough info to be reproduced.
 
-You can file new issues by filling out our [new issue form](https://github.com/nestjs/nest/issues/new).
+You can file new issues by filling out our [new issue form][new_issue].
 
 ### <a name="submit-pr"></a> Submitting a Pull Request (PR)
 
@@ -84,9 +84,9 @@ To the first point
 We cannot accept code without this.
 -->
 
-1. Search [GitHub](https://github.com/nestjs/nest/pulls) for an open or closed PR
+1. Search [GitHub Pull Requests][gh_prs] for an open or closed PR
    that relates to your submission. You don't want to duplicate effort.
-1. Fork the nestjs/nest repo.
+1. Fork this repository.
 1. Make your changes in a new git branch:
 
    ```shell
@@ -116,7 +116,6 @@ We cannot accept code without this.
 1. In GitHub, send a pull request to `nestjs:master`.
 
 - If we suggest changes then:
-
   - Make the required updates.
   - Re-run the Nest test suites to ensure tests are still passing.
   - Rebase your branch and force push to your GitHub repository (this will update your Pull Request):
@@ -159,26 +158,38 @@ from the main (upstream) repository:
 
 ## <a name="development"></a> Development Setup
 
-You will need Node.js version 8.9.0+.
+You will need [Node.js](https://nodejs.org) version 22.12 or newer, which the test tooling (Vitest) requires. The published packages themselves support Node.js >= 20.
 
 1. After cloning the repo, run:
 
 ```bash
-$ npm i # (or yarn install)
+$ npm ci --legacy-peer-deps # (or yarn install)
 ```
 
-2. In order to prepare your environment run `prepare.sh` shell script:
+2. To run the unit tests you are ready to go:
 
 ```bash
-$ sh scripts/prepare.sh
+$ npm run test
 ```
 
-That will compile fresh packages and afterward, move them to all `sample` directories as well as integration tests.
+The unit tests run straight from the TypeScript sources, so no build step and no Docker
+are required.
+
+3. Only if you are going to run the **integration** tests, prepare that environment with
+   the `prepare.sh` shell script:
+
+```bash
+$ bash scripts/prepare.sh
+```
+
+That will compile fresh packages into the root `node_modules/@nestjs`, then start the
+Docker containers the integration tests need and wait for RabbitMQ to accept
+connections. Docker is required for this step.
 
 ### <a name="common-scripts"></a>Commonly used NPM scripts
 
 ```bash
-# build all packages and move to "sample" directories
+# build all packages into the root node_modules/@nestjs
 $ npm run build
 
 # run the full unit tests suite
@@ -186,7 +197,7 @@ $ npm run test
 
 # run integration tests
 # docker is required(!)
-$ sh scripts/run-integration.sh
+$ bash scripts/run-integration.sh
 
 # run linter
 $ npm run lint
@@ -203,7 +214,7 @@ To ensure consistency throughout the source code, keep these rules in mind as yo
 // We're working on auto-documentation.
 * All public API methods **must be documented**. (Details TBC). -->
 
-- All features or bug fixes **must be tested** by one or more specs (unit-tests).
+- All features or bug fixes **must be tested** by one or more specs (unit tests).
 - We follow [Google's JavaScript Style Guide][js-style-guide], but wrap all code at
   **100 characters**. An automated formatter is available (`npm run format`).
 
@@ -228,12 +239,12 @@ format that includes a **type**, a **scope** and a **subject**:
 
 The **header** is mandatory and the **scope** of the header is optional.
 
-Any line of the commit message cannot be longer 100 characters! This allows the message to be easier
+Any line of the commit message cannot be longer than 100 characters! This allows the message to be easier
 to read on GitHub as well as in various git tools.
 
 Footer should contain a [closing reference to an issue](https://help.github.com/articles/closing-issues-via-commit-messages/) if any.
 
-Samples: (even more [samples](https://github.com/nestjs/nest/commits/master))
+Samples: (even more [samples][commits_samples])
 
 ```
 docs(changelog): update change log to beta.5
@@ -262,16 +273,23 @@ Must be one of the following:
 
 ### Scope
 
-The scope should be the name of the npm package affected (as perceived by person reading changelog generated from commit messages.
+The scope should have the name of the npm package affected (as perceived by person reading changelog generated from commit messages).
 
 The following is the list of supported scopes:
 
-- **common**
-- **core**
-- **sample**
-- **microservices**
-- **testing**
-- **websockets**
+- **common**: for changes made on `packages/common` directory
+- **core**: for changes made on `packages/core` directory
+- **sample**: for changes made on `sample` directory
+- **microservices**: for changes made on `packages/microservices` directory
+- **express**: for changes made on `packages/platform-express` directory
+- **fastify**: for changes made on `packages/platform-fastify` directory
+- **node**: for changes made on `packages/platform-node` directory
+- **socket.io**: for changes made on `packages/platform-socket.io` directory
+- **ws**: for changes made on `packages/platform-ws` directory
+- **testing**: for changes made on `packages/testing` directory
+- **websockets**: for changes made on `packages/websockets` directory
+
+If your change affects more than one package, separate the scopes with a comma (e.g. `common,core`).
 
 There are currently a few exceptions to the "use package name" rule:
 
@@ -279,7 +297,6 @@ There are currently a few exceptions to the "use package name" rule:
 - **changelog**: used for updating the release notes in CHANGELOG.md
 - **sample/#**: for the example apps directory, replacing # with the example app number
 - none/empty string: useful for `style`, `test` and `refactor` changes that are done across all packages (e.g. `style: add missing semicolons`)
-  <!-- * **aio**: used for docs-app (angular.io) related changes within the /aio directory of the repo -->
 
 ### Subject
 
@@ -317,14 +334,14 @@ changes to be accepted, the CLA must be signed. It's a quick process, we promise
 <!-- [coc]: https://github.com/angular/code-of-conduct/blob/master/CODE_OF_CONDUCT.md -->
 
 [commit-message-format]: https://docs.google.com/document/d/1QrDFcIiPjSLDn3EL15IJygNPiHORgU1_OOAqWjiDU5Y/edit#
-[corporate-cla]: http://code.google.com/legal/corporate-cla-v1.0.html
-[dev-doc]: https://github.com/nestjs/nest/blob/master/docs/DEVELOPER.md
-[github]: https://github.com/nestjs/nest
-[discord]: https://discordapp.com/invite/G7Qnnhy
-[individual-cla]: http://code.google.com/legal/individual-cla-v1.0.html
-[js-style-guide]: https://google.github.io/styleguide/jsguide.html
-[jsfiddle]: http://jsfiddle.net
-[plunker]: http://plnkr.co/edit
-[runnable]: http://runnable.com
 
-<!-- [stackoverflow]: http://stackoverflow.com/questions/tagged/angular -->
+<!-- [individual-cla]: http://code.google.com/legal/individual-cla-v1.0.html -->
+<!-- [corporate-cla]: http://code.google.com/legal/corporate-cla-v1.0.html -->
+
+[github]: https://github.com/nestjs/nest
+[stackoverflow]: https://stackoverflow.com/questions/tagged/nestjs
+[discord]: https://discordapp.com/invite/G7Qnnhy
+[js-style-guide]: https://google.github.io/styleguide/jsguide.html
+[new_issue]: https://github.com/nestjs/nest/issues/new
+[gh_prs]: https://github.com/nestjs/nest/pulls
+[commits_samples]: https://github.com/nestjs/nest/commits/master

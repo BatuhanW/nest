@@ -1,113 +1,414 @@
+/* eslint-disable @typescript-eslint/no-redundant-type-constituents */
 import {
-  isNil,
-  isString,
-  isUndefined,
-} from '@nestjs/common/utils/shared.utils';
-import { Observable } from 'rxjs';
-import {
-  CONNECT_EVENT,
+  BLOCKED_RMQ_MESSAGE,
+  CONNECTION_FAILED_MESSAGE,
+  CONSUMER_CANCELLED_RMQ_MESSAGE,
   DISCONNECTED_RMQ_MESSAGE,
-  DISCONNECT_EVENT,
   NO_MESSAGE_HANDLER,
-  RQM_DEFAULT_IS_GLOBAL_PREFETCH_COUNT,
-  RQM_DEFAULT_NOACK,
-  RQM_DEFAULT_PREFETCH_COUNT,
-  RQM_DEFAULT_QUEUE,
-  RQM_DEFAULT_QUEUE_OPTIONS,
-  RQM_DEFAULT_URL,
-} from '../constants';
-import { RmqContext } from '../ctx-host';
-import { Transport } from '../enums';
-import { RmqUrl } from '../external/rmq-url.interface';
-import { CustomTransportStrategy, RmqOptions } from '../interfaces';
+  RMQ_SEPARATOR,
+  RMQ_WILDCARD_ALL,
+  RMQ_WILDCARD_SINGLE,
+  RMQ_DEFAULT_IS_GLOBAL_PREFETCH_COUNT,
+  RMQ_DEFAULT_MAX_MESSAGE_SIZE,
+  RMQ_DEFAULT_NOACK,
+  RMQ_DEFAULT_NO_ASSERT,
+  RMQ_DEFAULT_PREFETCH_COUNT,
+  RMQ_DEFAULT_QUEUE,
+  RMQ_DEFAULT_QUEUE_OPTIONS,
+  RMQ_DEFAULT_URL,
+  RMQ_MAX_SHORT_STRING_LENGTH,
+  RMQ_NO_EVENT_HANDLER,
+  RMQ_NO_MESSAGE_HANDLER,
+  UNBLOCKED_RMQ_MESSAGE,
+} from '../constants.js';
+import { RmqContext } from '../ctx-host/index.js';
+import { Transport } from '../enums/index.js';
+import { MaxPacketLengthExceededException } from '../errors/max-packet-length-exceeded.exception.js';
+import { RmqEvents, RmqEventsMap, RmqStatus } from '../events/rmq.events.js';
+import { RmqUrl } from '../external/rmq-url.interface.js';
+import {
+  MessageHandler,
+  RmqOptions,
+  TransportId,
+} from '../interfaces/index.js';
 import {
   IncomingRequest,
   OutgoingResponse,
-} from '../interfaces/packet.interface';
-import { Server } from './server';
+  ReadPacket,
+} from '../interfaces/packet.interface.js';
+import { RmqRecordSerializer } from '../serializers/rmq-record.serializer.js';
+import { Server } from './server.js';
+import { isNil, isString, isUndefined } from '@nestjs/common/internal';
 
-let rqmPackage: any = {};
+// To enable type safety for RMQ. This cant be uncommented by default
+// because it would require the user to install the amqplib package even if they dont use RabbitMQ
+// Otherwise, TypeScript would fail to compile the code.
+//
+// type AmqpConnectionManager =
+//   import('amqp-connection-manager').AmqpConnectionManager;
+// type ChannelWrapper = import('amqp-connection-manager').ChannelWrapper;
+// type Message = import('amqplib').Message;
+// type Channel = import('amqplib').Channel | import('amqplib').ConfirmChannel;
 
-export class ServerRMQ extends Server implements CustomTransportStrategy {
-  public readonly transportId = Transport.RMQ;
+type AmqpConnectionManager = any;
+type ChannelWrapper = any;
+type Message = any;
+type Channel = any;
 
-  protected server: any = null;
-  protected channel: any = null;
+const INFINITE_CONNECTION_ATTEMPTS = -1;
+
+/**
+ * @publicApi
+ */
+export class ServerRMQ extends Server<RmqEvents, RmqStatus> {
+  public transportId: TransportId = Transport.RMQ;
+
+  protected server: AmqpConnectionManager | null = null;
+  protected channel: ChannelWrapper | null = null;
+  protected consumer: { channel: Channel; consumerTag: string } | null = null;
+  protected isClosing = false;
+  private pendingClose: Promise<void> | null = null;
+  private closeCount = 0;
+  protected connectionAttempts = 0;
   protected readonly urls: string[] | RmqUrl[];
   protected readonly queue: string;
-  protected readonly prefetchCount: number;
+  protected readonly noAck: boolean;
+  protected readonly maxMessageSize: number;
   protected readonly queueOptions: any;
-  protected readonly isGlobalPrefetchCount: boolean;
+  protected readonly wildcardHandlers = new Map<string, MessageHandler>();
+  protected pendingEventListeners: Array<{
+    event: keyof RmqEvents;
+    callback: RmqEvents[keyof RmqEvents];
+  }> = [];
 
-  constructor(protected readonly options: RmqOptions['options']) {
+  constructor(protected readonly options: Required<RmqOptions>['options']) {
     super();
-    this.urls = this.getOptionsProp(this.options, 'urls') || [RQM_DEFAULT_URL];
+    this.urls = this.getOptionsProp(this.options, 'urls') || [RMQ_DEFAULT_URL];
     this.queue =
-      this.getOptionsProp(this.options, 'queue') || RQM_DEFAULT_QUEUE;
-    this.prefetchCount =
-      this.getOptionsProp(this.options, 'prefetchCount') ||
-      RQM_DEFAULT_PREFETCH_COUNT;
-    this.isGlobalPrefetchCount =
-      this.getOptionsProp(this.options, 'isGlobalPrefetchCount') ||
-      RQM_DEFAULT_IS_GLOBAL_PREFETCH_COUNT;
+      this.getOptionsProp(this.options, 'queue') || RMQ_DEFAULT_QUEUE;
+    this.noAck = this.getOptionsProp(this.options, 'noAck', RMQ_DEFAULT_NOACK);
+    const maxMessageSize = this.getOptionsProp(this.options, 'maxMessageSize');
+    // A value that is not a number (such as NaN from an unset environment
+    // variable) gets the default: no size compares greater than NaN
+    this.maxMessageSize =
+      maxMessageSize == null || isNaN(maxMessageSize)
+        ? RMQ_DEFAULT_MAX_MESSAGE_SIZE
+        : maxMessageSize;
     this.queueOptions =
       this.getOptionsProp(this.options, 'queueOptions') ||
-      RQM_DEFAULT_QUEUE_OPTIONS;
-
-    this.loadPackage('amqplib', ServerRMQ.name, () => require('amqplib'));
-    rqmPackage = this.loadPackage(
-      'amqp-connection-manager',
-      ServerRMQ.name,
-      () => require('amqp-connection-manager'),
-    );
+      RMQ_DEFAULT_QUEUE_OPTIONS;
 
     this.initializeSerializer(options);
     this.initializeDeserializer(options);
   }
 
-  public async listen(callback: () => void): Promise<void> {
-    await this.start(callback);
+  public async listen(
+    callback: (err?: unknown, ...optionalParams: unknown[]) => void,
+  ): Promise<void> {
+    try {
+      await this.start(callback);
+    } catch (err) {
+      callback(err);
+    }
   }
 
-  public close(): void {
-    this.channel && this.channel.close();
-    this.server && this.server.close();
+  public close(): Promise<void> {
+    this.closeCount++;
+    // A close() that overlaps another one waits for it: closing the
+    // connection while the first one waits for its channel to close would
+    // leave that close() pending for good
+    this.pendingClose ??= this.closeChannelAndConnection().finally(() => {
+      this.pendingClose = null;
+    });
+    return this.pendingClose;
   }
 
-  public async start(callback?: () => void) {
-    this.server = this.createClient();
-    this.server.on(CONNECT_EVENT, () => {
+  private async closeChannelAndConnection(): Promise<void> {
+    // A reconnection from here on must not set the channel up, and so
+    // consume, again
+    this.isClosing = true;
+    try {
+      // Without a consumer, no request or event can be in flight
+      const consumer = this.consumer;
+      if (consumer && this.getOptionsProp(this.options, 'gracefulShutdown')) {
+        await this.stopReceivingMessages(consumer);
+        await this.waitForHandlersInFlight(
+          this.getOptionsProp(this.options, 'gracePeriod'),
+        );
+      }
+      // The channel goes first, as amqplib settles its close on the broker's
+      // reply, which never arrives once the connection is closed. The
+      // connection is still closed when the channel close fails, otherwise
+      // the connection manager keeps reconnecting after close() rejected.
+      const results = [
+        ...(await Promise.allSettled([this.channel?.close()])),
+        ...(await Promise.allSettled([this.server?.close()])),
+      ];
+      const [failure, ...otherFailures] = results.filter(
+        (result): result is PromiseRejectedResult =>
+          result.status === 'rejected',
+      );
+      otherFailures.forEach(({ reason }) => this.logger.error(reason));
+      if (failure) {
+        throw failure.reason;
+      }
+    } finally {
+      this.consumer = null;
+      this.pendingEventListeners = [];
+    }
+  }
+
+  private async stopReceivingMessages(consumer: {
+    channel: Channel;
+    consumerTag: string;
+  }) {
+    try {
+      await consumer.channel.cancel(consumer.consumerTag);
+    } catch {
+      // The channel is closed, so the server receives nothing either way.
+    }
+  }
+
+  public async start(
+    callback?: (err?: unknown, ...optionalParams: unknown[]) => void,
+  ) {
+    // Each start counts its own attempts towards "maxConnectionAttempts"
+    this.connectionAttempts = 0;
+    // The channel of an earlier start, closed since, must not stop this one
+    // from setting up its own or be taken for a reconnect
+    this.channel = null;
+    this.consumer = null;
+    this.isClosing = false;
+    const closeCount = this.closeCount;
+    const server = await this.createClient<AmqpConnectionManager>();
+    // The connection manager starts connecting as soon as it is created, and
+    // close() found nothing to close
+    if (this.closeCount !== closeCount) {
+      await server.close().catch(() => {});
+      callback?.(new Error('Connection closed'));
+      return;
+    }
+    this.server = server;
+    let listenCallback = callback;
+    const settleListenCallback = (...args: unknown[]) => {
+      const cb = listenCallback;
+      listenCallback = undefined;
+      cb?.(...args);
+    };
+    this.server!.once(RmqEventsMap.CONNECT, () => {
       if (this.channel) {
         return;
       }
-      this.channel = this.server.createChannel({
+      this._status$.next(RmqStatus.CONNECTED);
+      this.channel = this.server!.createChannel({
         json: false,
-        setup: (channel: any) => this.setupChannel(channel, callback),
+        setup: (channel: Channel) =>
+          this.setupChannel(channel, settleListenCallback),
+      });
+      // The wrapper emits "error" when the setup throws, and an unhandled emit
+      // crashes the process. A later error is only logged: the callback
+      // settles once.
+      this.channel.on(RmqEventsMap.ERROR, (err: unknown) => {
+        this.logger.error(err);
+        const cb = listenCallback;
+        if (!cb) {
+          return;
+        }
+        listenCallback = undefined;
+        // Otherwise the wrapper re-runs the setup on every reconnect, and the
+        // server would start consuming after "listen()" has failed.
+        void this.close()
+          .catch(closeErr => this.logger.error(closeErr))
+          .then(() => cb(err));
       });
     });
-    this.server.on(DISCONNECT_EVENT, (err: any) => {
+
+    const maxConnectionAttempts = this.getOptionsProp(
+      this.options,
+      'maxConnectionAttempts',
+      INFINITE_CONNECTION_ATTEMPTS,
+    );
+
+    this.registerConnectListener();
+    this.registerDisconnectListener();
+    this.registerBlockedListener();
+    this.registerUnblockedListener();
+    this.pendingEventListeners.forEach(({ event, callback }) =>
+      this.server!.on(event, callback),
+    );
+    this.pendingEventListeners = [];
+
+    // "connectFailed" fires on every failed attempt, so count each one.
+    const connectFailedEvent = 'connectFailed';
+    this.server!.on(
+      connectFailedEvent,
+      async (error: Record<string, unknown>) => {
+        this._status$.next(RmqStatus.DISCONNECTED);
+
+        this.logger.error(CONNECTION_FAILED_MESSAGE);
+        if (error?.err) {
+          this.logger.error(error.err);
+        }
+        const isReconnecting = !!this.channel;
+        if (
+          maxConnectionAttempts === INFINITE_CONNECTION_ATTEMPTS ||
+          isReconnecting
+        ) {
+          return;
+        }
+        if (++this.connectionAttempts === maxConnectionAttempts) {
+          await this.close().catch(err => this.logger.error(err));
+          settleListenCallback(
+            error.err ?? new Error(CONNECTION_FAILED_MESSAGE),
+          );
+        }
+      },
+    );
+  }
+
+  public async createClient<T = any>(): Promise<T> {
+    // amqp-connection-manager imports amqplib, so amqplib is checked first to
+    // name the package that is actually missing.
+    await this.loadPackage('amqplib', ServerRMQ.name, () => import('amqplib'));
+    const rmqPackage = await this.loadPackage(
+      'amqp-connection-manager',
+      ServerRMQ.name,
+      () => import('amqp-connection-manager'),
+    );
+    const socketOptions = this.getOptionsProp(this.options, 'socketOptions');
+    return rmqPackage.connect(this.urls, {
+      connectionOptions: socketOptions?.connectionOptions,
+      heartbeatIntervalInSeconds: socketOptions?.heartbeatIntervalInSeconds,
+      reconnectTimeInSeconds: socketOptions?.reconnectTimeInSeconds,
+    }) as T;
+  }
+
+  private registerConnectListener() {
+    this.server!.on(RmqEventsMap.CONNECT, (err: any) => {
+      this._status$.next(RmqStatus.CONNECTED);
+    });
+  }
+
+  private registerDisconnectListener() {
+    this.server!.on(RmqEventsMap.DISCONNECT, (err: any) => {
+      this._status$.next(RmqStatus.DISCONNECTED);
       this.logger.error(DISCONNECTED_RMQ_MESSAGE);
       this.logger.error(err);
     });
   }
 
-  public createClient<T = any>(): T {
-    const socketOptions = this.getOptionsProp(this.options, 'socketOptions');
-    return rqmPackage.connect(this.urls, { connectionOptions: socketOptions });
+  private registerBlockedListener() {
+    this.server!.on(RmqEventsMap.BLOCKED, ({ reason }: { reason: string }) => {
+      this._status$.next(RmqStatus.BLOCKED);
+      this.logger.warn(BLOCKED_RMQ_MESSAGE(reason));
+    });
   }
 
-  public async setupChannel(channel: any, callback: Function) {
-    const noAck = this.getOptionsProp(this.options, 'noAck', RQM_DEFAULT_NOACK);
+  private registerUnblockedListener() {
+    this.server!.on(RmqEventsMap.UNBLOCKED, () => {
+      this._status$.next(RmqStatus.UNBLOCKED);
+      this.logger.log(UNBLOCKED_RMQ_MESSAGE);
+    });
+  }
 
-    await channel.assertQueue(this.queue, this.queueOptions);
-    await channel.prefetch(this.prefetchCount, this.isGlobalPrefetchCount);
-    channel.consume(
-      this.queue,
-      (msg: Record<string, any>) => this.handleMessage(msg, channel),
+  public async setupChannel(channel: Channel, callback: Function) {
+    if (this.isClosing) {
+      return;
+    }
+    const noAssert =
+      this.getOptionsProp(this.options, 'noAssert') ??
+      this.queueOptions.noAssert ??
+      RMQ_DEFAULT_NO_ASSERT;
+
+    let createdQueue: string;
+
+    if (this.queue === RMQ_DEFAULT_QUEUE || !noAssert) {
+      const { queue } = await channel.assertQueue(
+        this.queue,
+        this.queueOptions,
+      );
+      createdQueue = queue;
+    } else {
+      createdQueue = this.queue;
+    }
+
+    const isGlobalPrefetchCount = this.getOptionsProp(
+      this.options,
+      'isGlobalPrefetchCount',
+      RMQ_DEFAULT_IS_GLOBAL_PREFETCH_COUNT,
+    );
+    const prefetchCount = this.getOptionsProp(
+      this.options,
+      'prefetchCount',
+      RMQ_DEFAULT_PREFETCH_COUNT,
+    );
+
+    // Use queue name as exchange name if exchange is not provided and "wildcards" is set to true
+    // or the exchange is a fanout one, which is where the client publishes in these cases
+    const exchange = this.getOptionsProp(
+      this.options,
+      'exchange',
+      this.options.queue,
+    );
+    if (
+      this.options.exchange ||
+      this.options.wildcards ||
+      // Only with a name to declare, so that a fanout server that has none
+      // still consumes its queue directly
+      (this.options.exchangeType === 'fanout' && exchange)
+    ) {
+      const exchangeType = this.getOptionsProp(
+        this.options,
+        'exchangeType',
+        'topic',
+      );
+      await channel.assertExchange(exchange, exchangeType, {
+        durable: true,
+        arguments: this.getOptionsProp(this.options, 'exchangeArguments', {}),
+      });
+
+      if (this.options.routingKey || this.options.exchangeType === 'fanout') {
+        await channel.bindQueue(
+          createdQueue,
+          exchange,
+          this.options.exchangeType === 'fanout' ? '' : this.options.routingKey,
+        );
+      }
+
+      if (this.options.wildcards) {
+        const routingKeys = Array.from(this.getHandlers().keys());
+        await Promise.all(
+          routingKeys.map(routingKey =>
+            channel.bindQueue(createdQueue, exchange, routingKey),
+          ),
+        );
+
+        // When "wildcards" is set to true,  we need to initialize wildcard handlers
+        // otherwise we would not be able to associate the incoming messages with the handlers
+        this.initializeWildcardHandlersIfExist();
+      }
+    }
+
+    await channel.prefetch(prefetchCount, isGlobalPrefetchCount);
+    // close() may have started while the channel was being set up
+    if (this.isClosing) {
+      return;
+    }
+    // The broker names the consumer when no "consumerTag" is configured
+    const { consumerTag } = await channel.consume(
+      createdQueue,
+      (msg: Record<string, any> | null) =>
+        this.handleMessage(msg!, channel).catch(err => this.handleError(err)),
       {
-        noAck,
+        noAck: this.noAck,
+        consumerTag: this.getOptionsProp(
+          this.options,
+          'consumerTag',
+          undefined,
+        ),
       },
     );
+    this.consumer = { channel, consumerTag };
     callback();
   }
 
@@ -116,53 +417,328 @@ export class ServerRMQ extends Server implements CustomTransportStrategy {
     channel: any,
   ): Promise<void> {
     if (isNil(message)) {
-      return;
+      // amqplib calls the consumer with "null" once the broker has cancelled
+      // it (e.g., its queue was deleted). The connection stays up, so nothing
+      // else would set the channel up (and consume) again.
+      this.logger.error(CONSUMER_CANCELLED_RMQ_MESSAGE);
+      return this.setupChannel(channel, () => {});
     }
-    const { content, properties } = message;
-    const rawMessage = JSON.parse(content.toString());
-    const packet = this.deserializer.deserialize(rawMessage);
-    const pattern = isString(packet.pattern)
-      ? packet.pattern
-      : JSON.stringify(packet.pattern);
+    const { content, properties, fields } = message;
+    if (content.length > this.maxMessageSize) {
+      return this.skipOversizedMessage(message, channel);
+    }
+    const rawMessage = this.parseMessageContent(content);
+    const packet = await this.deserializer.deserialize(rawMessage, properties);
+    const pattern = this.getPatternAsString(packet.pattern);
 
     const rmqContext = new RmqContext([message, channel, pattern]);
+    if (!this.isPatternOfRoutingKey(pattern, fields)) {
+      this.logger.warn(
+        `Message dropped: its pattern does not name the handler of its routing key "${fields.routingKey}".`,
+      );
+      if (!this.noAck) {
+        this.channel!.nack(message as Message, false, false);
+      }
+      return;
+    }
     if (isUndefined((packet as IncomingRequest).id)) {
       return this.handleEvent(pattern, packet, rmqContext);
     }
     const handler = this.getHandlerByPattern(pattern);
 
     if (!handler) {
+      if (!this.noAck) {
+        this.logger.warn(RMQ_NO_MESSAGE_HANDLER`${pattern}`);
+        this.channel!.nack(rmqContext.getMessage() as Message, false, false);
+      }
+      // The sender chooses the id, which this reply carries
+      this.assertValidPacketId((packet as IncomingRequest).id);
       const status = 'error';
       const noHandlerPacket = {
         id: (packet as IncomingRequest).id,
         err: NO_MESSAGE_HANDLER,
         status,
       };
-      return this.sendMessage(
+      await this.sendMessage(
         noHandlerPacket,
         properties.replyTo,
         properties.correlationId,
+        rmqContext,
       );
+      return;
     }
-    const response$ = this.transformToObservable(
-      await handler(packet.data, rmqContext),
-    ) as Observable<any>;
-
     const publish = <T>(data: T) =>
-      this.sendMessage(data, properties.replyTo, properties.correlationId);
+      this.sendMessage(
+        data,
+        properties.replyTo,
+        properties.correlationId,
+        rmqContext,
+      );
 
-    response$ && this.send(response$, publish);
+    this.warnIfEventHandlerReplies(handler, pattern);
+    return this.handleRequest(
+      rmqContext,
+      async () =>
+        this.transformToObservable(await handler(packet.data, rmqContext)),
+      publish,
+    );
+  }
+
+  /**
+   * Skips a message whose body is larger than "maxMessageSize" without
+   * decoding it: JSON.parse() can take dozens of times the size of the text
+   * in memory, and V8 ends the process, instead of throwing, once the heap is
+   * exhausted. Neither amqplib nor the broker's default limit bounds the body
+   * below that.
+   */
+  protected async skipOversizedMessage(
+    message: Record<string, any>,
+    channel: any,
+  ): Promise<void> {
+    const { content, properties } = message;
+    const err = new MaxPacketLengthExceededException(content.length);
+    this.logger.error(
+      `Message skipped (queue "${this.queue}"): ${err.message}`,
+    );
+    if (!this.noAck) {
+      // Requeued, it would be delivered again
+      this.channel!.nack(message as Message, false, false);
+    }
+    if (isNil(properties?.replyTo)) {
+      return;
+    }
+    // The id and the pattern are in the body, so the sender of a request,
+    // which waits for a reply, is answered through the properties alone
+    await this.sendMessage(
+      { id: properties.correlationId, err: err.message, status: 'error' },
+      properties.replyTo,
+      properties.correlationId,
+      new RmqContext([message, channel, '']),
+    );
+  }
+
+  public async handleEvent(
+    pattern: string,
+    packet: ReadPacket,
+    context: RmqContext,
+  ): Promise<any> {
+    const handler = this.getHandlerByPattern(pattern);
+    if (!handler && !this.noAck) {
+      this.channel!.nack(context.getMessage() as Message, false, false);
+      return this.logger.warn(RMQ_NO_EVENT_HANDLER`${pattern}`);
+    }
+    return super.handleEvent(pattern, packet, context);
   }
 
   public sendMessage<T = any>(
     message: T,
     replyTo: any,
     correlationId: string,
-  ): void {
+    context: RmqContext,
+  ): Promise<unknown> {
+    // Both come from the request. amqplib decodes invalid UTF-8 in them to
+    // longer strings than it can encode again, and once it throws on one, the
+    // channel wrapper never settles the publish nor releases the reply.
+    const isTooLong = (value: unknown) =>
+      isString(value) && Buffer.byteLength(value) > RMQ_MAX_SHORT_STRING_LENGTH;
+    if (isTooLong(replyTo) || isTooLong(correlationId)) {
+      this.logger.error(
+        `Dropped a reply whose "replyTo" or "correlationId" is longer than ${RMQ_MAX_SHORT_STRING_LENGTH} bytes.`,
+      );
+      return Promise.resolve();
+    }
     const outgoingResponse = this.serializer.serialize(
-      (message as unknown) as OutgoingResponse,
+      message as unknown as OutgoingResponse,
     );
+    const options = outgoingResponse.options;
+    delete outgoingResponse.options;
+
     const buffer = Buffer.from(JSON.stringify(outgoingResponse));
-    this.channel.sendToQueue(replyTo, buffer, { correlationId });
+    const sendOptions = { ...options, correlationId };
+
+    return this.channel!.sendToQueue(replyTo, buffer, sendOptions);
+  }
+
+  public unwrap<T>(): T {
+    if (!this.server) {
+      throw new Error(
+        'Not initialized. Please call the "listen"/"startAllMicroservices" method before accessing the server.',
+      );
+    }
+    return this.server as T;
+  }
+
+  public on<
+    EventKey extends keyof RmqEvents = keyof RmqEvents,
+    EventCallback extends RmqEvents[EventKey] = RmqEvents[EventKey],
+  >(event: EventKey, callback: EventCallback) {
+    if (this.server) {
+      this.server.addListener(event, callback);
+    } else {
+      this.pendingEventListeners.push({ event, callback });
+    }
+  }
+
+  public getHandlerByPattern(pattern: string): MessageHandler | null {
+    if (!this.options.wildcards) {
+      return super.getHandlerByPattern(pattern);
+    }
+
+    // Search for non-wildcard handler first
+    const handler = super.getHandlerByPattern(pattern);
+    if (handler) {
+      return handler;
+    }
+
+    // Search for wildcard handler
+    if (this.wildcardHandlers.size === 0) {
+      return null;
+    }
+    for (const [wildcardPattern, handler] of this.wildcardHandlers) {
+      if (this.matchRmqPattern(wildcardPattern, pattern)) {
+        return handler;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * With "wildcards", the queue is bound to the service's exchange once per
+   * handler pattern, so the broker routes a message published there by its
+   * routing key, which is what its topic permissions are checked against,
+   * and ClientRMQ sets that key to the pattern. The handler is picked by the
+   * pattern in the body, so this checks that it is the handler of the routing
+   * key as well. A message published to the queue itself, through another
+   * exchange, or through the binding of the "routingKey" option is not
+   * checked.
+   */
+  protected isPatternOfRoutingKey(
+    pattern: string,
+    fields: Record<string, any> | undefined,
+  ): boolean {
+    if (
+      !this.options.wildcards ||
+      !fields?.exchange ||
+      !isString(fields.routingKey)
+    ) {
+      return true;
+    }
+    const exchange = this.getOptionsProp(
+      this.options,
+      'exchange',
+      this.options.queue,
+    );
+    const exchangeType = this.getOptionsProp(
+      this.options,
+      'exchangeType',
+      'topic',
+    );
+    if (
+      fields.exchange !== exchange ||
+      (exchangeType !== 'topic' && exchangeType !== 'direct')
+    ) {
+      return true;
+    }
+    const { routingKey } = this.options;
+    if (routingKey && this.matchRmqPattern(routingKey, fields.routingKey)) {
+      return true;
+    }
+    return (
+      this.getHandlerByPattern(pattern) ===
+      this.getHandlerByRoutingKey(fields.routingKey)
+    );
+  }
+
+  /**
+   * Returns the handler of a routing key, read as the broker routed it: as
+   * JSON, '"admin.purge"' would name the handler of "admin.purge". ClientRMQ
+   * sends an object pattern as the normalized JSON its handler is stored by.
+   */
+  private getHandlerByRoutingKey(routingKey: string): MessageHandler | null {
+    const handler = this.messageHandlers.get(routingKey);
+    if (handler) {
+      return handler;
+    }
+    for (const [wildcardPattern, wildcardHandler] of this.wildcardHandlers) {
+      if (this.matchRmqPattern(wildcardPattern, routingKey)) {
+        return wildcardHandler;
+      }
+    }
+    return null;
+  }
+
+  protected initializeSerializer(options: RmqOptions['options']) {
+    this.serializer = options?.serializer ?? new RmqRecordSerializer();
+  }
+
+  private parseMessageContent(content: Buffer) {
+    try {
+      return JSON.parse(content.toString());
+    } catch {
+      return content.toString();
+    }
+  }
+
+  protected initializeWildcardHandlersIfExist() {
+    if (this.wildcardHandlers.size !== 0) {
+      return;
+    }
+    const handlers = this.getHandlers();
+
+    handlers.forEach((handler, pattern) => {
+      if (typeof pattern !== 'string') {
+        return;
+      }
+
+      if (
+        pattern.includes(RMQ_WILDCARD_ALL) ||
+        pattern.includes(RMQ_WILDCARD_SINGLE)
+      ) {
+        this.wildcardHandlers.set(pattern, handler);
+      }
+    });
+  }
+
+  private matchRmqPattern(pattern: string, routingKey: string): boolean {
+    // The key comes from the body of the message, as long as its sender
+    // likes, and matching costs a pass per segment. A routing key is an AMQP
+    // short string, so the broker routes no longer one (more characters are
+    // more bytes too).
+    if (routingKey && routingKey.length > RMQ_MAX_SHORT_STRING_LENGTH) {
+      return false;
+    }
+    // The broker splits an empty key into no words at all, so "#" and "#.#"
+    // match it
+    const patternSegments = pattern ? pattern.split(RMQ_SEPARATOR) : [];
+    const routingKeySegments = routingKey
+      ? routingKey.split(RMQ_SEPARATOR)
+      : [];
+    const routingKeySegmentsLength = routingKeySegments.length;
+
+    // matched[j] is true when the pattern segments read so far match
+    // the first j segments of the routing key
+    let matched = [true, ...routingKeySegments.map(() => false)];
+
+    for (const currentPattern of patternSegments) {
+      const isWildcardAll = currentPattern === RMQ_WILDCARD_ALL;
+      const next = [isWildcardAll && matched[0]];
+
+      for (let j = 1; j <= routingKeySegmentsLength; j++) {
+        if (isWildcardAll) {
+          // "#" matches zero segments (matched[j]) or one more (next[j - 1])
+          next[j] = matched[j] || next[j - 1];
+          continue;
+        }
+        next[j] =
+          matched[j - 1] &&
+          (currentPattern === RMQ_WILDCARD_SINGLE ||
+            currentPattern === routingKeySegments[j - 1]);
+      }
+      if (!next.includes(true)) {
+        return false;
+      }
+      matched = next;
+    }
+    return matched[routingKeySegmentsLength];
   }
 }

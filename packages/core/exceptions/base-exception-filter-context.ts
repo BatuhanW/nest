@@ -1,12 +1,18 @@
-import { FILTER_CATCH_EXCEPTIONS } from '@nestjs/common/constants';
-import { Type } from '@nestjs/common/interfaces';
-import { ExceptionFilter } from '@nestjs/common/interfaces/exceptions/exception-filter.interface';
-import { isEmpty, isFunction } from '@nestjs/common/utils/shared.utils';
 import { iterate } from 'iterare';
-import { ContextCreator } from '../helpers/context-creator';
-import { STATIC_CONTEXT } from '../injector/constants';
-import { NestContainer } from '../injector/container';
-import { InstanceWrapper } from '../injector/instance-wrapper';
+import { getClassRef } from '../helpers/class-ref-registry.js';
+import { ContextCreator } from '../helpers/context-creator.js';
+import { STATIC_CONTEXT } from '../injector/constants.js';
+import { NestContainer } from '../injector/container.js';
+import {
+  type InstancePerContext,
+  InstanceWrapper,
+} from '../injector/instance-wrapper.js';
+import {
+  FILTER_CATCH_EXCEPTIONS,
+  isEmpty,
+  isFunction,
+} from '@nestjs/common/internal';
+import type { Type, ExceptionFilter } from '@nestjs/common';
 
 export class BaseExceptionFilterContext extends ContextCreator {
   protected moduleContext: string;
@@ -21,17 +27,18 @@ export class BaseExceptionFilterContext extends ContextCreator {
     inquirerId?: string,
   ): R {
     if (isEmpty(metadata)) {
-      return [] as R;
+      return [] as any[] as R;
     }
     return iterate(metadata)
       .filter(
-        instance => instance && (isFunction(instance.catch) || instance.name),
+        instance =>
+          instance && (isFunction(instance.catch) || isFunction(instance)),
       )
       .map(filter => this.getFilterInstance(filter, contextId, inquirerId))
       .filter(item => !!item)
       .map(instance => ({
-        func: instance.catch.bind(instance),
-        exceptionMetatypes: this.reflectCatchExceptions(instance),
+        func: instance!.catch.bind(instance),
+        exceptionMetatypes: this.reflectCatchExceptions(instance!),
       }))
       .toArray() as R;
   }
@@ -41,23 +48,43 @@ export class BaseExceptionFilterContext extends ContextCreator {
     contextId = STATIC_CONTEXT,
     inquirerId?: string,
   ): ExceptionFilter | null {
-    const isObject = (filter as ExceptionFilter).catch;
-    if (isObject) {
-      return filter as ExceptionFilter;
+    if (!isFunction(filter)) {
+      return filter;
     }
-    const instanceWrapper = this.getInstanceByMetatype(filter);
+    const instanceWrapper = this.getInstanceByMetatype(filter as Type<unknown>);
     if (!instanceWrapper) {
-      return null;
+      return this.pickEnhancer<ExceptionFilter>(filter, null, 'catch');
     }
     const instanceHost = instanceWrapper.getInstanceByContextId(
-      contextId,
+      this.getContextId(contextId, instanceWrapper),
       inquirerId,
     );
-    return instanceHost && instanceHost.instance;
+    if (instanceHost && !this.isInstantiated(instanceWrapper, instanceHost)) {
+      return null;
+    }
+    return this.pickEnhancer<ExceptionFilter>(
+      filter,
+      instanceHost && instanceHost.instance,
+      'catch',
+    );
   }
 
-  public getInstanceByMetatype<T extends Record<string, any>>(
-    filter: T,
+  /**
+   * A filter class that has not been instantiated in a context (or for an
+   * inquirer) is represented there by an object created from its prototype,
+   * e.g. a request-scoped filter of a controller that failed to resolve for
+   * the request. Its "catch()" would run without its constructor having been
+   * called, i.e. without its dependencies.
+   */
+  protected isInstantiated(
+    instanceWrapper: InstanceWrapper,
+    instanceHost: InstancePerContext<unknown>,
+  ): boolean {
+    return instanceWrapper.isNotMetatype || !!instanceHost.isConstructorCalled;
+  }
+
+  public getInstanceByMetatype(
+    metatype: Type<unknown>,
   ): InstanceWrapper | undefined {
     if (!this.moduleContext) {
       return;
@@ -67,13 +94,22 @@ export class BaseExceptionFilterContext extends ContextCreator {
     if (!moduleRef) {
       return;
     }
-    return moduleRef.injectables.get(filter.name);
+    return moduleRef.injectables.get(metatype);
   }
 
   public reflectCatchExceptions(instance: ExceptionFilter): Type<any>[] {
-    const prototype = Object.getPrototypeOf(instance);
+    // `@Catch()` also stores the types on the prototype of the filter class,
+    // because the "constructor" of that prototype may name another class (see
+    // `getClassRef`), and a filter the application instantiated itself is not
+    // a registered class. The class lookup serves filters that an older
+    // `@Catch()` decorated.
     return (
-      Reflect.getMetadata(FILTER_CATCH_EXCEPTIONS, prototype.constructor) || []
+      Reflect.getMetadata(
+        FILTER_CATCH_EXCEPTIONS,
+        Object.getPrototypeOf(instance),
+      ) ??
+      Reflect.getMetadata(FILTER_CATCH_EXCEPTIONS, getClassRef(instance)) ??
+      []
     );
   }
 }

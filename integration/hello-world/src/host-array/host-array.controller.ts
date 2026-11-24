@@ -1,7 +1,7 @@
 import { Controller, Get, Header, HostParam, Param } from '@nestjs/common';
 import { Observable, of } from 'rxjs';
-import { HostArrayService } from './host-array.service';
-import { UserByIdPipe } from './users/user-by-id.pipe';
+import { HostArrayService } from './host-array.service.js';
+import { UserByIdPipe } from './users/user-by-id.pipe.js';
 
 @Controller({
   path: 'host-array',
@@ -18,7 +18,7 @@ export class HostArrayController {
 
   @Get('async')
   async asyncGreeting(@HostParam('tenant') tenant: string): Promise<string> {
-    return `${await this.hostService.greeting()} tenant=${tenant}`;
+    return `${this.hostService.greeting()} tenant=${tenant}`;
   }
 
   @Get('stream')

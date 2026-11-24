@@ -1,54 +1,808 @@
-import { expect } from 'chai';
-import { NestApplication } from '../nest-application';
-import { ApplicationConfig } from '../application-config';
-import { NestContainer } from '../injector';
-import { NoopHttpAdapter } from './utils/noop-adapter.spec';
+import { Logger, RequestMethod } from '@nestjs/common';
+import { loadPackage } from '@nestjs/common/utils/load-package.util.js';
+import * as microservicesPackage from '@nestjs/microservices';
+import { MicroserviceOptions } from '@nestjs/microservices';
+import { createServer } from 'http';
+import { ApplicationConfig } from '../application-config.js';
+import { MESSAGES } from '../constants.js';
+import { CookieSigner } from '../helpers/cookies/cookie-signer.js';
+import { NestContainer } from '../injector/container.js';
+import { GraphInspector } from '../inspector/graph-inspector.js';
+import { NestApplication } from '../nest-application.js';
+import { mapToExcludeRoute } from './../middleware/utils.js';
+import { NoopHttpAdapter } from './utils/noop-adapter.js';
 
 describe('NestApplication', () => {
+  beforeAll(async () => {
+    // Pre-populate the package cache so that connectMicroservice()
+    // can synchronously retrieve @nestjs/microservices via loadPackageCached.
+    // Use the already-imported module to avoid a slow dynamic import() on CI.
+    await loadPackage(
+      '@nestjs/microservices',
+      'NestApplication tests',
+      () => microservicesPackage,
+    );
+  });
+
+  describe('cookies option', () => {
+    const createApp = (cookies?: { secret?: string | string[] }) => {
+      const applicationConfig = new ApplicationConfig();
+      const container = new NestContainer(applicationConfig);
+      const httpAdapter = new NoopHttpAdapter({});
+      new NestApplication(
+        container,
+        httpAdapter,
+        applicationConfig,
+        new GraphInspector(container),
+        { cookies },
+      );
+      return { applicationConfig, httpAdapter };
+    };
+
+    it('should share one signer between the config and the http adapter', () => {
+      const { applicationConfig, httpAdapter } = createApp({
+        secret: ['new', 'old'],
+      });
+      const signer = applicationConfig.getCookieSigner();
+      expect(signer).toBeInstanceOf(CookieSigner);
+      expect((httpAdapter as any).cookieSigner).toBe(signer);
+    });
+
+    it('should not create a signer without a secret', () => {
+      expect(createApp().applicationConfig.getCookieSigner()).toBeUndefined();
+      expect(createApp({}).applicationConfig.getCookieSigner()).toBeUndefined();
+    });
+
+    it('should reject an empty secret', () => {
+      expect(() => createApp({ secret: '' })).toThrow(TypeError);
+      expect(() => createApp({ secret: [] })).toThrow(TypeError);
+      expect(() => createApp({ secret: ['new', ''] })).toThrow(TypeError);
+    });
+
+    it('should not require the http adapter to accept a signer', () => {
+      const applicationConfig = new ApplicationConfig();
+      const container = new NestContainer(applicationConfig);
+      const httpAdapter = Object.assign(new NoopHttpAdapter({}), {
+        setCookieSigner: undefined,
+      });
+      new NestApplication(
+        container,
+        httpAdapter,
+        applicationConfig,
+        new GraphInspector(container),
+        { cookies: { secret: 'secret' } },
+      );
+      expect(applicationConfig.getCookieSigner()).toBeInstanceOf(CookieSigner);
+    });
+  });
+
   describe('Hybrid Application', () => {
     class Interceptor {
       public intercept(context, next) {
         return next();
       }
     }
-    it('default should use new ApplicationConfig', () => {
+    it('default should use new ApplicationConfig', async () => {
       const applicationConfig = new ApplicationConfig();
       const container = new NestContainer(applicationConfig);
       const instance = new NestApplication(
         container,
         new NoopHttpAdapter({}),
         applicationConfig,
+        new GraphInspector(container),
         {},
       );
       instance.useGlobalInterceptors(new Interceptor());
-      const microservice = instance.connectMicroservice({});
-      expect((instance as any).config.getGlobalInterceptors().length).to.equal(
-        1,
+      const microservice = instance.connectMicroservice<MicroserviceOptions>(
+        {},
       );
+      expect((instance as any).config.getGlobalInterceptors().length).toBe(1);
       expect(
         (microservice as any).applicationConfig.getGlobalInterceptors().length,
-      ).to.equal(0);
+      ).toBe(0);
     });
-    it('should inherit existing ApplicationConfig', () => {
+    it('should inherit existing ApplicationConfig', async () => {
       const applicationConfig = new ApplicationConfig();
       const container = new NestContainer(applicationConfig);
       const instance = new NestApplication(
         container,
         new NoopHttpAdapter({}),
         applicationConfig,
+        new GraphInspector(container),
         {},
       );
       instance.useGlobalInterceptors(new Interceptor());
-      const microservice = instance.connectMicroservice(
+      const microservice = instance.connectMicroservice<MicroserviceOptions>(
         {},
         { inheritAppConfig: true },
       );
-      expect((instance as any).config.getGlobalInterceptors().length).to.equal(
-        1,
-      );
+      expect((instance as any).config.getGlobalInterceptors().length).toBe(1);
       expect(
         (microservice as any).applicationConfig.getGlobalInterceptors().length,
-      ).to.equal(1);
+      ).toBe(1);
+    });
+
+    it('should immediately initialize microservice by default', async () => {
+      const applicationConfig = new ApplicationConfig();
+      const container = new NestContainer(applicationConfig);
+      const instance = new NestApplication(
+        container,
+        new NoopHttpAdapter({}),
+        applicationConfig,
+        new GraphInspector(container),
+        {},
+      );
+
+      const microservice = instance.connectMicroservice<MicroserviceOptions>(
+        {},
+        {},
+      );
+
+      expect((microservice as any).isInitialized).toBe(true);
+      expect((microservice as any).wasInitHookCalled).toBe(true);
+    });
+
+    it('should defer microservice initialization when deferInitialization is true', async () => {
+      const applicationConfig = new ApplicationConfig();
+      const container = new NestContainer(applicationConfig);
+      const instance = new NestApplication(
+        container,
+        new NoopHttpAdapter({}),
+        applicationConfig,
+        new GraphInspector(container),
+        {},
+      );
+
+      const microservice = instance.connectMicroservice<MicroserviceOptions>(
+        {},
+        { deferInitialization: true },
+      );
+
+      expect((microservice as any).isInitialized).toBe(false);
+      expect((microservice as any).wasInitHookCalled).toBe(false);
+    });
+
+    it('should not let a deferred microservice bind the gateways', async () => {
+      const applicationConfig = new ApplicationConfig();
+      const container = new NestContainer(applicationConfig);
+      const instance = new NestApplication(
+        container,
+        new NoopHttpAdapter({}),
+        applicationConfig,
+        new GraphInspector(container),
+        {},
+      );
+
+      const microservice = instance.connectMicroservice<MicroserviceOptions>(
+        {},
+        { deferInitialization: true },
+      );
+      const socketModule = { register: vi.fn() };
+      (microservice as any).socketModule = socketModule;
+
+      await (microservice as any).registerModules();
+      expect(socketModule.register).not.toHaveBeenCalled();
+    });
+  });
+  describe('Global Prefix', () => {
+    it('should get correct global prefix options', () => {
+      const applicationConfig = new ApplicationConfig();
+      const container = new NestContainer(applicationConfig);
+      const instance = new NestApplication(
+        container,
+        new NoopHttpAdapter({}),
+        applicationConfig,
+        new GraphInspector(container),
+        {},
+      );
+      const excludeRoute = ['foo', { path: 'bar', method: RequestMethod.GET }];
+      instance.setGlobalPrefix('api', {
+        exclude: excludeRoute,
+      });
+      expect(applicationConfig.getGlobalPrefixOptions()).toEqual({
+        exclude: mapToExcludeRoute(excludeRoute),
+      });
+    });
+  });
+  describe('Double initialization', () => {
+    it('should initialize application only once', async () => {
+      const noopHttpAdapter = new NoopHttpAdapter({});
+      (noopHttpAdapter as any).init = vi.fn();
+
+      const applicationConfig = new ApplicationConfig();
+
+      const container = new NestContainer(applicationConfig);
+      container.setHttpAdapter(noopHttpAdapter);
+
+      const instance = new NestApplication(
+        container,
+        noopHttpAdapter,
+        applicationConfig,
+        new GraphInspector(container),
+        {},
+      );
+
+      await instance.init();
+      await instance.init();
+
+      expect((noopHttpAdapter as any).init).toHaveBeenCalledOnce();
+    });
+  });
+  describe('init', () => {
+    const createInstance = () => {
+      const noopHttpAdapter = new NoopHttpAdapter({});
+      const applicationConfig = new ApplicationConfig();
+      const container = new NestContainer(applicationConfig);
+      container.setHttpAdapter(noopHttpAdapter);
+      return new NestApplication(
+        container,
+        noopHttpAdapter,
+        applicationConfig,
+        new GraphInspector(container),
+        {},
+      );
+    };
+
+    it('should make the gateways turn clients away until the lifecycle hooks have completed', async () => {
+      const instance = createInstance();
+      const calls: string[] = [];
+      (instance as any).socketModule = {
+        rejectClients: () => calls.push('rejectClients'),
+        register: () => calls.push('register'),
+        acceptClients: () => calls.push('acceptClients'),
+      };
+      vi.spyOn(instance as any, 'callInitHook').mockImplementation(
+        async () => void calls.push('callInitHook'),
+      );
+      vi.spyOn(instance as any, 'callBootstrapHook').mockImplementation(
+        async () => void calls.push('callBootstrapHook'),
+      );
+
+      await instance.init();
+      expect(calls).toEqual([
+        'rejectClients',
+        'register',
+        'callInitHook',
+        'callBootstrapHook',
+        'acceptClients',
+      ]);
+    });
+
+    it('should keep turning clients away when a lifecycle hook fails', async () => {
+      const instance = createInstance();
+      const socketModule = {
+        rejectClients: vi.fn(),
+        register: vi.fn(),
+        acceptClients: vi.fn(),
+      };
+      (instance as any).socketModule = socketModule;
+      vi.spyOn(instance as any, 'callInitHook').mockRejectedValue(
+        new Error('onModuleInit failed'),
+      );
+
+      await expect(instance.init()).rejects.toThrow('onModuleInit failed');
+      expect(socketModule.rejectClients).toHaveBeenCalledOnce();
+      expect(socketModule.acceptClients).not.toHaveBeenCalled();
+    });
+  });
+  describe('close', () => {
+    it('should reset the listening state', async () => {
+      const server = createServer();
+      const httpAdapter = new NoopHttpAdapter(server);
+      httpAdapter.setHttpServer(server);
+      httpAdapter.close = () => new Promise(resolve => server.close(resolve));
+
+      const applicationConfig = new ApplicationConfig();
+      const container = new NestContainer(applicationConfig);
+      container.setHttpAdapter(httpAdapter);
+      const instance = new NestApplication(
+        container,
+        httpAdapter,
+        applicationConfig,
+        new GraphInspector(container),
+        {},
+      );
+      await instance.listen(0, '127.0.0.1');
+
+      await instance.close();
+
+      expect(container.getHttpAdapterHostRef().listening).toBe(false);
+      await expect(instance.getUrl()).rejects.toBe(MESSAGES.CALL_LISTEN_FIRST);
+    });
+  });
+  describe('buffered logs', () => {
+    let processStdoutWriteSpy: ReturnType<typeof vi.fn>;
+
+    const createApp = (options: { autoFlushLogs?: boolean } = {}) => {
+      const applicationConfig = new ApplicationConfig();
+      const container = new NestContainer(applicationConfig);
+      const httpAdapter = new NoopHttpAdapter({});
+      container.setHttpAdapter(httpAdapter);
+      return new NestApplication(
+        container,
+        httpAdapter,
+        applicationConfig,
+        new GraphInspector(container),
+        options,
+      );
+    };
+
+    beforeEach(() => {
+      processStdoutWriteSpy = vi
+        .spyOn(process.stdout, 'write')
+        .mockImplementation(() => true);
+      Logger.attachBuffer();
+      new Logger('Bootstrap').log('buffered message');
+    });
+
+    afterEach(() => {
+      Logger.detachBuffer();
+      Logger['logBuffer'] = [];
+      processStdoutWriteSpy.mockRestore();
+    });
+
+    const printed = () =>
+      processStdoutWriteSpy.mock.calls.map(([chunk]) => String(chunk));
+
+    it('should flush them when the application is initialized', async () => {
+      const app = createApp();
+      expect(printed()).toEqual([]);
+
+      await app.init();
+
+      expect(printed().some(line => line.includes('buffered message'))).toBe(
+        true,
+      );
+      expect(Logger['isBufferAttached']).toBe(false);
+    });
+
+    it('should not flush them on init when "autoFlushLogs" is false', async () => {
+      const app = createApp({ autoFlushLogs: false });
+
+      await app.init();
+
+      expect(printed()).toEqual([]);
+      expect(Logger['isBufferAttached']).toBe(true);
+    });
+
+    it('should flush them when the initialization fails', async () => {
+      const app = createApp();
+      vi.spyOn(app as any, 'callInitHook').mockRejectedValue(
+        new Error('init failed'),
+      );
+
+      await expect(app.init()).rejects.toThrow('init failed');
+
+      expect(printed().some(line => line.includes('buffered message'))).toBe(
+        true,
+      );
+      expect(Logger['isBufferAttached']).toBe(false);
+    });
+
+    it('should not flush them on a failed init when "autoFlushLogs" is false', async () => {
+      const app = createApp({ autoFlushLogs: false });
+      vi.spyOn(app as any, 'callInitHook').mockRejectedValue(
+        new Error('init failed'),
+      );
+
+      await expect(app.init()).rejects.toThrow('init failed');
+
+      expect(printed()).toEqual([]);
+      expect(Logger['isBufferAttached']).toBe(true);
+    });
+  });
+
+  describe('use', () => {
+    it('should decorate function middleware before passing it to the http adapter', () => {
+      const useSpy = vi.fn();
+      const noopHttpAdapter = new NoopHttpAdapter({
+        use: useSpy,
+      });
+      const applicationConfig = new ApplicationConfig();
+      const container = new NestContainer(applicationConfig);
+      const decoratedMiddleware = vi.fn();
+      const instanceDecorator = vi.fn().mockReturnValue(decoratedMiddleware);
+
+      const instance = new NestApplication(
+        container,
+        noopHttpAdapter,
+        applicationConfig,
+        new GraphInspector(container),
+        {
+          instrument: {
+            instanceDecorator,
+          },
+        },
+      );
+      const middleware = vi.fn();
+
+      instance.use('/test', middleware);
+
+      expect(instanceDecorator).toHaveBeenCalledExactlyOnceWith(middleware);
+      expect(useSpy).toHaveBeenCalledExactlyOnceWith(
+        '/test',
+        decoratedMiddleware,
+      );
+    });
+
+    it('should fall back to the original middleware when the decorator returns a non-function', () => {
+      const useSpy = vi.fn();
+      const noopHttpAdapter = new NoopHttpAdapter({
+        use: useSpy,
+      });
+      const applicationConfig = new ApplicationConfig();
+      const container = new NestContainer(applicationConfig);
+      const instanceDecorator = vi.fn().mockReturnValue(undefined);
+
+      const instance = new NestApplication(
+        container,
+        noopHttpAdapter,
+        applicationConfig,
+        new GraphInspector(container),
+        {
+          instrument: {
+            instanceDecorator,
+          },
+        },
+      );
+      const middleware = vi.fn();
+
+      instance.use('/test', middleware);
+
+      expect(instanceDecorator).toHaveBeenCalledExactlyOnceWith(middleware);
+      expect(useSpy).toHaveBeenCalledExactlyOnceWith('/test', middleware);
+    });
+
+    it('should preserve arity for single-argument use() calls', () => {
+      const useSpy = vi.fn();
+      const noopHttpAdapter = new NoopHttpAdapter({
+        use: useSpy,
+      });
+      const applicationConfig = new ApplicationConfig();
+      const container = new NestContainer(applicationConfig);
+      const decoratedMiddleware = vi.fn();
+      const instanceDecorator = vi.fn().mockReturnValue(decoratedMiddleware);
+
+      const instance = new NestApplication(
+        container,
+        noopHttpAdapter,
+        applicationConfig,
+        new GraphInspector(container),
+        {
+          instrument: {
+            instanceDecorator,
+          },
+        },
+      );
+      const middleware = vi.fn();
+
+      instance.use(middleware);
+
+      // A trailing `undefined` handler would make Express 5's router throw
+      expect(useSpy).toHaveBeenCalledExactlyOnceWith(decoratedMiddleware);
+    });
+
+    it('should fall back to the original middleware when the decorator throws', () => {
+      const useSpy = vi.fn();
+      const noopHttpAdapter = new NoopHttpAdapter({
+        use: useSpy,
+      });
+      const applicationConfig = new ApplicationConfig();
+      const container = new NestContainer(applicationConfig);
+      const instanceDecorator = vi.fn().mockImplementation(() => {
+        throw new Error('cannot inspect');
+      });
+
+      const instance = new NestApplication(
+        container,
+        noopHttpAdapter,
+        applicationConfig,
+        new GraphInspector(container),
+        {
+          instrument: {
+            instanceDecorator,
+          },
+        },
+      );
+      const middleware = vi.fn();
+
+      instance.use('/test', middleware);
+
+      expect(useSpy).toHaveBeenCalledExactlyOnceWith('/test', middleware);
+    });
+  });
+  describe('useWebSocketAdapter', () => {
+    function createInstance(): NestApplication {
+      const noopHttpAdapter = new NoopHttpAdapter({});
+      const applicationConfig = new ApplicationConfig();
+      const container = new NestContainer(applicationConfig);
+      container.setHttpAdapter(noopHttpAdapter);
+      return new NestApplication(
+        container,
+        noopHttpAdapter,
+        applicationConfig,
+        new GraphInspector(container),
+        {},
+      );
+    }
+
+    it('should not warn when called before WS module registration', () => {
+      const instance = createInstance();
+      const warnSpy = vi.spyOn((instance as any).logger, 'warn');
+
+      instance.useWebSocketAdapter({} as any);
+
+      expect(warnSpy).not.toHaveBeenCalled();
+    });
+
+    it('should warn when called after WS module registration', async () => {
+      const instance = createInstance();
+      (instance as any).socketModule = { register: vi.fn() };
+      await instance.registerWsModule();
+      const warnSpy = vi.spyOn((instance as any).logger, 'warn');
+
+      instance.useWebSocketAdapter({} as any);
+
+      expect(warnSpy).toHaveBeenCalledOnce();
+      expect(warnSpy.mock.calls[0]?.[0]).toMatch(
+        /useWebSocketAdapter\(\) was called after WebSocket gateways were already initialized/,
+      );
+    });
+
+    it('should still set the adapter on ApplicationConfig even when called too late', async () => {
+      const instance = createInstance();
+      (instance as any).socketModule = { register: vi.fn() };
+      await instance.registerWsModule();
+      const adapter = { create: () => undefined } as any;
+
+      instance.useWebSocketAdapter(adapter);
+
+      expect((instance as any).config.getIoAdapter()).toBe(adapter);
+    });
+  });
+  describe('enableCsrfProtection', () => {
+    const createApp = (adapter: any) => {
+      const applicationConfig = new ApplicationConfig();
+      const container = new NestContainer(applicationConfig);
+      container.setHttpAdapter(adapter);
+      return new NestApplication(
+        container,
+        adapter,
+        applicationConfig,
+        new GraphInspector(container),
+        {},
+      );
+    };
+    const createAdapter = () => {
+      const adapter = new NoopHttpAdapter({});
+      adapter.getRequestMethod = (req: any) => req.method;
+      adapter.getRequestUrl = (req: any) => req.url;
+      return adapter;
+    };
+    const crossSitePost = (url: string) => ({
+      method: 'POST',
+      url,
+      headers: { host: 'a.example', 'sec-fetch-site': 'cross-site' },
+    });
+
+    it('should register one security hook that runs the check', () => {
+      const adapter = createAdapter();
+      const spy = vi
+        .spyOn(adapter, 'registerSecurityHook')
+        .mockReturnValue(undefined);
+      const app = createApp(adapter);
+
+      expect(app.enableCsrfProtection()).toBe(app);
+      expect(spy).toHaveBeenCalledOnce();
+
+      const hook = spy.mock.calls[0][0];
+      const response = { setHeader: vi.fn(), removeHeader: vi.fn() };
+      expect(hook(crossSitePost('/items'), response)).toBeInstanceOf(Error);
+      expect(
+        hook(
+          { ...crossSitePost('/items'), headers: { 'sec-fetch-site': 'none' } },
+          response,
+        ),
+      ).toBeUndefined();
+      expect(response.setHeader).not.toHaveBeenCalled();
+    });
+
+    it('should resolve exclusions at init, with the final global prefix', async () => {
+      const adapter = createAdapter();
+      const spy = vi
+        .spyOn(adapter, 'registerSecurityHook')
+        .mockReturnValue(undefined);
+      const app = createApp(adapter);
+
+      app.enableCsrfProtection({ exclude: ['hooks'] });
+      app.setGlobalPrefix('api');
+      const hook = spy.mock.calls[0][0];
+      const response = { setHeader: vi.fn(), removeHeader: vi.fn() };
+      expect(hook(crossSitePost('/api/hooks'), response)).toBeInstanceOf(Error);
+
+      await app.init();
+      expect(hook(crossSitePost('/api/hooks'), response)).toBeUndefined();
+      expect(hook(crossSitePost('/hooks'), response)).toBeInstanceOf(Error);
+      expect(hook(crossSitePost('/api/items'), response)).toBeInstanceOf(Error);
+    });
+
+    it('should throw when called after init', async () => {
+      const adapter = createAdapter();
+      const spy = vi.spyOn(adapter, 'registerSecurityHook');
+      const app = createApp(adapter);
+      await app.init();
+
+      expect(() => app.enableCsrfProtection()).toThrow(
+        /must be called before app.init\(\)/,
+      );
+      expect(spy).not.toHaveBeenCalled();
+    });
+
+    it('should throw when called twice', () => {
+      const adapter = createAdapter();
+      const spy = vi
+        .spyOn(adapter, 'registerSecurityHook')
+        .mockReturnValue(undefined);
+      const app = createApp(adapter);
+      app.enableCsrfProtection();
+
+      expect(() => app.enableCsrfProtection()).toThrow(/only be called once/);
+      expect(spy).toHaveBeenCalledOnce();
+    });
+
+    it('should validate options when called, without consuming the call', () => {
+      const adapter = createAdapter();
+      const spy = vi
+        .spyOn(adapter, 'registerSecurityHook')
+        .mockReturnValue(undefined);
+      const app = createApp(adapter);
+
+      expect(() =>
+        app.enableCsrfProtection({ trustedOrigins: ['https://a.example/'] }),
+      ).toThrow(/Invalid trusted origin/);
+      expect(spy).not.toHaveBeenCalled();
+      expect(() => app.enableCsrfProtection()).not.toThrow();
+      expect(spy).toHaveBeenCalledOnce();
+    });
+
+    it('should throw when the adapter does not support it', () => {
+      const adapter = createAdapter();
+      (adapter as any).registerSecurityHook = undefined;
+      const app = createApp(adapter);
+
+      expect(() => app.enableCsrfProtection()).toThrow(
+        'Your HTTP Adapter does not support `.enableCsrfProtection()`.',
+      );
+    });
+  });
+  describe('useSecurityHeaders', () => {
+    const createApp = (adapter: any) => {
+      const applicationConfig = new ApplicationConfig();
+      const container = new NestContainer(applicationConfig);
+      container.setHttpAdapter(adapter);
+      return new NestApplication(
+        container,
+        adapter,
+        applicationConfig,
+        new GraphInspector(container),
+        {},
+      );
+    };
+    const createAdapter = () => {
+      const adapter = new NoopHttpAdapter({});
+      adapter.getRequestMethod = (req: any) => req.method;
+      adapter.getRequestUrl = (req: any) => req.url;
+      return adapter;
+    };
+    const createResponse = () => {
+      const headers = new Map<string, string>([['X-Powered-By', 'Express']]);
+      return {
+        headers,
+        setHeader: (name: string, value: string) => headers.set(name, value),
+        removeHeader: (name: string) => headers.delete(name),
+      };
+    };
+
+    it('should register a security hook that writes the headers', () => {
+      const adapter = createAdapter();
+      const spy = vi
+        .spyOn(adapter, 'registerSecurityHook')
+        .mockReturnValue(undefined);
+      const app = createApp(adapter);
+
+      expect(app.useSecurityHeaders({ xFrameOptions: false })).toBe(app);
+      expect(spy).toHaveBeenCalledOnce();
+
+      const response = createResponse();
+      expect(spy.mock.calls[0][0]({ method: 'GET' }, response)).toBeUndefined();
+      expect(response.headers.has('Content-Security-Policy')).toBe(true);
+      expect(response.headers.has('X-Frame-Options')).toBe(false);
+      expect(response.headers.has('X-Powered-By')).toBe(false);
+    });
+
+    it('should disable the "x-powered-by" setting unless xPoweredBy is false', () => {
+      const adapter = Object.assign(createAdapter(), { disable: vi.fn() });
+      vi.spyOn(adapter, 'registerSecurityHook').mockReturnValue(undefined);
+      createApp(adapter).useSecurityHeaders();
+      expect(adapter.disable).toHaveBeenCalledExactlyOnceWith('x-powered-by');
+
+      const other = Object.assign(createAdapter(), { disable: vi.fn() });
+      vi.spyOn(other, 'registerSecurityHook').mockReturnValue(undefined);
+      createApp(other).useSecurityHeaders({ xPoweredBy: false });
+      expect(other.disable).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['useSecurityHeaders() first', ['headers', 'csrf']],
+      ['enableCsrfProtection() first', ['csrf', 'headers']],
+    ])(
+      'should share one hook with enableCsrfProtection(), writing the headers before a rejection (%s)',
+      (_title, order) => {
+        const adapter = createAdapter();
+        const spy = vi
+          .spyOn(adapter, 'registerSecurityHook')
+          .mockReturnValue(undefined);
+        const app = createApp(adapter);
+        for (const feature of order) {
+          feature === 'headers'
+            ? app.useSecurityHeaders()
+            : app.enableCsrfProtection();
+        }
+        expect(spy).toHaveBeenCalledOnce();
+
+        const response = createResponse();
+        const error = spy.mock.calls[0][0](
+          {
+            method: 'POST',
+            url: '/items',
+            headers: { 'sec-fetch-site': 'cross-site' },
+          },
+          response,
+        );
+        expect(error).toBeInstanceOf(Error);
+        expect(response.headers.get('X-Content-Type-Options')).toBe('nosniff');
+      },
+    );
+
+    it('should validate options when called, without consuming the call', () => {
+      const adapter = createAdapter();
+      const spy = vi
+        .spyOn(adapter, 'registerSecurityHook')
+        .mockReturnValue(undefined);
+      const app = createApp(adapter);
+
+      expect(() =>
+        app.useSecurityHeaders({
+          contentSecurityPolicy: { directives: { scriptSrc: "'self'; x" } },
+        }),
+      ).toThrow(/Content-Security-Policy/);
+      expect(spy).not.toHaveBeenCalled();
+      expect(() => app.useSecurityHeaders()).not.toThrow();
+      expect(spy).toHaveBeenCalledOnce();
+    });
+
+    it('should throw when called after init or twice', async () => {
+      const adapter = createAdapter();
+      vi.spyOn(adapter, 'registerSecurityHook').mockReturnValue(undefined);
+      const app = createApp(adapter);
+      app.useSecurityHeaders();
+      expect(() => app.useSecurityHeaders()).toThrow(/only be called once/);
+
+      const other = createApp(createAdapter());
+      await other.init();
+      expect(() => other.useSecurityHeaders()).toThrow(
+        /must be called before app.init\(\)/,
+      );
+    });
+
+    it('should throw when the adapter does not support it', () => {
+      const adapter = createAdapter();
+      (adapter as any).registerSecurityHook = undefined;
+      const app = createApp(adapter);
+
+      expect(() => app.useSecurityHeaders()).toThrow(
+        'Your HTTP Adapter does not support `.useSecurityHeaders()`.',
+      );
     });
   });
 });

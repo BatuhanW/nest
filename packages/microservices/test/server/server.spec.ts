@@ -1,64 +1,102 @@
-import { expect } from 'chai';
-import { Observable, of, throwError as _throw } from 'rxjs';
-import * as sinon from 'sinon';
-import { Server } from '../../server/server';
+import {
+  throwError as _throw,
+  lastValueFrom,
+  Observable,
+  of,
+  Subject,
+} from 'rxjs';
+import { BaseRpcContext } from '../../ctx-host/base-rpc.context.js';
+import { InvalidPacketIdException } from '../../errors/invalid-packet-id.exception.js';
+import { KafkaRetriableException } from '../../exceptions/kafka-retriable-exception.js';
+import { Server } from '../../server/server.js';
 
 class TestServer extends Server {
+  public on<
+    EventKey extends string = string,
+    EventCallback extends Function = Function,
+  >(event: EventKey, callback: EventCallback) {}
+  public unwrap<T>(): T {
+    return null!;
+  }
   public listen(callback: () => void) {}
   public close() {}
 }
 
 describe('Server', () => {
   const server = new TestServer();
-  const sandbox = sinon.createSandbox();
+  const untypedServer = server as any;
   const callback = () => {},
     pattern = { test: 'test pattern' };
 
   afterEach(() => {
-    sandbox.restore();
+    vi.restoreAllMocks();
   });
 
   describe('addHandler', () => {
     it(`should add handler`, () => {
       const handlerRoute = 'hello';
-      sandbox.stub(server as any, 'messageHandlers').value({ set() {} });
+      untypedServer.messageHandlers = new Map();
 
-      const messageHandlersSetSpy = sinon.spy(
-        (server as any).messageHandlers,
+      const messageHandlersSetSpy = vi.spyOn(
+        untypedServer.messageHandlers,
         'set',
       );
-      const normalizePatternStub = sinon
-        .stub(server as any, 'normalizePattern')
-        .returns(handlerRoute);
+      const normalizePatternStub = vi
+        .spyOn(server as any, 'normalizePattern')
+        .mockReturnValue(handlerRoute);
 
       server.addHandler(pattern, callback as any);
 
-      expect(messageHandlersSetSpy.called).to.be.true;
-      expect(messageHandlersSetSpy.args[0][0]).to.be.equal(handlerRoute);
-      expect(messageHandlersSetSpy.args[0][1]).to.be.equal(callback);
+      expect(messageHandlersSetSpy).toHaveBeenCalled();
+      expect(messageHandlersSetSpy.mock.calls[0][0]).toBe(handlerRoute);
+      expect(messageHandlersSetSpy.mock.calls[0][1]).toBe(callback);
 
-      normalizePatternStub.restore();
+      normalizePatternStub.mockRestore();
+    });
+    describe('when handler is an event handler', () => {
+      describe('and there are other handlers registered for the pattern already', () => {
+        it('should find tail and assign a handler ref to it', () => {
+          const handlerRoute = 'hello';
+          const headHandler: any = () => null;
+          const nextHandler: any = () => null;
+
+          headHandler.next = nextHandler;
+          untypedServer['messageHandlers'] = new Map([
+            [handlerRoute, headHandler],
+          ]);
+          const normalizePatternStub = vi
+            .spyOn(server as any, 'normalizePattern')
+            .mockReturnValue(handlerRoute);
+
+          server.addHandler(pattern, callback as any, true);
+
+          expect(nextHandler.next).toBe(callback);
+          normalizePatternStub.mockRestore();
+        });
+      });
     });
   });
 
   describe('getRouteFromPattern', () => {
-    let normalizePatternStub: sinon.SinonStub;
+    let normalizePatternStub: ReturnType<typeof vi.fn>;
 
     beforeEach(() => {
-      normalizePatternStub = sinon.stub(server as any, 'normalizePattern');
+      normalizePatternStub = vi
+        .spyOn(server as any, 'normalizePattern')
+        .mockImplementation(() => ({}) as any);
     });
 
     afterEach(() => {
-      normalizePatternStub.restore();
+      normalizePatternStub.mockRestore();
     });
 
     describe(`when gets 'string' pattern`, () => {
       it(`should call 'transformPatternToRoute' with 'string' argument`, () => {
         const inputServerPattern = 'hello';
         const transformedServerPattern = inputServerPattern;
-        (server as any).getRouteFromPattern(inputServerPattern);
+        untypedServer.getRouteFromPattern(inputServerPattern);
 
-        expect(normalizePatternStub.args[0][0]).to.be.equal(
+        expect(normalizePatternStub.mock.calls[0][0]).toBe(
           transformedServerPattern,
         );
       });
@@ -71,37 +109,126 @@ describe('Server', () => {
           controller: 'app',
           use: 'getHello',
         };
-        (server as any).getRouteFromPattern(inputServerPattern);
+        untypedServer.getRouteFromPattern(inputServerPattern);
 
-        expect(normalizePatternStub.args[0][0]).to.be.deep.equal(
+        expect(normalizePatternStub.mock.calls[0][0]).toEqual(
           transformedServerPattern,
+        );
+      });
+    });
+
+    describe(`when gets a 'string' pattern that is not 'json'`, () => {
+      it(`should not parse it`, () => {
+        const parseSpy = vi.spyOn(JSON, 'parse');
+        untypedServer.getRouteFromPattern('user.created');
+        untypedServer.getRouteFromPattern('notify');
+        untypedServer.getRouteFromPattern(' trueish');
+
+        expect(parseSpy).not.toHaveBeenCalled();
+        expect(normalizePatternStub.mock.calls.map(([arg]) => arg)).toEqual([
+          'user.created',
+          'notify',
+          ' trueish',
+        ]);
+      });
+    });
+
+    describe(`when gets a 'string' pattern that may be 'json'`, () => {
+      it(`should call 'transformPatternToRoute' with what 'JSON.parse' returns`, () => {
+        const patterns = [
+          '42',
+          '-1',
+          ' true ',
+          'false',
+          'null',
+          '"hello"',
+          '[1]',
+        ];
+        patterns.forEach(item => untypedServer.getRouteFromPattern(item));
+
+        expect(normalizePatternStub.mock.calls.map(([arg]) => arg)).toEqual([
+          42,
+          -1,
+          true,
+          false,
+          null,
+          'hello',
+          [1],
+        ]);
+      });
+
+      it(`should call 'transformPatternToRoute' with the 'string' argument when it is not 'json'`, () => {
+        const patterns = ['2fa.verify', '{"cmd":', '"hello', 'null.created'];
+        patterns.forEach(item => untypedServer.getRouteFromPattern(item));
+
+        expect(normalizePatternStub.mock.calls.map(([arg]) => arg)).toEqual(
+          patterns,
         );
       });
     });
   });
 
+  describe('getPatternAsString', () => {
+    it('should return the json text of a pattern within the limits', () => {
+      expect(untypedServer.getPatternAsString({ cmd: 'sum' })).toBe(
+        '{"cmd":"sum"}',
+      );
+      expect(untypedServer.getPatternAsString('sum')).toBe('sum');
+    });
+    it('should return the route of a pattern over the limits without serializing it', () => {
+      const wideArray = Array(100_000).fill({});
+      const stringify = vi.spyOn(JSON, 'stringify');
+
+      expect(untypedServer.getPatternAsString(wideArray)).toBe(
+        '[TOO_MANY_KEYS]',
+      );
+      expect(
+        untypedServer.getPatternAsString({ cmd: '\\"'.repeat(10_000) }),
+      ).toBe('{"cmd":[VALUE_TOO_LONG]}');
+      expect(stringify).not.toHaveBeenCalled();
+    });
+    it('should find the handler of a pattern within the limits', () => {
+      const handler = vi.fn();
+      untypedServer.messageHandlers = new Map([['{"a":1,"b":2}', handler]]);
+
+      expect(
+        server.getHandlerByPattern(
+          untypedServer.getPatternAsString({ b: 2, a: 1 }),
+        ),
+      ).toBe(handler);
+    });
+  });
+
+  describe('getRouteFromPattern with a long json text', () => {
+    it('should not parse it', () => {
+      const text = JSON.stringify(Array(600_000).fill(0));
+      expect(text.length).toBeGreaterThan(1024 * 1024);
+      const parse = vi.spyOn(JSON, 'parse');
+
+      expect(untypedServer.getRouteFromPattern(text)).toBe(text);
+      expect(parse).not.toHaveBeenCalled();
+    });
+  });
+
   describe('send', () => {
     let stream$: Observable<string>;
-    let sendSpy: sinon.SinonSpy;
+    let sendSpy: ReturnType<typeof vi.fn>;
     beforeEach(() => {
       stream$ = of('test');
     });
     describe('when stream', () => {
       beforeEach(() => {
-        sendSpy = sinon.spy();
+        sendSpy = vi.fn();
       });
       describe('throws exception', () => {
         beforeEach(() => {
-          server.send(_throw('test') as any, sendSpy);
+          server.send(_throw(() => 'test') as any, sendSpy);
         });
-        it('should send error and complete', () => {
-          process.nextTick(() => {
-            expect(
-              sendSpy.calledWith({
-                err: 'test',
-                isDisposed: true,
-              }),
-            ).to.be.true;
+        it('should send error and complete', async () => {
+          await new Promise<void>(resolve => process.nextTick(resolve));
+          expect(sendSpy).toHaveBeenCalledWith({
+            err: 'test',
+            isDisposed: true,
           });
         });
       });
@@ -109,98 +236,885 @@ describe('Server', () => {
         beforeEach(() => {
           server.send(stream$, sendSpy);
         });
-        it('should send response and "complete" event', () => {
-          process.nextTick(() => {
-            expect(
-              sendSpy.calledWith({
-                response: 'test',
-                isDisposed: true,
-              }),
-            ).to.be.true;
+        it('should send response and "complete" event', async () => {
+          await new Promise<void>(resolve => process.nextTick(resolve));
+          expect(sendSpy).toHaveBeenCalledWith({
+            response: 'test',
+            isDisposed: true,
           });
         });
+      });
+    });
+    describe('when respond rejects', () => {
+      const flush = () => new Promise(resolve => setImmediate(resolve));
+
+      it('should log the error and still publish the replies queued behind it', async () => {
+        const error = new Error('publish failed');
+        const loggerErrorSpy = vi
+          .spyOn(untypedServer.logger, 'error')
+          .mockImplementation(() => {});
+        sendSpy = vi
+          .fn()
+          .mockRejectedValueOnce(error)
+          .mockResolvedValue(undefined);
+
+        server.send(of('first', 'second'), sendSpy);
+        await flush();
+
+        expect(loggerErrorSpy).toHaveBeenCalledExactlyOnceWith(error);
+        expect(sendSpy).toHaveBeenCalledTimes(2);
+        expect(sendSpy).toHaveBeenLastCalledWith({
+          response: 'second',
+          isDisposed: true,
+        });
+      });
+
+      it('should keep draining replies that arrive after a failure', async () => {
+        vi.spyOn(untypedServer.logger, 'error').mockImplementation(() => {});
+        sendSpy = vi
+          .fn()
+          .mockRejectedValueOnce(new Error('publish failed'))
+          .mockResolvedValue(undefined);
+        const subject = new Subject<string>();
+
+        server.send(subject, sendSpy);
+        subject.next('first');
+        await flush();
+        subject.next('second');
+        await flush();
+
+        expect(sendSpy).toHaveBeenCalledTimes(2);
+        expect(sendSpy).toHaveBeenLastCalledWith({ response: 'second' });
+      });
+    });
+    describe('when the final reply cannot be published', () => {
+      const flush = () => new Promise(resolve => setImmediate(resolve));
+      let loggerErrorSpy: ReturnType<typeof vi.spyOn>;
+
+      beforeEach(() => {
+        loggerErrorSpy = vi
+          .spyOn(untypedServer.logger, 'error')
+          .mockImplementation(() => {});
+      });
+
+      it('should answer the request with an internal server error', async () => {
+        const error = new TypeError('Do not know how to serialize a BigInt');
+        sendSpy = vi
+          .fn()
+          .mockRejectedValueOnce(error)
+          .mockResolvedValue(undefined);
+
+        server.send(of({ id: 1n }), sendSpy);
+        await flush();
+
+        expect(loggerErrorSpy).toHaveBeenCalledExactlyOnceWith(error);
+        expect(sendSpy.mock.calls).toEqual([
+          [{ response: { id: 1n }, isDisposed: true }],
+          [
+            {
+              err: { status: 'error', message: 'Internal server error' },
+              isDisposed: true,
+            },
+          ],
+        ]);
+      });
+
+      it('should answer with an internal server error when an error reply cannot be published', async () => {
+        sendSpy = vi
+          .fn()
+          .mockRejectedValueOnce(new Error('publish failed'))
+          .mockResolvedValue(undefined);
+
+        server.send(
+          _throw(() => ({ id: 1n })),
+          sendSpy,
+        );
+        await flush();
+
+        expect(loggerErrorSpy).toHaveBeenCalledOnce();
+        expect(sendSpy.mock.calls).toEqual([
+          [{ err: { id: 1n }, isDisposed: true }],
+          [
+            {
+              err: { status: 'error', message: 'Internal server error' },
+              isDisposed: true,
+            },
+          ],
+        ]);
+      });
+
+      it('should answer only once when the internal server error cannot be published either', async () => {
+        sendSpy = vi.fn().mockRejectedValue(new Error('publish failed'));
+
+        server.send(of('test'), sendSpy);
+        await flush();
+
+        expect(loggerErrorSpy).toHaveBeenCalledTimes(2);
+        expect(sendSpy).toHaveBeenCalledTimes(2);
+        expect(sendSpy).toHaveBeenLastCalledWith({
+          err: { status: 'error', message: 'Internal server error' },
+          isDisposed: true,
+        });
+      });
+    });
+    describe('when the stream emits many values', () => {
+      const flush = () => new Promise(resolve => setImmediate(resolve));
+
+      it('should not shift each reply off the queue', async () => {
+        // Each shift() moves the replies queued behind the one it removes, so
+        // draining a stream of n replies that way takes time quadratic in n
+        // Patched by hand, as vi.spyOn() calls shift() itself
+        const shift = Array.prototype.shift;
+        const shifted: unknown[] = [];
+        Array.prototype.shift = function (this: unknown[]) {
+          const item = shift.call(this);
+          shifted.push(item);
+          return item;
+        };
+        sendSpy = vi.fn();
+        try {
+          server.send(of('first', 'second', 'third'), sendSpy);
+          await flush();
+        } finally {
+          Array.prototype.shift = shift;
+        }
+
+        expect(sendSpy.mock.calls).toEqual([
+          [{ response: 'first' }],
+          [{ response: 'second' }],
+          [{ response: 'third', isDisposed: true }],
+        ]);
+        expect(shifted).not.toContainEqual({ response: 'first' });
+      });
+
+      it('should send the completion on its own once the last reply is out', async () => {
+        let sent: () => void = () => {};
+        sendSpy = vi
+          .fn()
+          .mockImplementationOnce(
+            () => new Promise<void>(resolve => (sent = resolve)),
+          )
+          .mockResolvedValue(undefined);
+        const subject = new Subject<string>();
+
+        server.send(subject, sendSpy);
+        subject.next('first');
+        await flush();
+        subject.complete();
+        sent();
+        await flush();
+
+        expect(sendSpy.mock.calls).toEqual([
+          [{ response: 'first' }],
+          [{ isDisposed: true }],
+        ]);
       });
     });
   });
   describe('transformToObservable', () => {
     describe('when resultOrDeferred', () => {
       describe('is Promise', () => {
-        it('should returns Observable', async () => {
+        it('should return Observable that emits the resolved value of the supplied promise', async () => {
           const value = 100;
           expect(
-            await server
-              .transformToObservable(Promise.resolve(value))
-              .toPromise(),
-          ).to.be.eq(100);
+            await lastValueFrom(
+              server.transformToObservable(Promise.resolve(value)),
+            ),
+          ).toBe(100);
         });
       });
       describe('is Observable', () => {
-        it('should returns Observable', async () => {
+        it('should return the observable itself', async () => {
           const value = 100;
           expect(
-            await server.transformToObservable(of(value)).toPromise(),
-          ).to.be.eq(100);
+            await lastValueFrom(server.transformToObservable(of(value))),
+          ).toBe(100);
         });
       });
-      describe('is value', () => {
-        it('should returns Observable', async () => {
+      describe('is any number', () => {
+        it('should return Observable that emits the supplied number', async () => {
           const value = 100;
-          expect(
-            await server.transformToObservable(value).toPromise(),
-          ).to.be.eq(100);
+          expect(await lastValueFrom(server.transformToObservable(value))).toBe(
+            100,
+          );
+        });
+      });
+      describe('is an array', () => {
+        it('should return Observable that emits the supplied array', async () => {
+          const value = [1, 2, 3];
+          expect(await lastValueFrom(server.transformToObservable(value))).toBe(
+            value,
+          );
         });
       });
     });
   });
 
+  describe('getHandlers', () => {
+    it('should return registered handlers', () => {
+      const messageHandlers = [() => null, () => true];
+      const original = untypedServer.messageHandlers;
+      untypedServer.messageHandlers = messageHandlers;
+      expect(server.getHandlers()).toBe(messageHandlers);
+      untypedServer.messageHandlers = original;
+    });
+  });
+
+  describe('assertValidPacketId', () => {
+    it('should accept a number or a string of up to 256 characters', () => {
+      for (const id of [1, 'a'.repeat(256)]) {
+        expect(() => untypedServer.assertValidPacketId(id)).not.toThrow();
+      }
+    });
+    it('should reject any other id', () => {
+      for (const id of ['a'.repeat(257), [['a']], { id: 'a' }, null, true]) {
+        expect(() => untypedServer.assertValidPacketId(id)).toThrow(
+          InvalidPacketIdException,
+        );
+      }
+    });
+  });
+
   describe('getHandlerByPattern', () => {
-    let messageHandlersGetSpy: sinon.SinonStub;
-    let messageHandlersHasSpy: sinon.SinonStub;
+    let messageHandlersGetSpy: ReturnType<typeof vi.spyOn>;
+    let messageHandlersHasSpy: ReturnType<typeof vi.spyOn>;
+    let originalMessageHandlers: any;
     const handlerRoute = 'hello';
 
     beforeEach(() => {
-      sandbox
-        .stub(server as any, 'messageHandlers')
-        .value({ get() {}, has() {} });
-      messageHandlersGetSpy = sinon
-        .stub((server as any).messageHandlers, 'get')
-        .returns(callback);
-      messageHandlersHasSpy = sinon.stub(
-        (server as any).messageHandlers,
-        'has',
-      );
+      originalMessageHandlers = untypedServer.messageHandlers;
+      untypedServer.messageHandlers = new Map();
+      messageHandlersGetSpy = vi
+        .spyOn(untypedServer.messageHandlers, 'get')
+        .mockReturnValue(callback);
+      messageHandlersHasSpy = vi
+        .spyOn(untypedServer.messageHandlers, 'has')
+        .mockReturnValue(false);
 
-      sandbox.stub(server as any, 'getRouteFromPattern').returns(handlerRoute);
+      vi.spyOn(server as any, 'getRouteFromPattern').mockReturnValue(
+        handlerRoute,
+      );
     });
 
     afterEach(() => {
-      messageHandlersGetSpy.restore();
-      messageHandlersHasSpy.restore();
+      messageHandlersGetSpy.mockRestore();
+      messageHandlersHasSpy.mockRestore();
+      untypedServer.messageHandlers = originalMessageHandlers;
     });
 
     describe('when handler exists', () => {
       it('should return expected handler', () => {
-        messageHandlersHasSpy.returns(true);
+        messageHandlersHasSpy.mockReturnValue(true);
 
         const value = server.getHandlerByPattern(handlerRoute);
 
-        expect(messageHandlersHasSpy.args[0][0]).to.be.equal(handlerRoute);
-        expect(messageHandlersGetSpy.called).to.be.true;
-        expect(messageHandlersGetSpy.args[0][0]).to.be.equal(handlerRoute);
-        expect(value).to.be.equal(callback);
+        expect(messageHandlersHasSpy.mock.calls[0][0]).toBe(handlerRoute);
+        expect(messageHandlersGetSpy).toHaveBeenCalled();
+        expect(messageHandlersGetSpy.mock.calls[0][0]).toBe(handlerRoute);
+        expect(value).toBe(callback);
       });
     });
 
     describe('when handler does not exists', () => {
       it('should return null', () => {
-        messageHandlersHasSpy.returns(false);
+        messageHandlersHasSpy.mockReturnValue(false);
 
         const value = server.getHandlerByPattern(handlerRoute);
 
-        expect(messageHandlersHasSpy.args[0][0]).to.be.equal(handlerRoute);
-        expect(messageHandlersGetSpy.called).to.be.false;
-        expect(value).to.be.null;
+        expect(messageHandlersHasSpy.mock.calls[0][0]).toBe(handlerRoute);
+        expect(messageHandlersGetSpy).not.toHaveBeenCalled();
+        expect(value).toBeNull();
       });
+    });
+  });
+
+  describe('getHandlerByPattern (string patterns that read as json)', () => {
+    let realServer: TestServer;
+
+    beforeEach(() => {
+      realServer = new TestServer();
+    });
+
+    it.each(['1.0', '1e3', 'true', 'false', 'null', '[1]'])(
+      'should find the handler registered under the string "%s"',
+      jsonLike => {
+        const handler = async () => {};
+        realServer.addHandler(jsonLike, handler);
+
+        expect(realServer.getHandlerByPattern(jsonLike)).toBe(handler);
+      },
+    );
+
+    it('should still find an object pattern sent as json text', () => {
+      const handler = async () => {};
+      realServer.addHandler({ b: 2, a: 1 }, handler);
+
+      expect(realServer.getHandlerByPattern('{"a":1,"b":2}')).toBe(handler);
+      expect(realServer.getHandlerByPattern('{"b":2,"a":1}')).toBe(handler);
+    });
+
+    it('should prefer the handler of the exact string over the parsed one', () => {
+      const parsedHandler = async () => {};
+      const exactHandler = async () => {};
+      realServer.addHandler('x', parsedHandler);
+      realServer.addHandler('"x"', exactHandler);
+
+      expect(realServer.getHandlerByPattern('"x"')).toBe(exactHandler);
+    });
+
+    it('should still find the handler of a number pattern', () => {
+      const handler = async () => {};
+      realServer.addHandler(1, handler);
+
+      expect(realServer.getHandlerByPattern('1')).toBe(handler);
+    });
+
+    it('should return null when no handler matches', () => {
+      realServer.addHandler('1.0', async () => {});
+
+      expect(realServer.getHandlerByPattern('2.0')).toBeNull();
+    });
+  });
+
+  describe('handleEvent', () => {
+    const context = new BaseRpcContext([]);
+    const eventPattern = 'test_event';
+
+    function bindHandler(result: unknown) {
+      const endHook = vi.fn();
+      untypedServer.onProcessingStartHook = (
+        _transportId: unknown,
+        _ctx: unknown,
+        fn: () => Promise<void>,
+      ) => fn();
+      untypedServer.onProcessingEndHook = endHook;
+      untypedServer.messageHandlers = new Map([
+        [
+          eventPattern,
+          Object.assign(async () => result, { isEventHandler: true }),
+        ],
+      ]);
+      return endHook;
+    }
+
+    it('should log an error if no event handler exists', async () => {
+      const loggerErrorSpy = vi
+        .spyOn(untypedServer.logger, 'error')
+        .mockImplementation(() => {});
+      untypedServer.messageHandlers = new Map();
+
+      await server.handleEvent(
+        'unknown_event',
+        { pattern: 'unknown_event', data: null },
+        context,
+      );
+
+      expect(loggerErrorSpy).toHaveBeenCalledOnce();
+    });
+
+    it('should run the end hook when the handler returns a plain value', async () => {
+      const endHook = bindHandler('plain');
+
+      await server.handleEvent(
+        eventPattern,
+        { pattern: eventPattern, data: null },
+        context,
+      );
+
+      expect(endHook).toHaveBeenCalledOnce();
+    });
+
+    it('should run the end hook when the returned stream completes', async () => {
+      const endHook = bindHandler(of('streamed'));
+
+      await server.handleEvent(
+        eventPattern,
+        { pattern: eventPattern, data: null },
+        context,
+      );
+
+      expect(endHook).toHaveBeenCalledOnce();
+    });
+
+    it('should run the end hook when the returned stream fails', async () => {
+      const endHook = bindHandler(_throw(() => new Error('failed')));
+
+      await server.handleEvent(
+        eventPattern,
+        { pattern: eventPattern, data: null },
+        context,
+      );
+
+      expect(endHook).toHaveBeenCalledOnce();
+    });
+
+    it('should run the end hook when the handler throws an error', async () => {
+      const endHook = vi.fn();
+      untypedServer.onProcessingStartHook = (
+        _transportId: unknown,
+        _ctx: unknown,
+        fn: () => Promise<void>,
+      ) => fn();
+      untypedServer.onProcessingEndHook = endHook;
+      untypedServer.messageHandlers = new Map([
+        [
+          eventPattern,
+          Object.assign(
+            async () => {
+              throw new Error('handler failed');
+            },
+            { isEventHandler: true },
+          ),
+        ],
+      ]);
+
+      await expect(
+        server.handleEvent(
+          eventPattern,
+          { pattern: eventPattern, data: null },
+          context,
+        ),
+      ).rejects.toThrow('handler failed');
+      expect(endHook).toHaveBeenCalledOnce();
+    });
+
+    it('should run the end hook once per event', async () => {
+      const endHook = bindHandler(
+        new Observable(subscriber => {
+          subscriber.next('first');
+          subscriber.next('second');
+          subscriber.complete();
+        }),
+      );
+
+      await server.handleEvent(
+        eventPattern,
+        { pattern: eventPattern, data: null },
+        context,
+      );
+
+      expect(endHook).toHaveBeenCalledOnce();
+    });
+  });
+
+  describe('handleRequest', () => {
+    const context = new BaseRpcContext([]);
+    const flush = () => new Promise(resolve => setImmediate(resolve));
+
+    function bindHooks() {
+      const endHook = vi.fn();
+      untypedServer.onProcessingStartHook = (
+        _transportId: unknown,
+        _ctx: unknown,
+        fn: () => Promise<void>,
+      ) => fn();
+      untypedServer.onProcessingEndHook = endHook;
+      return endHook;
+    }
+
+    it('should reply with every value and run the end hook once', async () => {
+      const endHook = bindHooks();
+      const respond = vi.fn();
+
+      await untypedServer.handleRequest(
+        context,
+        async () => of('first', 'second'),
+        respond,
+      );
+      await flush();
+
+      expect(respond).toHaveBeenCalledTimes(2);
+      expect(respond).toHaveBeenLastCalledWith({
+        response: 'second',
+        isDisposed: true,
+      });
+      expect(endHook).toHaveBeenCalledExactlyOnceWith(
+        server.transportId,
+        context,
+      );
+    });
+
+    it('should run the end hook once when the response stream fails', async () => {
+      const endHook = bindHooks();
+      const respond = vi.fn();
+      const error = new Error('failed');
+
+      await untypedServer.handleRequest(
+        context,
+        async () => _throw(() => error),
+        respond,
+      );
+      await flush();
+
+      expect(respond).toHaveBeenCalledExactlyOnceWith({
+        err: error,
+        isDisposed: true,
+      });
+      expect(endHook).toHaveBeenCalledOnce();
+    });
+
+    it('should answer and pass the rejection on when "produce" rejects', async () => {
+      const endHook = bindHooks();
+      const respond = vi.fn();
+
+      await expect(
+        untypedServer.handleRequest(
+          context,
+          async () => {
+            throw new Error('handler failed');
+          },
+          respond,
+        ),
+      ).rejects.toThrow('handler failed');
+      await flush();
+
+      expect(respond).toHaveBeenCalledExactlyOnceWith({
+        err: {
+          status: 'error',
+          message: 'Internal server error',
+        },
+        isDisposed: true,
+      });
+      expect(endHook).toHaveBeenCalledOnce();
+    });
+
+    it('should answer a rejection with a retriable exception (only Kafka redelivers)', async () => {
+      const endHook = bindHooks();
+      const respond = vi.fn();
+      const exception = new KafkaRetriableException('retry me');
+
+      await expect(
+        untypedServer.handleRequest(
+          context,
+          async () => {
+            throw exception;
+          },
+          respond,
+        ),
+      ).rejects.toThrow(exception);
+      await flush();
+
+      expect(respond).toHaveBeenCalledExactlyOnceWith({
+        err: {
+          status: 'error',
+          message: 'Internal server error',
+        },
+        isDisposed: true,
+      });
+      expect(endHook).toHaveBeenCalledOnce();
+    });
+  });
+
+  describe('warnIfEventHandlerReplies', () => {
+    let warnSpy: ReturnType<typeof vi.spyOn>;
+
+    beforeEach(() => {
+      warnSpy = vi
+        .spyOn(untypedServer.logger, 'warn')
+        .mockImplementation(() => {});
+    });
+
+    it('should warn once per event handler that replying to requests is deprecated', () => {
+      const created = Object.assign(async () => null, { isEventHandler: true });
+      const deleted = Object.assign(async () => null, { isEventHandler: true });
+
+      untypedServer.warnIfEventHandlerReplies(created, 'user.created');
+      untypedServer.warnIfEventHandlerReplies(created, 'user.created');
+      untypedServer.warnIfEventHandlerReplies(deleted, 'user.deleted');
+
+      expect(warnSpy).toHaveBeenCalledTimes(2);
+      expect(warnSpy.mock.calls[0][0]).toMatch(
+        /^DEPRECATED! .*@EventPattern handlers will not reply to "send\(\)".* Pattern: user\.created$/,
+      );
+      expect(warnSpy.mock.calls[1][0]).toMatch(/Pattern: user\.deleted$/);
+    });
+
+    it('should not warn for a message handler', () => {
+      untypedServer.warnIfEventHandlerReplies(async () => null, 'user.get');
+
+      expect(warnSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('waitForHandlersInFlight', () => {
+    const context = new BaseRpcContext([]);
+    const eventPattern = 'test_event';
+    const flush = () => new Promise(resolve => setImmediate(resolve));
+    let server: TestServer;
+    let untypedServer: any;
+
+    beforeEach(() => {
+      // The count lives in the instance
+      server = new TestServer();
+      untypedServer = server as any;
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    function handleEventWith(handler: () => unknown) {
+      untypedServer.messageHandlers = new Map([
+        [eventPattern, Object.assign(handler, { isEventHandler: true })],
+      ]);
+      return server.handleEvent(
+        eventPattern,
+        { pattern: eventPattern, data: null },
+        context,
+      );
+    }
+
+    function waitAndTrack(gracePeriod?: number) {
+      const state = { isOver: false };
+      const wait = untypedServer
+        .waitForHandlersInFlight(gracePeriod)
+        .then(() => (state.isOver = true));
+      return { state, wait };
+    }
+
+    it('should resolve at once when nothing is being handled', async () => {
+      await expect(
+        untypedServer.waitForHandlersInFlight(60_000),
+      ).resolves.toBeUndefined();
+    });
+
+    it('should wait for an event handler that is still running', async () => {
+      let finish!: () => void;
+      void handleEventWith(() => new Promise<void>(res => (finish = res)));
+      const { state, wait } = waitAndTrack();
+
+      await flush();
+      expect(state.isOver).toBe(false);
+
+      finish();
+      await wait;
+      expect(state.isOver).toBe(true);
+    });
+
+    it('should wait for the stream an event handler returned', async () => {
+      const stream$ = new Subject<string>();
+      await handleEventWith(async () => stream$);
+      const { state, wait } = waitAndTrack();
+
+      stream$.next('value');
+      await flush();
+      expect(state.isOver).toBe(false);
+
+      stream$.complete();
+      await wait;
+      expect(state.isOver).toBe(true);
+    });
+
+    it('should wait until the last reply of a request has been published', async () => {
+      const endHook = vi.fn();
+      untypedServer.onProcessingEndHook = endHook;
+      let publish!: () => void;
+      const respond = vi.fn(() => new Promise<void>(res => (publish = res)));
+
+      await untypedServer.handleRequest(
+        context,
+        async () => of('reply'),
+        respond,
+      );
+      const { state, wait } = waitAndTrack();
+      await flush();
+
+      // The handler is done, its reply is not out yet
+      expect(endHook).toHaveBeenCalledOnce();
+      expect(respond).toHaveBeenCalledExactlyOnceWith({
+        response: 'reply',
+        isDisposed: true,
+      });
+      expect(state.isOver).toBe(false);
+
+      publish();
+      await wait;
+      expect(state.isOver).toBe(true);
+    });
+
+    it('should stop counting a request whose reply cannot be published', async () => {
+      vi.spyOn(untypedServer.logger, 'error').mockImplementation(() => {});
+      const respond = vi.fn().mockRejectedValue(new Error('closed'));
+
+      await untypedServer.handleRequest(
+        context,
+        async () => of('reply'),
+        respond,
+      );
+
+      await expect(
+        untypedServer.waitForHandlersInFlight(60_000),
+      ).resolves.toBeUndefined();
+      // The reply, then the error that takes its place
+      expect(respond).toHaveBeenCalledTimes(2);
+    });
+
+    it('should stop counting an event handler that throws', async () => {
+      await expect(
+        handleEventWith(async () => {
+          throw new Error('failed');
+        }),
+      ).rejects.toThrow('failed');
+
+      await expect(
+        untypedServer.waitForHandlersInFlight(60_000),
+      ).resolves.toBeUndefined();
+    });
+
+    it('should wait for every handler in flight', async () => {
+      let finishFirst!: () => void;
+      let finishSecond!: () => void;
+      void handleEventWith(() => new Promise<void>(res => (finishFirst = res)));
+      void handleEventWith(
+        () => new Promise<void>(res => (finishSecond = res)),
+      );
+      const { state, wait } = waitAndTrack();
+
+      finishFirst();
+      await flush();
+      expect(state.isOver).toBe(false);
+
+      finishSecond();
+      await wait;
+      expect(state.isOver).toBe(true);
+    });
+
+    it('should stop waiting after the grace period', async () => {
+      vi.useFakeTimers();
+      void handleEventWith(() => new Promise<void>(() => {}));
+      const { state } = waitAndTrack(5000);
+
+      await vi.advanceTimersByTimeAsync(4999);
+      expect(state.isOver).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(state.isOver).toBe(true);
+    });
+
+    it.each([
+      ['no period is given', undefined],
+      ['the period is not a number', Number(undefined)],
+    ])('should wait for 10 seconds when %s', async (_case, gracePeriod) => {
+      vi.useFakeTimers();
+      void handleEventWith(() => new Promise<void>(() => {}));
+      const { state } = waitAndTrack(gracePeriod);
+
+      await vi.advanceTimersByTimeAsync(9999);
+      expect(state.isOver).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(state.isOver).toBe(true);
+    });
+
+    it('should keep waiting when the grace period is longer than a timer supports', async () => {
+      vi.useFakeTimers();
+      let finish!: () => void;
+      void handleEventWith(() => new Promise<void>(res => (finish = res)));
+      const { state, wait } = waitAndTrack(Infinity);
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(state.isOver).toBe(false);
+
+      finish();
+      await wait;
+      expect(state.isOver).toBe(true);
+    });
+
+    it('should take the whole grace period for an event handler whose stream stays open', async () => {
+      vi.useFakeTimers();
+      const stream$ = new Subject<string>();
+      await handleEventWith(async () => stream$);
+      const { state } = waitAndTrack(5000);
+
+      stream$.next('value');
+      await vi.advanceTimersByTimeAsync(4999);
+      expect(state.isOver).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(state.isOver).toBe(true);
+    });
+
+    it('should take the whole grace period for a request whose response stream stays open', async () => {
+      vi.useFakeTimers();
+      const response$ = new Subject<string>();
+      const respond = vi.fn();
+      await untypedServer.handleRequest(
+        context,
+        async () => response$,
+        respond,
+      );
+      const { state } = waitAndTrack(5000);
+
+      response$.next('first');
+      await vi.advanceTimersByTimeAsync(4999);
+      expect(respond).toHaveBeenCalledExactlyOnceWith({ response: 'first' });
+      expect(state.isOver).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(state.isOver).toBe(true);
+    });
+  });
+
+  describe('normalizeGracePeriod', () => {
+    it.each([
+      [undefined, 10000],
+      [null, 10000],
+      [NaN, 10000],
+      ['10s', 10000],
+      [{}, 10000],
+      [5000, 5000],
+      ['5000', 5000],
+      [0, 0],
+      ['', 0],
+      [[], 0],
+      [-1, -1],
+      [true, 1],
+      [Infinity, 2 ** 31 - 1],
+    ])('should read %o as %o', (gracePeriod, expected) => {
+      expect(untypedServer.normalizeGracePeriod(gracePeriod)).toBe(expected);
+    });
+  });
+
+  describe('runWithProcessingHooks', () => {
+    const context = new BaseRpcContext([]);
+
+    it('should run the end hook once when "fn" both runs it and rejects', async () => {
+      const endHook = vi.fn();
+      untypedServer.onProcessingEndHook = endHook;
+
+      await expect(
+        untypedServer.runWithProcessingHooks(
+          context,
+          async (runEndHook: () => void) => {
+            runEndHook();
+            throw new Error('late failure');
+          },
+        ),
+      ).rejects.toThrow('late failure');
+
+      expect(endHook).toHaveBeenCalledOnce();
+    });
+
+    it('should pass the start and end hook contexts separately', async () => {
+      const startHook = vi.fn(
+        (_transportId: unknown, _ctx: unknown, fn: () => Promise<void>) => fn(),
+      );
+      const endHook = vi.fn();
+      const endHookContext = new BaseRpcContext(['end']);
+      untypedServer.onProcessingStartHook = startHook;
+      untypedServer.onProcessingEndHook = endHook;
+
+      await untypedServer.runWithProcessingHooks(
+        context,
+        async (runEndHook: () => void) => runEndHook(),
+        endHookContext,
+      );
+
+      expect(startHook.mock.calls[0][1]).toBe(context);
+      expect(endHook).toHaveBeenCalledExactlyOnceWith(
+        server.transportId,
+        endHookContext,
+      );
     });
   });
 });

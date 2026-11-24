@@ -1,4 +1,4 @@
-export * from './middleware-config-proxy.interface';
-export * from './middleware-configuration.interface';
-export * from './middleware-consumer.interface';
-export * from './nest-middleware.interface';
+export type * from './middleware-config-proxy.interface.js';
+export type * from './middleware-configuration.interface.js';
+export type * from './middleware-consumer.interface.js';
+export type * from './nest-middleware.interface.js';

@@ -1,7 +1,6 @@
-import { expect } from 'chai';
-import * as sinon from 'sinon';
-import { MULTER_MODULE_OPTIONS } from '../../../multer/files.constants';
-import { MulterModule } from '../../../multer/multer.module';
+import { FactoryProvider } from '@nestjs/common';
+import { MULTER_MODULE_OPTIONS } from '../../../multer/files.constants.js';
+import { MulterModule } from '../../../multer/multer.module.js';
 
 describe('MulterModule', () => {
   describe('register', () => {
@@ -11,13 +10,15 @@ describe('MulterModule', () => {
       };
       const dynamicModule = MulterModule.register(options as any);
 
-      expect(dynamicModule.providers).to.have.length(2);
-      expect(dynamicModule.imports).to.be.undefined;
-      expect(dynamicModule.exports).to.include(MULTER_MODULE_OPTIONS);
-      expect(dynamicModule.providers).to.deep.include({
-        provide: MULTER_MODULE_OPTIONS,
-        useValue: options,
-      });
+      expect(dynamicModule.providers).toHaveLength(2);
+      expect(dynamicModule.imports).toBeUndefined();
+      expect(dynamicModule.exports).toContain(MULTER_MODULE_OPTIONS);
+
+      const moduleOptionsProvider = dynamicModule.providers!.find(
+        p => 'useFactory' in p && p.provide === MULTER_MODULE_OPTIONS,
+      ) as FactoryProvider;
+      expect(moduleOptionsProvider).not.toBeUndefined();
+      expect(moduleOptionsProvider.useFactory()).toBe(options);
     });
   });
 
@@ -30,14 +31,16 @@ describe('MulterModule', () => {
         };
         const dynamicModule = MulterModule.registerAsync(asyncOptions);
 
-        expect(dynamicModule.providers).to.have.length(2);
-        expect(dynamicModule.imports).to.be.undefined;
-        expect(dynamicModule.exports).to.include(MULTER_MODULE_OPTIONS);
-        expect(dynamicModule.providers).to.deep.include({
-          provide: MULTER_MODULE_OPTIONS,
-          useFactory: asyncOptions.useFactory,
-          inject: [],
-        });
+        expect(dynamicModule.providers).toHaveLength(2);
+        expect(dynamicModule.imports).toBeUndefined();
+        expect(dynamicModule.exports).toContain(MULTER_MODULE_OPTIONS);
+        expect(dynamicModule.providers).toContainEqual(
+          expect.objectContaining({
+            provide: MULTER_MODULE_OPTIONS,
+            useFactory: asyncOptions.useFactory,
+            inject: [],
+          }),
+        );
       });
     });
 
@@ -48,9 +51,9 @@ describe('MulterModule', () => {
         };
         const dynamicModule = MulterModule.registerAsync(asyncOptions as any);
 
-        expect(dynamicModule.providers).to.have.length(2);
-        expect(dynamicModule.imports).to.be.undefined;
-        expect(dynamicModule.exports).to.include(MULTER_MODULE_OPTIONS);
+        expect(dynamicModule.providers).toHaveLength(2);
+        expect(dynamicModule.imports).toBeUndefined();
+        expect(dynamicModule.exports).toContain(MULTER_MODULE_OPTIONS);
       });
     });
 
@@ -61,9 +64,9 @@ describe('MulterModule', () => {
         };
         const dynamicModule = MulterModule.registerAsync(asyncOptions as any);
 
-        expect(dynamicModule.providers).to.have.length(3);
-        expect(dynamicModule.imports).to.be.undefined;
-        expect(dynamicModule.exports).to.include(MULTER_MODULE_OPTIONS);
+        expect(dynamicModule.providers).toHaveLength(3);
+        expect(dynamicModule.imports).toBeUndefined();
+        expect(dynamicModule.exports).toContain(MULTER_MODULE_OPTIONS);
       });
       it('provider should call "createMulterOptions"', async () => {
         const asyncOptions = {
@@ -71,12 +74,10 @@ describe('MulterModule', () => {
         };
         const dynamicModule = MulterModule.registerAsync(asyncOptions as any);
         const optionsFactory = {
-          createMulterOptions: sinon.spy(),
+          createMulterOptions: vi.fn(),
         };
-        await ((dynamicModule.providers[0] as any).useFactory as any)(
-          optionsFactory,
-        );
-        expect(optionsFactory.createMulterOptions.called).to.be.true;
+        await (dynamicModule.providers![0] as any).useFactory(optionsFactory);
+        expect(optionsFactory.createMulterOptions).toHaveBeenCalled();
       });
     });
   });

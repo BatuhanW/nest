@@ -1,6 +1,5 @@
-import { expect } from 'chai';
-import { RouteParamtypes } from '../../../common/enums/route-paramtypes.enum';
-import { ParamsTokenFactory } from '../../pipes/params-token-factory';
+import { RouteParamtypes } from '../../../common/enums/route-paramtypes.enum.js';
+import { ParamsTokenFactory } from '../../pipes/params-token-factory.js';
 
 describe('ParamsTokenFactory', () => {
   let factory: ParamsTokenFactory;
@@ -10,29 +9,29 @@ describe('ParamsTokenFactory', () => {
   describe('exchangeEnumForString', () => {
     describe('when key is', () => {
       describe(`RouteParamtypes.BODY`, () => {
-        it('should returns body object', () => {
-          expect(factory.exchangeEnumForString(RouteParamtypes.BODY)).to.be.eql(
+        it('should return body object', () => {
+          expect(factory.exchangeEnumForString(RouteParamtypes.BODY)).toEqual(
             'body',
           );
         });
       });
       describe(`RouteParamtypes.QUERY`, () => {
-        it('should returns query object', () => {
-          expect(
-            factory.exchangeEnumForString(RouteParamtypes.QUERY),
-          ).to.be.eql('query');
+        it('should return query object', () => {
+          expect(factory.exchangeEnumForString(RouteParamtypes.QUERY)).toEqual(
+            'query',
+          );
         });
       });
       describe(`RouteParamtypes.PARAM`, () => {
-        it('should returns params object', () => {
-          expect(
-            factory.exchangeEnumForString(RouteParamtypes.PARAM),
-          ).to.be.eql('param');
+        it('should return params object', () => {
+          expect(factory.exchangeEnumForString(RouteParamtypes.PARAM)).toEqual(
+            'param',
+          );
         });
       });
       describe('not available', () => {
-        it('should returns "custom"', () => {
-          expect(factory.exchangeEnumForString(-1)).to.be.eql('custom');
+        it('should return "custom"', () => {
+          expect(factory.exchangeEnumForString(-1 as any)).toEqual('custom');
         });
       });
     });

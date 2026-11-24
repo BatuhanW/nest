@@ -1,11 +1,15 @@
-import { Scope, Type } from '@nestjs/common';
-import { SCOPE_OPTIONS_METADATA } from '@nestjs/common/constants';
-import { MiddlewareConfiguration } from '@nestjs/common/interfaces/middleware/middleware-configuration.interface';
-import { NestContainer } from '../injector';
-import { InstanceWrapper } from '../injector/instance-wrapper';
+import type { InjectionToken, Type } from '@nestjs/common';
+import { getClassScope } from '../helpers/get-class-scope.js';
+import { isDurable } from '../helpers/is-durable.js';
+import { NestContainer } from '../injector/container.js';
+import { InstanceWrapper } from '../injector/instance-wrapper.js';
+import type { MiddlewareConfiguration } from '@nestjs/common/internal';
 
 export class MiddlewareContainer {
-  private readonly middleware = new Map<string, Map<string, InstanceWrapper>>();
+  private readonly middleware = new Map<
+    string,
+    Map<InjectionToken, InstanceWrapper>
+  >();
   private readonly configurationSets = new Map<
     string,
     Set<MiddlewareConfiguration>
@@ -15,16 +19,24 @@ export class MiddlewareContainer {
 
   public getMiddlewareCollection(
     moduleKey: string,
-  ): Map<string, InstanceWrapper> {
+  ): Map<InjectionToken, InstanceWrapper> {
     if (!this.middleware.has(moduleKey)) {
-      const moduleRef = this.container.getModuleByKey(moduleKey);
+      const moduleRef = this.container.getModuleByKey(moduleKey)!;
       this.middleware.set(moduleKey, moduleRef.middlewares);
     }
-    return this.middleware.get(moduleKey);
+    return this.middleware.get(moduleKey)!;
   }
 
   public getConfigurations(): Map<string, Set<MiddlewareConfiguration>> {
     return this.configurationSets;
+  }
+
+  /**
+   * Gives the module its place among the configurations, which are kept in
+   * the order of insertion, before its configurations are known.
+   */
+  public reserveConfig(moduleKey: string) {
+    this.getTargetConfig(moduleKey);
   }
 
   public insertConfig(
@@ -32,17 +44,19 @@ export class MiddlewareContainer {
     moduleKey: string,
   ) {
     const middleware = this.getMiddlewareCollection(moduleKey);
-    const targetConfig = this.getTargetConfig(moduleKey);
+    const targetConfig = this.getTargetConfig(moduleKey)!;
 
     const configurations = configList || [];
     const insertMiddleware = <T extends Type<unknown>>(metatype: T) => {
-      const token = metatype.name;
+      const token = metatype;
       middleware.set(
         token,
         new InstanceWrapper({
-          scope: this.getClassScope(metatype),
+          scope: getClassScope(metatype),
+          durable: isDurable(metatype),
+          name: token?.name ?? token,
           metatype,
-          name: token,
+          token,
         }),
       );
     };
@@ -60,10 +74,5 @@ export class MiddlewareContainer {
       );
     }
     return this.configurationSets.get(moduleName);
-  }
-
-  private getClassScope<T = unknown>(type: Type<T>): Scope {
-    const metadata = Reflect.getMetadata(SCOPE_OPTIONS_METADATA, type);
-    return metadata && metadata.scope;
   }
 }

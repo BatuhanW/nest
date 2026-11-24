@@ -1,3 +1,3 @@
-export * from './on-gateway-connection.interface';
-export * from './on-gateway-disconnect.interface';
-export * from './on-gateway-init.interface';
+export type * from './on-gateway-connection.interface.js';
+export type * from './on-gateway-disconnect.interface.js';
+export type * from './on-gateway-init.interface.js';

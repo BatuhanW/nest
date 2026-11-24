@@ -1,9 +1,11 @@
-import { RequestMethod } from '../../enums';
-import { Type } from '../type.interface';
+import { RequestMethod } from '../../enums/index.js';
+import { Type } from '../type.interface.js';
+import { VersionValue } from '../version-options.interface.js';
 
 export interface RouteInfo {
   path: string;
   method: RequestMethod;
+  version?: VersionValue;
 }
 
 export interface MiddlewareConfiguration<T = any> {

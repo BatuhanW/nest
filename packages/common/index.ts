@@ -1,16 +1,15 @@
 /*
  * Nest @common
- * Copyright(c) 2017 - 2020 Kamil Mysliwiec
+ * Copyright(c) 2017 - 2025 Kamil Mysliwiec
  * https://nestjs.com
  * MIT Licensed
  */
 import 'reflect-metadata';
 
-export * from './cache';
-export * from './decorators';
-export * from './enums';
-export * from './exceptions';
-export * from './http';
+export * from './decorators/index.js';
+export * from './enums/index.js';
+export * from './exceptions/index.js';
+export * from './file-stream/index.js';
 export {
   Abstract,
   ArgumentMetadata,
@@ -19,7 +18,12 @@ export {
   CallHandler,
   CanActivate,
   ClassProvider,
+  ContentSecurityPolicyDirectiveValue,
+  ContentSecurityPolicyOptions,
   ContextType,
+  CookieSerializeOptions,
+  CookiesOptions,
+  CsrfProtectionOptions,
   DynamicModule,
   ExceptionFilter,
   ExecutionContext,
@@ -27,9 +31,14 @@ export {
   FactoryProvider,
   ForwardReference,
   HttpServer,
+  HttpExceptionBody,
+  HttpExceptionBodyMessage,
+  HttpRedirectResponse,
   INestApplication,
   INestApplicationContext,
   INestMicroservice,
+  ITransportServer,
+  InjectionToken,
   IntrospectionResult,
   MessageEvent,
   MiddlewareConsumer,
@@ -38,25 +47,36 @@ export {
   NestHybridApplicationOptions,
   NestInterceptor,
   NestMiddleware,
+  PreRequestHook,
   NestModule,
   OnApplicationBootstrap,
   OnApplicationShutdown,
   OnModuleDestroy,
   OnModuleInit,
+  OptionalFactoryDependency,
   Paramtype,
   PipeTransform,
   Provider,
+  RawBodyRequest,
+  ReferrerPolicyToken,
+  RouteConflictPolicy,
+  RouteConflictPolicyLevel,
+  RouteResolutionStrategy,
   RpcExceptionFilter,
   Scope,
   ScopeOptions,
+  SecurityHeadersOptions,
   Type,
   ValidationError,
   ValueProvider,
+  VersioningOptions,
+  VERSION_NEUTRAL,
   WebSocketAdapter,
   WsExceptionFilter,
   WsMessageHandler,
-} from './interfaces';
-export * from './pipes';
-export * from './serializer';
-export * from './services';
-export * from './utils';
+} from './interfaces/index.js';
+export * from './module-utils/index.js';
+export * from './pipes/index.js';
+export * from './serializer/index.js';
+export * from './services/index.js';
+export * from './utils/index.js';

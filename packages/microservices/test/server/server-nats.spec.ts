@@ -1,189 +1,1010 @@
-import { expect } from 'chai';
-import * as sinon from 'sinon';
-import { NO_MESSAGE_HANDLER } from '../../constants';
-import { NatsContext } from '../../ctx-host';
-import { BaseRpcContext } from '../../ctx-host/base-rpc.context';
-import { ServerNats } from '../../server/server-nats';
+import { headers as createHeaders } from '@nats-io/transport-node';
+import { of } from 'rxjs';
+import { NO_MESSAGE_HANDLER } from '../../constants.js';
+import { BaseRpcContext } from '../../ctx-host/base-rpc.context.js';
+import { NatsContext } from '../../ctx-host/index.js';
+import { InvalidPacketIdException } from '../../errors/invalid-packet-id.exception.js';
+import { NatsRecordBuilder } from '../../record-builders/index.js';
+import { ServerNats } from '../../server/server-nats.js';
+import { objectToMap } from './utils/object-to-map.js';
+
+// type NatsMsg = import('@nats-io/nats-core').Msg;
+type NatsMsg = any;
 
 describe('ServerNats', () => {
   let server: ServerNats;
+  let untypedServer: any;
 
-  const objectToMap = obj =>
-    new Map(Object.keys(obj).map(key => [key, obj[key]]) as any);
-
-  beforeEach(() => {
+  beforeEach(async () => {
     server = new ServerNats({});
+    untypedServer = server as any;
+
+    // Eagerly init serializer/deserializer (loadPackage is async in ESM)
+    if (typeof untypedServer.serializer?.init === 'function') {
+      await untypedServer.serializer.init();
+    }
+    if (typeof untypedServer.deserializer?.init === 'function') {
+      await untypedServer.deserializer.init();
+    }
   });
   describe('listen', () => {
-    let createNatsClient;
-    let onSpy: sinon.SinonSpy;
-    let client;
+    let client: any;
+    let callbackSpy: ReturnType<typeof vi.fn>;
 
     beforeEach(() => {
-      onSpy = sinon.spy();
       client = {
-        on: onSpy,
+        status: vi.fn().mockReturnValue({
+          async *[Symbol.asyncIterator]() {},
+        }),
       };
-      createNatsClient = sinon
-        .stub(server, 'createNatsClient')
-        .callsFake(() => client);
+      vi.spyOn(server, 'createNatsClient').mockResolvedValue(client);
+      callbackSpy = vi.fn();
+    });
+    describe('when "start" throws an exception', () => {
+      it('should call callback with a thrown error as an argument', async () => {
+        const error = new Error('random error');
 
-      server.listen(null);
+        vi.spyOn(server, 'start').mockImplementation(() => {
+          throw error;
+        });
+        await server.listen(callbackSpy as any);
+        expect(callbackSpy).toHaveBeenCalledWith(error);
+      });
     });
-    it('should bind "error" event to handler', () => {
-      expect(onSpy.getCall(0).args[0]).to.be.equal('error');
+    it('should log a failing status iterator instead of rejecting', async () => {
+      const error = new Error('status failed');
+      const logErrorSpy = vi.spyOn(untypedServer.logger, 'error');
+      client.status.mockReturnValue({
+        [Symbol.asyncIterator]: () => ({ next: () => Promise.reject(error) }),
+      });
+      vi.spyOn(server, 'start').mockImplementation(() => {});
+
+      await server.listen(callbackSpy as any);
+      await vi.waitFor(() => expect(logErrorSpy).toHaveBeenCalledWith(error));
     });
-    it('should bind "connect" event to handler', () => {
-      expect(onSpy.getCall(1).args[0]).to.be.equal('connect');
+    it('should close the created client and skip startup when closed before createNatsClient resolves', async () => {
+      let resolveClient!: (value: any) => void;
+      const pendingClient = {
+        close: vi.fn().mockResolvedValue(undefined),
+        status: vi.fn().mockReturnValue({
+          async *[Symbol.asyncIterator]() {},
+        }),
+      };
+      vi.spyOn(server, 'createNatsClient').mockImplementation(
+        () =>
+          new Promise(resolve => {
+            resolveClient = resolve;
+          }),
+      );
+      const startSpy = vi.spyOn(server, 'start').mockImplementation(() => {});
+
+      const listenPromise = server.listen(callbackSpy as any);
+      await server.close();
+      resolveClient(pendingClient);
+      await listenPromise;
+
+      expect(pendingClient.close).toHaveBeenCalledOnce();
+      expect(startSpy).not.toHaveBeenCalled();
+      expect(untypedServer.natsClient).toBeUndefined();
+      expect(callbackSpy).toHaveBeenCalledWith(expect.any(Error));
     });
   });
   describe('close', () => {
-    const natsClient = { close: sinon.spy() };
+    const natsClient = { close: vi.fn() };
     beforeEach(() => {
-      (server as any).natsClient = natsClient;
+      untypedServer.natsClient = natsClient;
     });
-    it('should close natsClient', () => {
-      server.close();
-      expect(natsClient.close.called).to.be.true;
+    it('should close natsClient', async () => {
+      await server.close();
+      expect(natsClient.close).toHaveBeenCalled();
+    });
+
+    describe('when "gracefulShutdown" is true', () => {
+      let subscriptions: Array<{ unsubscribe: ReturnType<typeof vi.fn> }>;
+      beforeEach(() => {
+        natsClient.close.mockClear();
+        subscriptions = [{ unsubscribe: vi.fn() }, { unsubscribe: vi.fn() }];
+        untypedServer.subscriptions = subscriptions;
+        untypedServer.options.gracefulShutdown = true;
+      });
+      afterEach(() => {
+        vi.useRealTimers();
+      });
+
+      it('should unsubscribe all subscriptions', async () => {
+        await server.close();
+        for (const subscription of subscriptions) {
+          expect(subscription.unsubscribe).toHaveBeenCalledOnce();
+        }
+        expect(untypedServer.subscriptions).toEqual([]);
+      });
+
+      it('should unsubscribe, wait for the handlers in flight, then close the connection', async () => {
+        const waitSpy = vi
+          .spyOn(untypedServer, 'waitForHandlersInFlight')
+          .mockResolvedValue(undefined);
+
+        await server.close();
+
+        const [unsubscribed] =
+          subscriptions[1].unsubscribe.mock.invocationCallOrder;
+        const [waited] = waitSpy.mock.invocationCallOrder;
+        const [closed] = natsClient.close.mock.invocationCallOrder;
+        expect(unsubscribed).toBeLessThan(waited);
+        expect(waited).toBeLessThan(closed);
+      });
+
+      it('should wait for "gracePeriod" at most', async () => {
+        const waitSpy = vi
+          .spyOn(untypedServer, 'waitForHandlersInFlight')
+          .mockResolvedValue(undefined);
+        untypedServer.options.gracePeriod = 500;
+
+        await server.close();
+
+        expect(waitSpy).toHaveBeenCalledExactlyOnceWith(500);
+      });
+
+      it('should close without waiting when no handler is in flight', async () => {
+        // With fake timers a fixed wait would never end
+        vi.useFakeTimers();
+        untypedServer.options.gracePeriod = 60_000;
+
+        await server.close();
+
+        expect(natsClient.close).toHaveBeenCalledOnce();
+      });
+
+      it('should close as soon as the handler in flight is done', async () => {
+        vi.useFakeTimers();
+        untypedServer.options.gracePeriod = 60_000;
+        let finish!: () => void;
+        untypedServer.messageHandlers = new Map([
+          [
+            'slow',
+            Object.assign(() => new Promise<void>(res => (finish = res)), {
+              isEventHandler: true,
+            }),
+          ],
+        ]);
+        void server.handleEvent(
+          'slow',
+          { pattern: 'slow', data: null },
+          new BaseRpcContext([]),
+        );
+
+        const closing = server.close();
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(natsClient.close).not.toHaveBeenCalled();
+
+        finish();
+        await closing;
+        expect(natsClient.close).toHaveBeenCalledOnce();
+      });
+
+      it('should close after "gracePeriod" when a handler is still running', async () => {
+        vi.useFakeTimers();
+        untypedServer.options.gracePeriod = 5000;
+        untypedServer.messageHandlers = new Map([
+          [
+            'stuck',
+            Object.assign(() => new Promise<void>(() => {}), {
+              isEventHandler: true,
+            }),
+          ],
+        ]);
+        void server.handleEvent(
+          'stuck',
+          { pattern: 'stuck', data: null },
+          new BaseRpcContext([]),
+        );
+
+        const closing = server.close();
+        await vi.advanceTimersByTimeAsync(4999);
+        expect(natsClient.close).not.toHaveBeenCalled();
+
+        await vi.advanceTimersByTimeAsync(1);
+        await closing;
+        expect(natsClient.close).toHaveBeenCalledOnce();
+      });
+    });
+
+    describe('when "gracefulShutdown" is false', () => {
+      const subscriptions = [
+        { unsubscribe: vi.fn() },
+        { unsubscribe: vi.fn() },
+      ];
+      beforeEach(() => {
+        untypedServer.subscriptions = subscriptions;
+        untypedServer.options.gracefulShutdown = false;
+      });
+      it('should not unsubscribe all subscriptions', async () => {
+        await server.close();
+        for (const subscription of subscriptions) {
+          expect(subscription.unsubscribe).not.toHaveBeenCalled();
+        }
+      });
+
+      it('should not wait for the handlers in flight', async () => {
+        const waitSpy = vi.spyOn(untypedServer, 'waitForHandlersInFlight');
+
+        await server.close();
+
+        expect(waitSpy).not.toHaveBeenCalled();
+      });
     });
   });
   describe('bindEvents', () => {
-    let onSpy: sinon.SinonSpy, subscribeSpy: sinon.SinonSpy, natsClient;
+    let onSpy: ReturnType<typeof vi.fn>,
+      subscribeSpy: ReturnType<typeof vi.fn>,
+      natsClient;
+    const pattern = 'test';
+    const messageHandler = vi.fn();
 
     beforeEach(() => {
-      onSpy = sinon.spy();
-      subscribeSpy = sinon.spy();
+      onSpy = vi.fn();
+      subscribeSpy = vi.fn();
       natsClient = {
         on: onSpy,
         subscribe: subscribeSpy,
       };
+      untypedServer.messageHandlers = objectToMap({
+        [pattern]: messageHandler,
+      });
     });
-    it('should subscribe to each acknowledge patterns', () => {
-      const pattern = 'test';
-      const handler = sinon.spy();
-      (server as any).messageHandlers = objectToMap({
-        [pattern]: handler,
+
+    it('should subscribe to every pattern', () => {
+      server.bindEvents(natsClient);
+      expect(subscribeSpy).toHaveBeenCalledWith(
+        pattern,
+        expect.objectContaining({}),
+      );
+    });
+
+    it('should use a per pattern queue if provided', () => {
+      const queue = 'test';
+      untypedServer.messageHandlers = objectToMap({
+        [pattern]: Object.assign(messageHandler, {
+          extras: {
+            queue,
+          },
+        }),
       });
       server.bindEvents(natsClient);
-      expect(subscribeSpy.calledWith(pattern)).to.be.true;
+      const lastCallArgs =
+        subscribeSpy.mock.calls[subscribeSpy.mock.calls.length - 1];
+      expect(lastCallArgs[1].queue).toEqual(queue);
+    });
+
+    it('should fill the subscriptions array properly', () => {
+      server.bindEvents(natsClient);
+      expect(server['subscriptions'].length).toBe(1);
     });
   });
   describe('getMessageHandler', () => {
     it(`should return function`, () => {
-      expect(
-        typeof server.getMessageHandler(null, (server as any).natsClient),
-      ).to.be.eql('function');
+      expect(typeof server.getMessageHandler(null!)).toEqual('function');
     });
     describe('handler', () => {
       it('should call "handleMessage"', async () => {
-        const handleMessageStub = sinon
-          .stub(server, 'handleMessage')
-          .callsFake(() => null);
-        (await server.getMessageHandler('', (server as any).natsClient))(
-          '' as any,
-          '',
-        );
-        expect(handleMessageStub.called).to.be.true;
+        const handleMessageStub = vi
+          .spyOn(server, 'handleMessage')
+          .mockResolvedValue(undefined as any);
+        await server.getMessageHandler('')('' as any, '');
+        expect(handleMessageStub).toHaveBeenCalled();
+      });
+      it('should route "handleMessage" rejections to "handleError" instead of leaving them unhandled', async () => {
+        const error = new Error('unexpected');
+        vi.spyOn(server, 'handleMessage').mockRejectedValue(error);
+        const handleErrorSpy = vi
+          .spyOn(untypedServer, 'handleError')
+          .mockImplementation(() => undefined);
+
+        await server.getMessageHandler('')('' as any, '');
+
+        expect(handleErrorSpy).toHaveBeenCalledWith(error);
       });
     });
   });
   describe('handleMessage', () => {
-    let getPublisherSpy: sinon.SinonSpy;
+    let getPublisherSpy: ReturnType<typeof vi.fn>;
 
     const channel = 'test';
-    const data = 'test';
     const id = '3';
 
+    const createRequest = (subject: string): NatsMsg => {
+      const data = JSON.stringify({ pattern: subject, data: 'test', id });
+      return {
+        data,
+        subject,
+        sid: +id,
+        reply: 'inbox',
+        respond: vi.fn(),
+        json: () => JSON.parse(data),
+      };
+    };
+    const flush = () => new Promise(resolve => setImmediate(resolve));
+
     beforeEach(() => {
-      getPublisherSpy = sinon.spy();
-      sinon.stub(server, 'getPublisher').callsFake(() => getPublisherSpy);
-    });
-    it('should call "handleEvent" if identifier is not present', () => {
-      const handleEventSpy = sinon.spy(server, 'handleEvent');
-      server.handleMessage(channel, { pattern: '', data: '' }, null, '', '');
-      expect(handleEventSpy.called).to.be.true;
-    });
-    it(`should publish NO_MESSAGE_HANDLER if pattern not exists in messageHandlers object`, () => {
-      server.handleMessage(
-        channel,
-        { id, pattern: '', data: '' },
-        null,
-        '',
-        '',
+      getPublisherSpy = vi.fn();
+      vi.spyOn(server, 'getPublisher').mockImplementation(
+        () => getPublisherSpy as any,
       );
-      expect(
-        getPublisherSpy.calledWith({
-          id,
-          status: 'error',
-          err: NO_MESSAGE_HANDLER,
-        }),
-      ).to.be.true;
     });
-    it(`should call handler with expected arguments`, () => {
-      const handler = sinon.spy();
-      (server as any).messageHandlers = objectToMap({
+    describe('when the message is a reply of a Nest server', () => {
+      // The requester names the subject a reply is published on, which can
+      // be the subject of a handler
+      const deliver = async (packet: Record<string, unknown>) => {
+        const handler = vi.fn();
+        untypedServer.messageHandlers = objectToMap({ [channel]: handler });
+        const data = JSON.stringify(packet);
+        await server.handleMessage(channel, {
+          data,
+          subject: channel,
+          respond: vi.fn(),
+          json: () => JSON.parse(data),
+        });
+        return handler;
+      };
+
+      it.each([
+        { response: 'active', isDisposed: true, id: 'account-4' },
+        { response: 'active', id: 'account-4' },
+        { isDisposed: true, id: 'account-4' },
+        { err: 'failed', isDisposed: true, id: 'account-4' },
+        { err: NO_MESSAGE_HANDLER, status: 'error', id: 4 },
+      ])(
+        'should not dispatch %j to the handler of the subject',
+        async packet => {
+          const handler = await deliver(packet);
+
+          expect(handler).not.toHaveBeenCalled();
+          expect(getPublisherSpy).not.toHaveBeenCalled();
+        },
+      );
+      it('should dispatch an event whose data looks like a reply', async () => {
+        const handler = await deliver({
+          pattern: channel,
+          data: { response: 'active', isDisposed: true, id: 'account-4' },
+        });
+
+        expect(handler).toHaveBeenCalledWith(
+          { response: 'active', isDisposed: true, id: 'account-4' },
+          expect.any(NatsContext),
+        );
+      });
+      it('should dispatch a message with more keys than a reply', async () => {
+        const external = { response: 'active', id: 'account-4', extra: true };
+        const handler = await deliver(external);
+
+        expect(handler).toHaveBeenCalledWith(external, expect.any(NatsContext));
+      });
+    });
+    it('should call "handleEvent" if identifier is not present', async () => {
+      const handleEventSpy = vi.spyOn(server, 'handleEvent');
+      const data = JSON.stringify({ id: 10 });
+      const natsMsg: NatsMsg = {
+        data,
+        subject: channel,
+        sid: +id,
+        respond: vi.fn(),
+        json: () => JSON.parse(data),
+      };
+      await server.handleMessage(channel, natsMsg);
+      expect(handleEventSpy).toHaveBeenCalled();
+    });
+    it(`should publish NO_MESSAGE_HANDLER if pattern does not exist in messageHandlers object`, async () => {
+      const data = JSON.stringify({
+        id,
+        pattern: 'test',
+        data: 'test',
+      });
+      const natsMsg: NatsMsg = {
+        data,
+        subject: channel,
+        sid: +id,
+        respond: vi.fn(),
+        json: () => JSON.parse(data),
+      };
+
+      await server.handleMessage(channel, natsMsg);
+      expect(getPublisherSpy).toHaveBeenCalledWith({
+        id,
+        status: 'error',
+        err: NO_MESSAGE_HANDLER,
+      });
+    });
+    it(`should call handler with expected arguments`, async () => {
+      const handler = vi.fn();
+      untypedServer.messageHandlers = objectToMap({
         [channel]: handler,
       });
 
-      const callerSubject = 'subject';
-      const natsContext = new NatsContext([callerSubject]);
-      server.handleMessage(
-        channel,
-        { pattern: '', data, id: '2' },
-        null,
-        '',
-        callerSubject,
+      const headers = {};
+      const natsContext = new NatsContext([channel, headers]);
+
+      const data = JSON.stringify({
+        pattern: channel,
+        data: 'test',
+        id,
+      });
+      const natsMsg: NatsMsg = {
+        data,
+        subject: channel,
+        sid: +id,
+        respond: vi.fn(),
+        headers,
+        json: () => JSON.parse(data),
+      };
+      await server.handleMessage(channel, natsMsg);
+      expect(handler).toHaveBeenCalledWith('test', natsContext);
+    });
+    it('should expose the message headers as packet metadata on the context', async () => {
+      const handler = vi.fn();
+      untypedServer.messageHandlers = objectToMap({ [channel]: handler });
+      const headers = createHeaders();
+      headers.set('x-request-id', 'trace-1');
+      const data = JSON.stringify({ pattern: channel, data: 'test', id });
+
+      await server.handleMessage(channel, {
+        data,
+        subject: channel,
+        respond: vi.fn(),
+        headers,
+        json: () => JSON.parse(data),
+      });
+
+      const context: NatsContext = handler.mock.calls[0][1];
+      expect(context.getMetadata()).toEqual({ 'x-request-id': 'trace-1' });
+    });
+    it('should still reply with an event handler, but warn once that this is deprecated', async () => {
+      const handler = Object.assign(async () => 'stored', {
+        isEventHandler: true,
+      });
+      untypedServer.messageHandlers = objectToMap({ [channel]: handler });
+      const warnSpy = vi
+        .spyOn(untypedServer.logger, 'warn')
+        .mockImplementation(() => {});
+      const data = JSON.stringify({ pattern: channel, data: 'test', id });
+      const natsMsg: NatsMsg = {
+        data,
+        subject: channel,
+        sid: +id,
+        respond: vi.fn(),
+        json: () => JSON.parse(data),
+      };
+
+      await server.handleMessage(channel, natsMsg);
+      await server.handleMessage(channel, natsMsg);
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(getPublisherSpy).toHaveBeenCalledTimes(2);
+      expect(getPublisherSpy).toHaveBeenCalledWith({
+        response: 'stored',
+        isDisposed: true,
+      });
+      expect(warnSpy).toHaveBeenCalledOnce();
+      expect(warnSpy.mock.calls[0][0]).toMatch(
+        /^DEPRECATED! .* Pattern: test$/,
       );
-      expect(handler.calledWith(data, natsContext)).to.be.true;
+    });
+    it('should drop a request whose id is neither a number nor a short string', async () => {
+      // Every reply carries a copy of the id
+      const handler = vi.fn();
+      untypedServer.messageHandlers = objectToMap({
+        [channel]: handler,
+      });
+      const data = JSON.stringify({
+        pattern: channel,
+        data: 'test',
+        id: 'a'.repeat(257),
+      });
+      const natsMsg: NatsMsg = {
+        data,
+        subject: channel,
+        sid: +id,
+        respond: vi.fn(),
+        json: () => JSON.parse(data),
+      };
+
+      const error = await server
+        .handleMessage(channel, natsMsg)
+        .catch(err => err);
+
+      expect(handler).not.toHaveBeenCalled();
+      expect(getPublisherSpy).not.toHaveBeenCalled();
+      expect(error).toBeInstanceOf(InvalidPacketIdException);
+    });
+    describe('when an event subject matches the subject of a request', () => {
+      let eventHandler: ReturnType<typeof vi.fn>;
+      let messageHandler: ReturnType<typeof vi.fn>;
+
+      beforeEach(() => {
+        eventHandler = Object.assign(
+          vi.fn(async () => 'event'),
+          { isEventHandler: true },
+        );
+        messageHandler = vi.fn(async () => 'message');
+        vi.spyOn(untypedServer.logger, 'warn').mockImplementation(() => {});
+      });
+      it.each([
+        ['orders.*', 'orders.get'],
+        ['orders.>', 'orders.*'],
+        ['orders.get', '*.get'],
+      ])(
+        'should answer it with the message handler only (event: "%s", message: "%s")',
+        async (eventSubject, messageSubject) => {
+          untypedServer.messageHandlers = objectToMap({
+            [eventSubject]: eventHandler,
+            [messageSubject]: messageHandler,
+          });
+
+          // NATS delivers the request to each subscription that matches it
+          await server.handleMessage(eventSubject, createRequest('orders.get'));
+          await server.handleMessage(
+            messageSubject,
+            createRequest('orders.get'),
+          );
+          await flush();
+
+          expect(eventHandler).toHaveBeenCalledWith(
+            'test',
+            expect.any(NatsContext),
+          );
+          expect(getPublisherSpy).toHaveBeenCalledExactlyOnceWith({
+            response: 'message',
+            isDisposed: true,
+          });
+        },
+      );
+      it('should still answer it with the event handler when no message handler subject matches it', async () => {
+        untypedServer.messageHandlers = objectToMap({
+          'orders.*': eventHandler,
+          'users.get': messageHandler,
+        });
+
+        await server.handleMessage('orders.*', createRequest('orders.get'));
+        await flush();
+
+        expect(getPublisherSpy).toHaveBeenCalledExactlyOnceWith({
+          response: 'event',
+          isDisposed: true,
+        });
+      });
+      it('should still answer it with the event handler when both share a queue group', async () => {
+        // NATS delivers the request to a single member of the group, so the
+        // message handler does not receive it
+        untypedServer.options.queue = 'orders';
+        untypedServer.messageHandlers = objectToMap({
+          'orders.*': eventHandler,
+          'orders.get': messageHandler,
+        });
+
+        await server.handleMessage('orders.*', createRequest('orders.get'));
+        await flush();
+
+        expect(getPublisherSpy).toHaveBeenCalledExactlyOnceWith({
+          response: 'event',
+          isDisposed: true,
+        });
+      });
+      it('should answer it with the message handler only when the event handler has a queue group of its own', async () => {
+        untypedServer.options.queue = 'orders';
+        eventHandler.extras = { queue: 'audit' };
+        untypedServer.messageHandlers = objectToMap({
+          'orders.*': eventHandler,
+          'orders.get': messageHandler,
+        });
+
+        await server.handleMessage('orders.*', createRequest('orders.get'));
+        await flush();
+
+        expect(eventHandler).toHaveBeenCalled();
+        expect(getPublisherSpy).not.toHaveBeenCalled();
+      });
+    });
+    describe('when a message subject matches the subject of another message handler', () => {
+      let wildcardHandler: ReturnType<typeof vi.fn>;
+      let messageHandler: ReturnType<typeof vi.fn>;
+
+      beforeEach(() => {
+        wildcardHandler = vi.fn(async () => 'wildcard');
+        messageHandler = vi.fn(async () => 'message');
+      });
+      it.each(['orders.*', 'orders.>', '*.get'])(
+        'should answer it with the message handler of its subject only (wildcard: "%s")',
+        async wildcardSubject => {
+          untypedServer.messageHandlers = objectToMap({
+            [wildcardSubject]: wildcardHandler,
+            'orders.get': messageHandler,
+          });
+
+          // NATS delivers the request to each subscription that matches it
+          await server.handleMessage(
+            wildcardSubject,
+            createRequest('orders.get'),
+          );
+          await server.handleMessage('orders.get', createRequest('orders.get'));
+          await flush();
+
+          expect(wildcardHandler).not.toHaveBeenCalled();
+          expect(getPublisherSpy).toHaveBeenCalledExactlyOnceWith({
+            response: 'message',
+            isDisposed: true,
+          });
+        },
+      );
+      it('should still answer it with each wildcard handler when no message handler has its subject', async () => {
+        untypedServer.messageHandlers = objectToMap({
+          'orders.*': wildcardHandler,
+          'orders.>': messageHandler,
+        });
+
+        await server.handleMessage('orders.*', createRequest('orders.get'));
+        await server.handleMessage('orders.>', createRequest('orders.get'));
+        await flush();
+
+        expect(getPublisherSpy).toHaveBeenCalledTimes(2);
+      });
+      it('should still answer it with the wildcard handler when both share a queue group', async () => {
+        // NATS delivers the request to a single member of the group, so the
+        // message handler of its subject does not receive it
+        untypedServer.options.queue = 'orders';
+        untypedServer.messageHandlers = objectToMap({
+          'orders.*': wildcardHandler,
+          'orders.get': messageHandler,
+        });
+
+        await server.handleMessage('orders.*', createRequest('orders.get'));
+        await flush();
+
+        expect(getPublisherSpy).toHaveBeenCalledExactlyOnceWith({
+          response: 'wildcard',
+          isDisposed: true,
+        });
+      });
+      it('should not answer it with the wildcard handler when it has a queue group of its own', async () => {
+        untypedServer.options.queue = 'orders';
+        wildcardHandler.extras = { queue: 'audit' };
+        untypedServer.messageHandlers = objectToMap({
+          'orders.*': wildcardHandler,
+          'orders.get': messageHandler,
+        });
+
+        await server.handleMessage('orders.*', createRequest('orders.get'));
+        await flush();
+
+        expect(wildcardHandler).not.toHaveBeenCalled();
+        expect(getPublisherSpy).not.toHaveBeenCalled();
+      });
+      it('should still dispatch an event to the wildcard handler', async () => {
+        untypedServer.messageHandlers = objectToMap({
+          'orders.*': wildcardHandler,
+          'orders.get': messageHandler,
+        });
+        const data = JSON.stringify({ pattern: 'orders.get', data: 'test' });
+
+        await server.handleMessage('orders.*', {
+          ...createRequest('orders.get'),
+          data,
+          json: () => JSON.parse(data),
+        });
+
+        expect(wildcardHandler).toHaveBeenCalledWith(
+          'test',
+          expect.any(NatsContext),
+        );
+      });
+    });
+  });
+
+  describe('matchNatsSubject', () => {
+    it.each([
+      ['orders.get', 'orders.get', true],
+      ['orders.get', 'orders.list', false],
+      ['orders.*', 'orders.get', true],
+      ['*.get', 'orders.get', true],
+      ['orders.*', 'orders', false],
+      ['orders.*', 'orders.get.one', false],
+      ['orders.>', 'orders.get.one', true],
+      ['orders.>', 'orders', false],
+      ['>', 'orders', true],
+    ])('should match "%s" against "%s" as %s', (pattern, subject, expected) => {
+      expect(untypedServer.matchNatsSubject(pattern, subject)).toBe(expected);
+    });
+  });
+
+  describe('processing end hook', () => {
+    const channel = 'test';
+    const id = '3';
+    let publishSpy: ReturnType<typeof vi.fn>;
+    let endHook: ReturnType<typeof vi.fn>;
+
+    const bindHandler = (handler: () => unknown) => {
+      publishSpy = vi.fn();
+      vi.spyOn(server, 'getPublisher').mockImplementation(
+        () => publishSpy as any,
+      );
+      endHook = vi.fn();
+      untypedServer.onProcessingStartHook = (
+        _transportId: unknown,
+        _ctx: unknown,
+        fn: () => Promise<void>,
+      ) => fn();
+      untypedServer.onProcessingEndHook = endHook;
+      untypedServer.messageHandlers = objectToMap({
+        [channel]: (async () => handler()) as any,
+      });
+    };
+    const handleMessage = () => {
+      const data = JSON.stringify({ id, pattern: channel, data: 'test' });
+      const natsMsg: NatsMsg = {
+        data,
+        subject: channel,
+        sid: +id,
+        respond: vi.fn(),
+        json: () => JSON.parse(data),
+      };
+      return server.handleMessage(channel, natsMsg);
+    };
+    const flush = () => new Promise(resolve => setImmediate(resolve));
+
+    it('should run the hook once when the response stream emits several values', async () => {
+      bindHandler(() => of('first', 'second', 'third'));
+
+      await handleMessage();
+      await flush();
+
+      expect(publishSpy).toHaveBeenCalledTimes(3);
+      expect(endHook).toHaveBeenCalledOnce();
+    });
+    it('should run the hook when the handler rejects', async () => {
+      bindHandler(() => {
+        throw new Error('handler failed');
+      });
+
+      await expect(handleMessage()).rejects.toThrow('handler failed');
+
+      expect(endHook).toHaveBeenCalledOnce();
     });
   });
   describe('getPublisher', () => {
-    let publisherSpy: sinon.SinonSpy;
-    let pub, publisher;
-
+    const context = new NatsContext([] as any);
     const id = '1';
-    beforeEach(() => {
-      publisherSpy = sinon.spy();
-      pub = {
-        publish: publisherSpy,
-      };
-    });
-    it(`should return function`, () => {
-      expect(typeof server.getPublisher(null, null, id)).to.be.eql('function');
-    });
-    it(`should call "publish" when replyTo provided`, () => {
-      const replyTo = 'test';
-      publisher = server.getPublisher(pub, replyTo, id);
 
-      const respond = 'test';
-      publisher({ respond, id });
-      expect(publisherSpy.calledWith(replyTo, { respond, id })).to.be.true;
+    it(`should return function`, () => {
+      const natsMsg: NatsMsg = {
+        data: new Uint8Array(),
+        subject: '',
+        sid: +id,
+        respond: vi.fn(),
+      };
+      expect(typeof server.getPublisher(natsMsg, id, context)).toEqual(
+        'function',
+      );
+    });
+    it(`should call "respond" when reply topic provided`, () => {
+      const replyTo = 'test';
+      const natsMsg = {
+        data: new Uint8Array(),
+        subject: '',
+        sid: +id,
+        respond: vi.fn(),
+        reply: replyTo,
+      } as NatsMsg;
+      const publisher = server.getPublisher(natsMsg, id, context);
+
+      const response = 'test';
+      publisher({ response, isDisposed: true });
+      expect(natsMsg.respond).toHaveBeenCalledWith(
+        JSON.stringify({ response, isDisposed: true, id }),
+        { headers: undefined },
+      );
+    });
+    describe('when the response is a record', () => {
+      it(`should respond with the record data as "response" and the record headers`, () => {
+        const natsMsg = {
+          data: new Uint8Array(),
+          subject: '',
+          sid: +id,
+          respond: vi.fn(),
+          reply: 'test',
+        } as NatsMsg;
+        const publisher = server.getPublisher(natsMsg, id, context);
+        const headers = { key: 'value' };
+        const record = new NatsRecordBuilder({ value: 'test' })
+          .setHeaders(headers)
+          .build();
+
+        publisher({ response: record, isDisposed: true });
+
+        expect(natsMsg.respond).toHaveBeenCalledWith(
+          JSON.stringify({
+            response: { value: 'test' },
+            isDisposed: true,
+            id,
+          }),
+          { headers },
+        );
+        expect(record.headers).toBe(headers);
+      });
+      it(`should respond with the record sent through "send" unwrapped, with its headers, once disposed`, async () => {
+        const flush = () => new Promise(resolve => setImmediate(resolve));
+        const natsMsg = {
+          data: new Uint8Array(),
+          subject: '',
+          sid: +id,
+          respond: vi.fn(),
+          reply: 'test',
+        } as NatsMsg;
+        const publisher = server.getPublisher(natsMsg, id, context);
+        const headers = { key: 'value' };
+        const record = new NatsRecordBuilder({ value: 'test' })
+          .setHeaders(headers)
+          .build();
+
+        server.send(of(record), publisher);
+        await flush();
+
+        expect(natsMsg.respond).toHaveBeenCalledExactlyOnceWith(
+          JSON.stringify({
+            response: { value: 'test' },
+            isDisposed: true,
+            id,
+          }),
+          { headers },
+        );
+      });
     });
     it(`should not call "publish" when replyTo NOT provided`, () => {
       const replyTo = undefined;
-      publisher = server.getPublisher(pub, replyTo, id);
+      const natsMsg = {
+        data: new Uint8Array(),
+        subject: '',
+        reply: replyTo,
+        sid: +id,
+        respond: vi.fn(),
+      } as NatsMsg;
+      const publisher = server.getPublisher(natsMsg, id, context);
 
       const respond = 'test';
       publisher({ respond, id });
-      expect(publisherSpy.notCalled);
+      expect(natsMsg.respond).not.toHaveBeenCalled();
     });
   });
   describe('handleEvent', () => {
     const channel = 'test';
     const data = 'test';
 
-    it('should call handler with expected arguments', () => {
-      const handler = sinon.spy();
-      (server as any).messageHandlers = objectToMap({
+    it('should call handler with expected arguments', async () => {
+      const handler = vi.fn();
+      untypedServer.messageHandlers = objectToMap({
         [channel]: handler,
       });
 
-      server.handleEvent(
+      await server.handleEvent(
         channel,
         { pattern: '', data },
         new BaseRpcContext([]),
       );
-      expect(handler.calledWith(data)).to.be.true;
+      expect(handler).toHaveBeenCalledWith(data, expect.any(BaseRpcContext));
+    });
+  });
+  describe('handleStatusUpdates', () => {
+    it('should retrieve "status()" async iterator', async () => {
+      const serverMock = {
+        status: vi.fn().mockReturnValue({
+          async *[Symbol.asyncIterator]() {},
+        }),
+      };
+      await server.handleStatusUpdates(serverMock as any);
+      expect(serverMock.status).toHaveBeenCalled();
+    });
+
+    it('should log "disconnect" and "error" statuses as "errors"', async () => {
+      const logErrorSpy = vi.spyOn(untypedServer.logger, 'error');
+      const serverMock = {
+        status: vi.fn().mockReturnValue({
+          async *[Symbol.asyncIterator]() {
+            yield { type: 'disconnect' };
+            yield { type: 'error', error: 'Test error' };
+          },
+        }),
+      };
+      await server.handleStatusUpdates(serverMock as any);
+      expect(logErrorSpy).toHaveBeenCalledTimes(2);
+      expect(logErrorSpy).toHaveBeenCalledWith(
+        `NatsError: type: "disconnect".`,
+      );
+      expect(logErrorSpy).toHaveBeenCalledWith(
+        `NatsError: type: "error", error: "Test error".`,
+      );
+    });
+    it('should log other statuses as "logs"', async () => {
+      const logSpy = vi.spyOn(untypedServer.logger, 'log');
+      const serverMock = {
+        status: vi.fn().mockReturnValue({
+          async *[Symbol.asyncIterator]() {
+            yield { type: 'non-disconnect', data: 'localhost' };
+            yield { type: 'warn', data: {} };
+          },
+        }),
+      };
+      await server.handleStatusUpdates(serverMock as any);
+      expect(logSpy).toHaveBeenCalledTimes(2);
+      expect(logSpy).toHaveBeenCalledWith(
+        `NatsStatus: type: "non-disconnect", data: "localhost".`,
+      );
+      expect(logSpy).toHaveBeenCalledWith(
+        `NatsStatus: type: "warn", data: "{}".`,
+      );
+    });
+    it('should log a throwing listener and keep handling statuses', async () => {
+      const error = new Error('listener failed');
+      const logErrorSpy = vi.spyOn(untypedServer.logger, 'error');
+      const reconnectListener = vi.fn();
+      server.on('disconnect', () => {
+        throw error;
+      });
+      server.on('reconnect', reconnectListener);
+      const serverMock = {
+        status: vi.fn().mockReturnValue({
+          async *[Symbol.asyncIterator]() {
+            yield { type: 'disconnect', server: 'localhost' };
+            yield { type: 'reconnect', server: 'localhost' };
+          },
+        }),
+      };
+      await server.handleStatusUpdates(serverMock as any);
+      expect(logErrorSpy).toHaveBeenCalledWith(error);
+      expect(reconnectListener).toHaveBeenCalledWith('localhost');
+    });
+    describe('when the status iterator completes', () => {
+      const createClientMock = () => ({
+        status: vi.fn().mockReturnValue({
+          async *[Symbol.asyncIterator]() {
+            yield { type: 'disconnect', server: 'localhost' };
+            yield { type: 'reconnecting' };
+            yield { type: 'close' };
+          },
+        }),
+        close: vi.fn(),
+      });
+
+      it('should report the server as disconnected and log an error', async () => {
+        const logErrorSpy = vi.spyOn(untypedServer.logger, 'error');
+        const statuses: string[] = [];
+        server.status.subscribe(status => statuses.push(status));
+        const natsClient = createClientMock();
+        untypedServer.natsClient = natsClient;
+
+        await server.handleStatusUpdates(natsClient as any);
+
+        expect(statuses).toEqual([
+          'disconnected',
+          'reconnecting',
+          'disconnected',
+        ]);
+        expect(logErrorSpy).toHaveBeenLastCalledWith(
+          expect.stringContaining('will not be reopened'),
+        );
+      });
+
+      it('should not report a connection that close() closed', async () => {
+        const logErrorSpy = vi.spyOn(untypedServer.logger, 'error');
+        const natsClient = createClientMock();
+        untypedServer.natsClient = natsClient;
+        // nats resolves close() once the status iterator has completed
+        natsClient.close.mockImplementation(() =>
+          server.handleStatusUpdates(natsClient as any),
+        );
+
+        await server.close();
+
+        expect(logErrorSpy).not.toHaveBeenCalledWith(
+          expect.stringContaining('will not be reopened'),
+        );
+      });
     });
   });
 });

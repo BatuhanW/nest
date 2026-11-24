@@ -1,36 +1,90 @@
-import { expect } from 'chai';
-import * as sinon from 'sinon';
-import { ClientTCP } from '../../client/client-tcp';
-import { ERROR_EVENT } from '../../constants';
+import { EventEmitter } from 'events';
+import { Socket as NetSocket } from 'net';
+import { TLSSocket } from 'tls';
+import { ClientTCP } from '../../client/client-tcp.js';
+import { ECONNREFUSED } from '../../constants.js';
+import { TcpStatus } from '../../events/tcp.events.js';
+import { JsonSocket } from '../../helpers/json-socket.js';
+import { TcpSocket } from '../../helpers/tcp-socket.js';
+
+/**
+ * Stands in for a `TcpSocket`, forwarding listeners to an event emitter that
+ * plays the underlying net socket, so connection events can be fired by hand.
+ */
+class FakeTcpSocket {
+  public readonly netSocket = Object.assign(new EventEmitter(), {
+    destroy: vi.fn(),
+  });
+  public readonly connect = vi.fn();
+  public readonly end = vi.fn();
+  public readonly sendMessage = vi.fn();
+
+  public on(event: string, callback: (...args: any[]) => void) {
+    this.netSocket.on(event, callback);
+    return this;
+  }
+}
 
 describe('ClientTCP', () => {
   let client: ClientTCP;
-  let socket;
-  let createSocketStub: sinon.SinonStub;
+  let untypedClient: any;
+  let socket: any;
+  let createSocketStub: ReturnType<typeof vi.fn>;
+
+  describe('when "host", "port" or "socketClass" is empty', () => {
+    it.each([undefined, null, ''])(
+      'should connect to localhost when "host" is %j',
+      host => {
+        const client = new ClientTCP({ host: host as string }) as any;
+        expect(client.host).toBe('localhost');
+      },
+    );
+    it.each([undefined, null])(
+      'should use the default port and JsonSocket for %j',
+      value => {
+        const client = new ClientTCP({
+          port: value as unknown as number,
+          socketClass: value as any,
+        }) as any;
+
+        expect(client.port).toBe(3000);
+        expect(client.socketClass).toBe(JsonSocket);
+      },
+    );
+  });
 
   beforeEach(() => {
     client = new ClientTCP({});
+    untypedClient = client as any;
+
     const onFakeCallback = (event, callback) =>
       event !== 'error' && event !== 'close' && callback({});
 
     socket = {
-      connect: sinon.stub(),
-      on: sinon.stub().callsFake(onFakeCallback),
+      connect: vi.fn(),
+      on: vi.fn().mockImplementation(onFakeCallback),
       netSocket: {
-        addListener: sinon.stub().callsFake(onFakeCallback),
-        removeListener: sinon.spy(),
-        once: sinon.stub().callsFake(onFakeCallback),
+        addListener: vi.fn().mockImplementation(onFakeCallback),
+        removeListener: vi.fn(),
+        once: vi.fn().mockImplementation(onFakeCallback),
       },
-      sendMessage: sinon.spy(),
-      end: sinon.spy(),
+      sendMessage: vi.fn(),
+      end: vi.fn(),
     };
-    createSocketStub = sinon
-      .stub(client, 'createSocket')
-      .callsFake(() => socket);
+    createSocketStub = vi
+      .spyOn(client, 'createSocket')
+      .mockImplementation(() => socket);
   });
   afterEach(() => {
-    createSocketStub.restore();
+    createSocketStub.mockRestore();
   });
+
+  const connectWith = async (fakeSocket: FakeTcpSocket) => {
+    const connectPromise = client.connect();
+    fakeSocket.netSocket.emit('connect');
+    await connectPromise;
+  };
+
   describe('publish', () => {
     let msg;
     beforeEach(() => {
@@ -45,101 +99,183 @@ describe('ClientTCP', () => {
       it('should remove listener from routing map', () => {
         client['publish'](msg, () => ({}))();
 
-        expect(client['routingMap'].size).to.be.eq(0);
+        expect(client['routingMap'].size).toBe(0);
       });
     });
     describe('on error', () => {
       it('should call callback', () => {
-        const callback = sinon.spy();
-        sinon.stub(client, 'assignPacketId' as any).callsFake(() => {
+        const callback = vi.fn();
+        vi.spyOn(client, 'assignPacketId' as any).mockImplementation(() => {
           throw new Error();
         });
         client['publish'](msg, callback);
-        expect(callback.called).to.be.true;
-        expect(callback.getCall(0).args[0].err).to.be.instanceof(Error);
+        expect(callback).toHaveBeenCalled();
+        expect(callback.mock.calls[0][0].err).toBeInstanceOf(Error);
+      });
+
+      it('should not leave the request pending', () => {
+        socket.sendMessage = () => {
+          throw new Error('Send error');
+        };
+
+        client['publish'](msg, vi.fn());
+
+        expect(client['routingMap'].size).toBe(0);
       });
     });
   });
   describe('handleResponse', () => {
-    let callback;
+    let callback: ReturnType<typeof vi.fn>;
     const id = '1';
 
     describe('when disposed', () => {
-      beforeEach(() => {
-        callback = sinon.spy();
+      beforeEach(async () => {
+        callback = vi.fn();
         client['routingMap'].set(id, callback);
-        client.handleResponse({ id, isDisposed: true });
+        await client.handleResponse({ id, isDisposed: true });
       });
       it('should emit disposed callback', () => {
-        expect(callback.called).to.be.true;
-        expect(
-          callback.calledWith({
-            err: undefined,
-            response: undefined,
-            isDisposed: true,
-          }),
-        ).to.be.true;
+        expect(callback).toHaveBeenCalledWith({
+          err: undefined,
+          response: undefined,
+          isDisposed: true,
+        });
       });
     });
     describe('when not disposed', () => {
       let buffer;
-      beforeEach(() => {
+      beforeEach(async () => {
         buffer = { id, err: undefined, response: 'res' };
-        callback = sinon.spy();
+        callback = vi.fn();
         client['routingMap'].set(id, callback);
-        client.handleResponse(buffer);
+        await client.handleResponse(buffer);
       });
       it('should not end server', () => {
-        expect(socket.end.called).to.be.false;
+        expect(socket.end).not.toHaveBeenCalled();
       });
       it('should call callback with error and response data', () => {
-        expect(callback.called).to.be.true;
-        expect(
-          callback.calledWith({
-            err: buffer.err,
-            response: buffer.response,
-          }),
-        ).to.be.true;
+        expect(callback).toHaveBeenCalledWith({
+          err: buffer.err,
+          response: buffer.response,
+        });
+      });
+    });
+    describe('when the deserializer fails', () => {
+      const error = new TypeError('Cannot read properties of undefined');
+      let logError: ReturnType<typeof vi.spyOn>;
+      let callback: ReturnType<typeof vi.fn>;
+
+      beforeEach(() => {
+        logError = vi
+          .spyOn(untypedClient.logger, 'error')
+          .mockImplementation(() => {});
+        callback = vi.fn();
+        client['routingMap'].set('1', callback);
+      });
+
+      it('should log the error and resolve when the deserializer throws', async () => {
+        untypedClient.deserializer = {
+          deserialize: () => {
+            throw error;
+          },
+        };
+
+        await expect(client.handleResponse({})).resolves.toBeUndefined();
+
+        expect(logError).toHaveBeenCalledTimes(1);
+        expect(logError).toHaveBeenCalledWith(
+          `Dropped a response that the deserializer failed on: ${error}`,
+          error.stack,
+        );
+      });
+
+      it('should log the error and resolve when the deserializer rejects', async () => {
+        untypedClient.deserializer = {
+          deserialize: () => Promise.reject(error),
+        };
+
+        await expect(client.handleResponse({})).resolves.toBeUndefined();
+
+        expect(logError).toHaveBeenCalledTimes(1);
+        expect(logError).toHaveBeenCalledWith(
+          `Dropped a response that the deserializer failed on: ${error}`,
+          error.stack,
+        );
+      });
+
+      it('should leave the pending request untouched', async () => {
+        untypedClient.deserializer = {
+          deserialize: () => Promise.reject(error),
+        };
+
+        await client.handleResponse({});
+
+        expect(callback).not.toHaveBeenCalled();
+        expect(client['routingMap'].get('1')).toBe(callback);
+      });
+
+      it('should not report a failing callback as an undecodable response', async () => {
+        const callbackError = new Error('callback failed');
+        callback.mockImplementation(() => {
+          throw callbackError;
+        });
+
+        await expect(
+          client.handleResponse({ id: '1', response: 'res' }),
+        ).rejects.toBe(callbackError);
+
+        expect(logError).not.toHaveBeenCalled();
       });
     });
   });
   describe('connect', () => {
-    let bindEventsSpy: sinon.SinonSpy;
-    let connect$Stub: sinon.SinonStub;
+    let registerConnectListenerSpy: ReturnType<typeof vi.fn>;
+    let registerErrorListenerSpy: ReturnType<typeof vi.fn>;
+    let registerCloseListenerSpy: ReturnType<typeof vi.fn>;
+    let connect$Stub: ReturnType<typeof vi.fn>;
 
     beforeEach(async () => {
-      bindEventsSpy = sinon.spy(client, 'bindEvents');
+      registerConnectListenerSpy = vi.spyOn(client, 'registerConnectListener');
+      registerErrorListenerSpy = vi.spyOn(client, 'registerErrorListener');
+      registerCloseListenerSpy = vi.spyOn(client, 'registerCloseListener');
     });
     afterEach(() => {
-      bindEventsSpy.restore();
+      registerConnectListenerSpy.mockRestore();
+      registerErrorListenerSpy.mockRestore();
+      registerCloseListenerSpy.mockRestore();
     });
     describe('when is not connected', () => {
       beforeEach(async () => {
         client['isConnected'] = false;
         const source = {
-          subscribe: resolve => resolve(),
-          toPromise: () => source,
+          subscribe: ({ complete }) => complete(),
           pipe: () => source,
         };
-        connect$Stub = sinon
-          .stub(client, 'connect$' as any)
-          .callsFake(() => source);
+        connect$Stub = vi
+          .spyOn(client, 'connect$' as any)
+          .mockImplementation(() => source);
         await client.connect();
       });
       afterEach(() => {
-        connect$Stub.restore();
+        connect$Stub.mockRestore();
       });
-      it('should call "bindEvents" once', async () => {
-        expect(bindEventsSpy.called).to.be.true;
+      it('should call "registerConnectListener" once', async () => {
+        expect(registerConnectListenerSpy).toHaveBeenCalled();
+      });
+      it('should call "registerErrorListener" once', async () => {
+        expect(registerErrorListenerSpy).toHaveBeenCalled();
+      });
+      it('should call "registerCloseListener" once', async () => {
+        expect(registerCloseListenerSpy).toHaveBeenCalled();
       });
       it('should call "createSocket" once', async () => {
-        expect(createSocketStub.called).to.be.true;
+        expect(createSocketStub).toHaveBeenCalled();
       });
       it('should call "connect$" once', async () => {
-        expect(connect$Stub.called).to.be.true;
+        expect(connect$Stub).toHaveBeenCalled();
       });
       it('should listen on messages', () => {
-        expect(socket.on.called).to.be.true;
+        expect(socket.on).toHaveBeenCalled();
       });
     });
     describe('when is connected', () => {
@@ -147,55 +283,420 @@ describe('ClientTCP', () => {
         client['isConnected'] = true;
       });
       it('should not call "createSocket"', () => {
-        expect(createSocketStub.called).to.be.false;
+        expect(createSocketStub).not.toHaveBeenCalled();
       });
       it('should not call "bindEvents"', () => {
-        expect(bindEventsSpy.called).to.be.false;
+        expect(registerConnectListenerSpy).not.toHaveBeenCalled();
       });
     });
   });
   describe('close', () => {
+    let routingMap: Map<string, Function>;
+    let callback: ReturnType<typeof vi.fn>;
+
     beforeEach(() => {
-      (client as any).socket = socket;
-      (client as any).isConnected = true;
+      routingMap = new Map<string, Function>();
+      callback = vi.fn();
+      routingMap.set('some id', callback);
+
+      untypedClient.socket = socket;
+      untypedClient.connectedSockets.add(socket);
+      untypedClient.routingMap = routingMap;
       client.close();
     });
-    it('should end() socket', () => {
-      expect(socket.end.called).to.be.true;
+    afterEach(() => {
+      vi.restoreAllMocks();
     });
-    it('should set "isConnected" to false', () => {
-      expect((client as any).isConnected).to.be.false;
+    it('should end() socket', () => {
+      expect(socket.end).toHaveBeenCalled();
+    });
+    it('should destroy a socket that has not connected yet', () => {
+      const pending = new FakeTcpSocket();
+      untypedClient.socket = pending;
+
+      client.close();
+
+      expect(pending.netSocket.destroy).toHaveBeenCalledTimes(1);
+      expect(pending.end).not.toHaveBeenCalled();
     });
     it('should set "socket" to null', () => {
-      expect((client as any).socket).to.be.null;
+      expect(untypedClient.socket).toBeNull();
+    });
+    it('should clear out the routing map', () => {
+      expect(untypedClient.routingMap.size).toBe(0);
+    });
+    it('should call callbacks', () => {
+      expect(callback).toHaveBeenCalledWith({
+        err: expect.objectContaining({ message: 'Connection closed' }),
+      });
+    });
+    it('should fail every pending request when a callback throws', () => {
+      const loggerErrorSpy = vi
+        .spyOn(untypedClient.logger, 'error')
+        .mockImplementation(() => {});
+      const throwingCallback = vi.fn().mockImplementation(() => {
+        throw new Error('Callback error');
+      });
+      let pendingDuringFlush: number | undefined;
+      const otherCallback = vi.fn(() => {
+        pendingDuringFlush = untypedClient.routingMap.size;
+      });
+      untypedClient.routingMap = new Map<string, Function>([
+        ['some id', throwingCallback],
+        ['some other id', otherCallback],
+      ]);
+
+      client.close();
+
+      expect(throwingCallback).toHaveBeenCalledTimes(1);
+      expect(otherCallback).toHaveBeenCalledWith({
+        err: expect.objectContaining({ message: 'Connection closed' }),
+      });
+      expect(loggerErrorSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ message: 'Callback error' }),
+      );
+      expect(pendingDuringFlush).toBe(0);
+      expect(untypedClient.routingMap.size).toBe(0);
     });
   });
-  describe('bindEvents', () => {
+  describe('registerErrorListener', () => {
     it('should bind error event handler', () => {
-      const callback = sinon.stub().callsFake((_, fn) => fn({ code: 'test' }));
+      const callback = vi
+        .fn()
+        .mockImplementation((_, fn) => fn({ code: 'test' }));
       const emitter = {
         on: callback,
       };
-      client.bindEvents(emitter as any);
-      expect(callback.getCall(0).args[0]).to.be.eql(ERROR_EVENT);
+      client.registerErrorListener(emitter as any);
+      expect(callback.mock.calls[0][0]).toEqual('error');
+    });
+  });
+  describe('registerCloseListener', () => {
+    it('should bind close event handler', () => {
+      const callback = vi
+        .fn()
+        .mockImplementation((_, fn) => fn({ code: 'test' }));
+      const emitter = {
+        on: callback,
+      };
+      client.registerCloseListener(emitter as any);
+      expect(callback.mock.calls[0][0]).toEqual('close');
+    });
+  });
+  describe('registerConnectListener', () => {
+    it('should bind connect event handler', () => {
+      const callback = vi
+        .fn()
+        .mockImplementation((_, fn) => fn({ code: 'test' }));
+      const emitter = {
+        on: callback,
+      };
+      client.registerConnectListener(emitter as any);
+      expect(callback.mock.calls[0][0]).toEqual('connect');
+    });
+  });
+  describe('socket lifecycle', () => {
+    let socketA: FakeTcpSocket;
+    let socketB: FakeTcpSocket;
+    let statuses: TcpStatus[];
+
+    beforeEach(() => {
+      socketA = new FakeTcpSocket();
+      socketB = new FakeTcpSocket();
+      createSocketStub
+        .mockReturnValueOnce(socketA as any)
+        .mockReturnValueOnce(socketB as any);
+      statuses = [];
+      client.status.subscribe(status => statuses.push(status));
+    });
+
+    it('should tear down the client when the current socket closes', async () => {
+      await connectWith(socketA);
+      const callback = vi.fn();
+      untypedClient.routingMap.set('pending id', callback);
+
+      socketA.netSocket.emit('close');
+
+      expect(untypedClient.socket).toBeNull();
+      expect(callback).toHaveBeenCalledWith({
+        err: expect.objectContaining({ message: 'Connection closed' }),
+      });
+      expect(statuses).toEqual([TcpStatus.CONNECTED, TcpStatus.DISCONNECTED]);
+    });
+
+    it('should report the disconnection when a closed socket finishes closing', async () => {
+      await connectWith(socketA);
+      client.close();
+
+      socketA.netSocket.emit('close');
+
+      expect(statuses).toEqual([TcpStatus.CONNECTED, TcpStatus.DISCONNECTED]);
+    });
+
+    it('should resolve a connection closed while connecting without reconnecting', async () => {
+      const connectA = client.connect();
+      client.close();
+
+      // close() clears this.socket before the pending connect() tap runs.
+      expect(untypedClient.socket).toBeNull();
+      socketA.netSocket.emit('connect');
+
+      await expect(connectA).resolves.toBeUndefined();
+      expect(socketA.netSocket.destroy).toHaveBeenCalledTimes(1);
+      expect(socketA.end).not.toHaveBeenCalled();
+      expect(socketA.netSocket.listenerCount('message')).toBe(1);
+      expect(untypedClient.socket).toBeNull();
+      expect(untypedClient.connectionPromise).toBeNull();
+      expect(createSocketStub).toHaveBeenCalledTimes(1);
+    });
+
+    it('should reject a pending non-TLS connect when the socket closes before connecting', async () => {
+      const connectA = client.connect();
+      client.close();
+
+      socketA.netSocket.emit('close');
+
+      await expect(connectA).rejects.toThrow('Connection closed');
+      expect(untypedClient.socket).toBeNull();
+      expect(untypedClient.connectionPromise).toBeNull();
+    });
+
+    it('should not emit CONNECTED when a closed socket emits a late connect event', async () => {
+      const connectA = client.connect();
+      client.close();
+
+      socketA.netSocket.emit('connect');
+
+      await expect(connectA).resolves.toBeUndefined();
+      expect(statuses).toEqual([]);
+    });
+
+    describe('when a newer "connect()" call replaced the socket', () => {
+      it('should connect the newer socket when the replaced one closes before it connects', async () => {
+        await connectWith(socketA);
+        client.close();
+        const connectB = client.connect();
+
+        socketA.netSocket.emit('close');
+        socketB.netSocket.emit('connect');
+
+        await expect(connectB).resolves.toBeUndefined();
+        expect(untypedClient.socket).toBe(socketB);
+        expect(untypedClient.connectionPromise).toBe(connectB);
+        expect(socketB.netSocket.listenerCount('message')).toBe(1);
+        expect(statuses).toEqual([TcpStatus.CONNECTED]);
+        expect(client.connect()).toBe(connectB);
+        expect(createSocketStub).toHaveBeenCalledTimes(2);
+      });
+
+      it('should keep the newer socket when the replaced one finishes closing', async () => {
+        await connectWith(socketA);
+        client.close();
+        await connectWith(socketB);
+        const callback = vi.fn();
+        untypedClient.routingMap.set('pending id', callback);
+
+        socketA.netSocket.emit('close');
+
+        expect(untypedClient.socket).toBe(socketB);
+        expect(callback).not.toHaveBeenCalled();
+        expect(untypedClient.routingMap.get('pending id')).toBe(callback);
+
+        await client.connect();
+        expect(createSocketStub).toHaveBeenCalledTimes(2);
+      });
+
+      it('should not report the newer connection as disconnected', async () => {
+        await connectWith(socketA);
+        client.close();
+        await connectWith(socketB);
+
+        socketA.netSocket.emit('error', { code: ECONNREFUSED });
+        socketA.netSocket.emit('close');
+
+        expect(statuses).toEqual([TcpStatus.CONNECTED]);
+      });
+
+      it('should not report the newer connection as connected when the replaced socket connects late', async () => {
+        const connectA = client.connect();
+        client.close();
+        const connectB = client.connect();
+
+        socketA.netSocket.emit('connect');
+        expect(statuses).toEqual([]);
+
+        socketB.netSocket.emit('connect');
+        await Promise.all([connectA, connectB]);
+        expect(statuses).toEqual([TcpStatus.CONNECTED]);
+      });
+
+      it('should not attach the response listener of the replaced socket to the newer one', async () => {
+        const handleResponseSpy = vi
+          .spyOn(client, 'handleResponse')
+          .mockResolvedValue(undefined);
+        const connectA = client.connect();
+        client.close();
+        const connectB = client.connect();
+        socketA.netSocket.emit('connect');
+        socketB.netSocket.emit('connect');
+        await Promise.all([connectA, connectB]);
+
+        const response = { id: 'some id', response: 'res' };
+        socketB.netSocket.emit('message', response);
+
+        expect(handleResponseSpy).toHaveBeenCalledTimes(1);
+        expect(handleResponseSpy).toHaveBeenCalledWith(response);
+      });
     });
   });
   describe('dispatchEvent', () => {
     const msg = { pattern: 'pattern', data: 'data' };
-    let sendMessageStub: sinon.SinonStub, internalSocket;
+    let sendMessageStub: ReturnType<typeof vi.fn>, internalSocket;
 
     beforeEach(() => {
-      sendMessageStub = sinon.stub();
+      sendMessageStub = vi.fn();
       internalSocket = {
         sendMessage: sendMessageStub,
       };
-      (client as any).socket = internalSocket;
+      untypedClient.socket = internalSocket;
     });
 
     it('should publish packet', async () => {
       await client['dispatchEvent'](msg);
 
-      expect(sendMessageStub.called).to.be.true;
+      expect(sendMessageStub).toHaveBeenCalled();
+    });
+  });
+
+  describe('tls', () => {
+    it('should upgrade to TLS', () => {
+      const client = new ClientTCP({ tlsOptions: {} });
+      const jsonSocket = client.createSocket();
+      expect(jsonSocket.socket).toBeInstanceOf(TLSSocket);
+    });
+    it('should not upgrade to TLS, if not requested', () => {
+      const jsonSocket = new ClientTCP({}).createSocket();
+      expect(jsonSocket.socket).toBeInstanceOf(NetSocket);
+    });
+  });
+
+  describe('write backpressure', () => {
+    it('should keep reading replies while its own writes are backed up', () => {
+      const jsonSocket = new ClientTCP({}).createSocket();
+      const netSocket = jsonSocket.netSocket;
+      vi.spyOn(netSocket, 'write').mockReturnValue(false);
+      const pauseSpy = vi.spyOn(netSocket, 'pause');
+      const replies: unknown[] = [];
+      jsonSocket.on('message', message => replies.push(message));
+
+      jsonSocket.sendMessage({ id: '1', pattern: 'sum', data: [1, 2] });
+      const reply = JSON.stringify({ id: '1', response: 3, isDisposed: true });
+      netSocket.emit('data', Buffer.from(`${reply.length}#${reply}`));
+
+      expect(replies).toEqual([{ id: '1', response: 3, isDisposed: true }]);
+      expect(pauseSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('maxBufferSize', () => {
+    const DEFAULT_MAX_BUFFER_SIZE = 16 * 1024 * 1024;
+
+    describe('when maxBufferSize is not provided', () => {
+      it('should use default maxBufferSize', () => {
+        const client = new ClientTCP({});
+        const socket = client.createSocket();
+        expect(socket['maxBufferSize']).toBe(DEFAULT_MAX_BUFFER_SIZE);
+      });
+    });
+
+    describe('when maxBufferSize is provided', () => {
+      it('should use custom maxBufferSize', () => {
+        const customSize = 5000;
+        const client = new ClientTCP({ maxBufferSize: customSize });
+        const socket = client.createSocket();
+        expect(socket['maxBufferSize']).toBe(customSize);
+      });
+
+      it('should pass maxBufferSize to JsonSocket', () => {
+        const customSize = 10000;
+        const client = new ClientTCP({ maxBufferSize: customSize });
+        const socket = client.createSocket();
+        expect(socket['maxBufferSize']).toBe(customSize);
+      });
+    });
+
+    describe('when custom socketClass is provided', () => {
+      it('should not pass maxBufferSize to custom socket class', () => {
+        class CustomSocket extends TcpSocket {
+          constructor(socket: any) {
+            super(socket);
+          }
+          protected handleSend() {}
+          protected handleData() {}
+        }
+
+        const client = new ClientTCP({
+          socketClass: CustomSocket as any,
+          maxBufferSize: 5000,
+        });
+        const socket = client.createSocket();
+        expect(socket).toBeInstanceOf(CustomSocket);
+        // Custom socket should not have maxBufferSize property
+        expect(socket['maxBufferSize']).toBeUndefined();
+      });
+    });
+  });
+
+  describe('on', () => {
+    let firstSocket: FakeTcpSocket;
+    let secondSocket: FakeTcpSocket;
+
+    beforeEach(() => {
+      firstSocket = new FakeTcpSocket();
+      secondSocket = new FakeTcpSocket();
+      createSocketStub
+        .mockReturnValueOnce(firstSocket as any)
+        .mockReturnValueOnce(secondSocket as any);
+    });
+
+    it('should attach a listener registered before "connect()" to the sockets of later reconnects', async () => {
+      const callback = vi.fn();
+      client.on('close', callback);
+
+      await connectWith(firstSocket);
+      firstSocket.netSocket.emit('close');
+      await connectWith(secondSocket);
+      secondSocket.netSocket.emit('close');
+
+      expect(callback).toHaveBeenCalledTimes(2);
+    });
+
+    it('should attach a listener registered after "connect()" to the sockets of later reconnects', async () => {
+      await connectWith(firstSocket);
+      const callback = vi.fn();
+      client.on('close', callback);
+
+      firstSocket.netSocket.emit('close');
+      expect(callback).toHaveBeenCalledTimes(1);
+
+      await connectWith(secondSocket);
+      secondSocket.netSocket.emit('close');
+      expect(callback).toHaveBeenCalledTimes(2);
+    });
+
+    it('should drop the listeners on "close()"', async () => {
+      const callback = vi.fn();
+      client.on('close', callback);
+
+      await connectWith(firstSocket);
+      client.close();
+      firstSocket.netSocket.emit('close');
+      expect(callback).toHaveBeenCalledTimes(1);
+
+      await connectWith(secondSocket);
+      secondSocket.netSocket.emit('close');
+
+      expect(callback).toHaveBeenCalledTimes(1);
     });
   });
 });

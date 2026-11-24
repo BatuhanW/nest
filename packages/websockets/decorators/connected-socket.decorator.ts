@@ -1,6 +1,9 @@
-import { WsParamtype } from '../enums/ws-paramtype.enum';
-import { createWsParamDecorator } from '../utils/param.utils';
+import { WsParamtype } from '../enums/ws-paramtype.enum.js';
+import { createWsParamDecorator } from '../utils/param.utils.js';
 
+/**
+ * @publicApi
+ */
 export const ConnectedSocket: () => ParameterDecorator = createWsParamDecorator(
   WsParamtype.SOCKET,
 );

@@ -1,7 +1,6 @@
-import { Provider, Scope } from '@nestjs/common';
-import { REQUEST } from './request-constants';
+import { type Provider, Scope } from '@nestjs/common';
+import { REQUEST } from './request-constants.js';
 
-// eslint-disable-next-line @typescript-eslint/no-empty-function
 const noop = () => {};
 export const requestProvider: Provider = {
   provide: REQUEST,

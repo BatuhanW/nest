@@ -1,9 +1,12 @@
-import { BaseRpcContext } from '../ctx-host/base-rpc.context';
-import { RequestContext } from '../interfaces';
+import { BaseRpcContext } from '../ctx-host/base-rpc.context.js';
+import { RequestContext } from '../interfaces/index.js';
 
+/**
+ * @publicApi
+ */
 export class RequestContextHost<
   TData = any,
-  TContext extends BaseRpcContext = any
+  TContext extends BaseRpcContext = any,
 > implements RequestContext<TData> {
   constructor(
     public readonly pattern: string | Record<string, any>,

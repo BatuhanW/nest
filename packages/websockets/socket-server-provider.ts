@@ -1,67 +1,200 @@
-import { addLeadingSlash } from '@nestjs/common/utils/shared.utils';
-import { ApplicationConfig } from '@nestjs/core/application-config';
-import { isString } from 'util';
-import { GatewayMetadata } from './interfaces/gateway-metadata.interface';
-import { SocketEventsHost } from './interfaces/socket-events-host.interface';
-import { SocketEventsHostFactory } from './socket-events-host-factory';
-import { SocketsContainer } from './sockets-container';
+import { AbstractWsAdapter } from './adapters/ws-adapter.js';
+import { ServerAndEventStreamsFactory } from './factories/server-and-event-streams-factory.js';
+import { GatewayMetadata } from './interfaces/gateway-metadata.interface.js';
+import { ServerAndEventStreamsHost } from './interfaces/server-and-event-streams-host.interface.js';
+import { SocketsContainer } from './sockets-container.js';
+import { Logger } from '@nestjs/common';
+import {
+  addLeadingSlash,
+  isFunction,
+  isNil,
+  isString,
+} from '@nestjs/common/internal';
+import type { ApplicationConfig } from '@nestjs/core';
+import { isDeepStrictEqual } from 'util';
+
+// The options that decide whether a client may connect at all. They are
+// options of the server, which gateways on the same port and path share.
+const CONNECTION_CHECKS = ['verifyClient', 'allowRequest'];
+// The options of a gateway that are not options of its server
+const GATEWAY_KEYS = ['namespace', 'path', 'server'];
 
 export class SocketServerProvider {
+  private readonly logger = new Logger(SocketServerProvider.name);
+  // The options of the gateway each server was created for
+  private readonly serverOptions = new WeakMap<
+    ServerAndEventStreamsHost,
+    Record<string, unknown>
+  >();
+
   constructor(
     private readonly socketsContainer: SocketsContainer,
     private readonly applicationConfig: ApplicationConfig,
+    private readonly hasHttpServer = true,
   ) {}
 
-  public scanForSocketServer<T extends GatewayMetadata>(
+  public scanForSocketServer<T extends GatewayMetadata = any>(
     options: T,
     port: number,
-  ): SocketEventsHost {
-    const socketEventsHost = this.socketsContainer.getSocketEventsHostByPort(
+    gatewayName?: string,
+  ): ServerAndEventStreamsHost {
+    const serverAndStreamsHost = this.socketsContainer.getOneByConfig({
       port,
-    );
-    return socketEventsHost
-      ? this.createWithNamespace(options, port, socketEventsHost)
-      : this.createSocketServer(options, port);
+      path: options.path,
+    });
+    if (serverAndStreamsHost) {
+      this.ensureOptionsApply(options, port, serverAndStreamsHost, gatewayName);
+    }
+    if (serverAndStreamsHost && options.namespace) {
+      return this.decorateWithNamespace(
+        options,
+        port,
+        serverAndStreamsHost.server,
+      );
+    }
+    return serverAndStreamsHost
+      ? serverAndStreamsHost
+      : this.createSocketServer(options, port, gatewayName);
   }
 
   private createSocketServer<T extends GatewayMetadata>(
     options: T,
     port: number,
-  ): SocketEventsHost {
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    const { namespace, server, ...partialOptions } = options as any;
+    gatewayName?: string,
+  ): ServerAndEventStreamsHost {
     const adapter = this.applicationConfig.getIoAdapter();
-    const ioServer = adapter.create(port, partialOptions);
-    const observableSocket = SocketEventsHostFactory.create(ioServer);
+    const { namespace, server, ...partialOptions } = options as Record<
+      string,
+      unknown
+    >;
+    let ioServer: unknown;
+    if (this.isServedWithoutListener(port, adapter)) {
+      // An adapter would otherwise listen on a port of the kernel's choosing,
+      // on every interface
+      this.logger.log(
+        `${gatewayName ?? 'A gateway'} has no port, and there is no HTTP server to serve it on, so its server does not listen for clients. Give it a port of its own to serve clients from this process.`,
+      );
+      ioServer = adapter.createWithoutListener(partialOptions);
+    } else {
+      ioServer = adapter.create(port, partialOptions);
+    }
+    const serverAndEventStreamsHost =
+      ServerAndEventStreamsFactory.create(ioServer);
 
-    this.socketsContainer.addSocketEventsHost(null, port, observableSocket);
-    return this.createWithNamespace(options, port, observableSocket);
+    this.socketsContainer.addOne(
+      { port, path: options.path },
+      serverAndEventStreamsHost,
+    );
+    this.serverOptions.set(
+      serverAndEventStreamsHost,
+      options as Record<string, unknown>,
+    );
+    if (!namespace) {
+      return serverAndEventStreamsHost;
+    }
+    return this.decorateWithNamespace(options, port, ioServer);
   }
 
-  private createWithNamespace<T extends GatewayMetadata>(
+  private isServedWithoutListener(
+    port: number,
+    adapter: unknown,
+  ): adapter is AbstractWsAdapter & {
+    createWithoutListener: NonNullable<
+      AbstractWsAdapter['createWithoutListener']
+    >;
+  } {
+    return (
+      port === 0 &&
+      !this.hasHttpServer &&
+      adapter instanceof AbstractWsAdapter &&
+      !adapter['httpServer'] &&
+      isFunction(adapter.createWithoutListener)
+    );
+  }
+
+  /**
+   * A gateway that joins a server created for another gateway is served with
+   * the options of that gateway. A connection check of its own would never
+   * run, and every client would reach its handlers, so the application does
+   * not start. Other options it would lose are reported.
+   */
+  private ensureOptionsApply(
+    options: Record<string, any>,
+    port: number,
+    host: ServerAndEventStreamsHost,
+    gatewayName?: string,
+  ) {
+    const serverOptions = this.serverOptions.get(host);
+    if (!serverOptions) {
+      return;
+    }
+    const gateway = gatewayName ? `The gateway ${gatewayName}` : 'A gateway';
+    const server = `the server on port ${port}${options.path ? ` and the path "${options.path}"` : ''}`;
+    for (const key of CONNECTION_CHECKS) {
+      if (!isNil(options[key]) && options[key] !== serverOptions[key]) {
+        const error = new Error(
+          `${gateway} sets "${key}", but shares ${server} with a gateway declared before it, and the server runs ${isNil(serverOptions[key]) ? 'no' : 'the'} "${key}" of that gateway. Set the same "${key}" on the gateway declared first, or give the gateway a port or path of its own.`,
+        );
+        this.logger.error(error);
+        throw error;
+      }
+    }
+    const droppedOptions = Object.keys(options).filter(
+      key =>
+        !GATEWAY_KEYS.includes(key) &&
+        !CONNECTION_CHECKS.includes(key) &&
+        !isDeepStrictEqual(options[key], serverOptions[key]),
+    );
+    if (droppedOptions.length > 0) {
+      this.logger.warn(
+        `${gateway} shares ${server} with a gateway declared before it, and the server was created with the options of that gateway, so these options of its own are not applied: ${droppedOptions.map(key => `"${key}"`).join(', ')}.`,
+      );
+    }
+  }
+
+  private decorateWithNamespace<T extends GatewayMetadata = any>(
     options: T,
     port: number,
-    socketEventsHost: SocketEventsHost,
-  ): SocketEventsHost {
-    const { namespace } = options;
-    if (!namespace) {
-      return socketEventsHost;
+    targetServer: unknown,
+  ): ServerAndEventStreamsHost {
+    // Gateways on the same namespace share one host, and with it the streams
+    // of connections and disconnections, as gateways sharing a server do.
+    // socket.io also serves a RegExp namespace from the first parent namespace
+    // created for it, so a second one would never get a connection.
+    const namespaceConfig = {
+      port,
+      path: options.path,
+      namespace: this.validateNamespace(options.namespace || ''),
+    };
+    const namespaceHost = this.socketsContainer.getOneByConfig(namespaceConfig);
+    if (namespaceHost) {
+      return namespaceHost;
     }
     const namespaceServer = this.getServerOfNamespace(
       options,
       port,
-      socketEventsHost.server,
+      targetServer,
     );
-    const eventsHost = SocketEventsHostFactory.create(namespaceServer);
-    this.socketsContainer.addSocketEventsHost(namespace, port, eventsHost);
-    return eventsHost;
+    const serverAndEventStreamsHost =
+      ServerAndEventStreamsFactory.create(namespaceServer);
+    // "/" is the namespace of the gateways without one, so a gateway on it
+    // shares their streams too, while it keeps the namespace as its server
+    const rootHost =
+      namespaceConfig.namespace === '/'
+        ? this.socketsContainer.getOneByConfig({ port, path: options.path })
+        : undefined;
+    if (rootHost) {
+      serverAndEventStreamsHost.connection = rootHost.connection;
+      serverAndEventStreamsHost.disconnect = rootHost.disconnect;
+    }
+    this.socketsContainer.addOne(namespaceConfig, serverAndEventStreamsHost);
+    return serverAndEventStreamsHost;
   }
 
-  private getServerOfNamespace<TOptions extends GatewayMetadata, TServer = any>(
-    options: TOptions,
-    port: number,
-    server: TServer,
-  ) {
+  private getServerOfNamespace<
+    TOptions extends GatewayMetadata = any,
+    TServer = any,
+  >(options: TOptions, port: number, server: TServer) {
     const adapter = this.applicationConfig.getIoAdapter();
     return adapter.create(port, {
       ...options,

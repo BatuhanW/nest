@@ -1,32 +1,242 @@
-import { RequestMethod } from '@nestjs/common';
 import {
-  CorsOptions,
-  CorsOptionsDelegate,
-} from '@nestjs/common/interfaces/external/cors-options.interface';
-import { NestApplicationOptions } from '@nestjs/common/interfaces/nest-application-options.interface';
-import { isFunction, isNil, isObject } from '@nestjs/common/utils/shared.utils';
-import { AbstractHttpAdapter } from '@nestjs/core/adapters/http-adapter';
-import { RouterMethodFactory } from '@nestjs/core/helpers/router-method-factory';
-import * as bodyParser from 'body-parser';
-import * as cors from 'cors';
-import * as express from 'express';
+  BadRequestException,
+  HttpException,
+  HttpStatus,
+  InternalServerErrorException,
+  Logger,
+  type RequestMethod,
+  StreamableFile,
+  VERSION_NEUTRAL,
+  type VersioningOptions,
+  VersioningType,
+} from '@nestjs/common';
+import cors from 'cors';
+import express from 'express';
+import type { Server } from 'http';
 import * as http from 'http';
 import * as https from 'https';
-import { ServeStaticOptions } from '../interfaces/serve-static-options.interface';
+import { pathToRegexp } from 'path-to-regexp';
+import { Duplex, Readable, Transform, Writable } from 'stream';
+import { types } from 'util';
+import type { NestExpressApplication } from '../interfaces/nest-express-application.interface.js';
+import {
+  NestExpressBodyParserOptionsFor,
+  NestExpressBodyParserType,
+} from '../interfaces/nest-express-body-parser.interface.js';
+import { ServeStaticOptions } from '../interfaces/serve-static-options.interface.js';
+import { getBodyParserOptions } from './utils/get-body-parser-options.util.js';
+import { getMediaTypeVersion } from './utils/get-media-type-version.util.js';
+import { onResponseClose } from './utils/on-response-close.util.js';
+import {
+  type CorsOptions,
+  type CorsOptionsDelegate,
+  type RouteInfo,
+  type VersionValue,
+  addLeadingSlash,
+  isFunction,
+  isNil,
+  isObject,
+  isString,
+  isUndefined,
+  stripEndSlash,
+} from '@nestjs/common/internal';
+import type { NestApplicationOptions } from '@nestjs/common';
+import { AbstractHttpAdapter } from '@nestjs/core';
+import {
+  RouterMethodFactory,
+  LegacyRouteConverter,
+} from '@nestjs/core/internal';
 
-export class ExpressAdapter extends AbstractHttpAdapter {
+type VersionedRoute = <
+  TRequest extends Record<string, any> = any,
+  TResponse = any,
+>(
+  req: TRequest,
+  res: TResponse,
+  next: () => void,
+) => any;
+
+// Covers "application/json" and the "+json" structured syntax suffix (RFC 6839),
+// e.g. "application/problem+json", with or without parameters.
+function isJsonContentType(contentType: string): boolean {
+  const mediaType = contentType.split(';')[0].trim().toLowerCase();
+  return (
+    mediaType.startsWith('application/json') || mediaType.endsWith('+json')
+  );
+}
+
+/**
+ * @publicApi
+ */
+export class ExpressAdapter extends AbstractHttpAdapter<
+  http.Server | https.Server
+> {
+  declare protected readonly __nestApplicationType: NestExpressApplication;
   private readonly routerMethodFactory = new RouterMethodFactory();
+  private readonly logger = new Logger(ExpressAdapter.name);
+  private readonly openConnections = new Set<Duplex>();
+  private readonly registeredPrefixes = new Set<string>();
+  private isShuttingDown = false;
+  private onRequestHook?: (
+    req: express.Request,
+    res: express.Response,
+    done: (err?: Error) => void,
+  ) => Promise<void> | void;
+  private onResponseHook?: (
+    req: express.Request,
+    res: express.Response,
+  ) => Promise<void> | void;
 
   constructor(instance?: any) {
     super(instance || express());
+    this.instance!.use((req, res, next) => {
+      if (this.onResponseHook) {
+        res.on('finish', async () => {
+          try {
+            await this.onResponseHook!.apply(this, [req, res]);
+          } catch (err) {
+            this.logger.error(err);
+          }
+        });
+      }
+
+      if (this.onRequestHook) {
+        this.runRequestHook(req, res, next);
+      } else {
+        next();
+      }
+    });
+  }
+
+  private runRequestHook(
+    req: express.Request,
+    res: express.Response,
+    next: express.NextFunction,
+  ): void {
+    let completed = false;
+    const doneOnce = (err?: unknown) => {
+      if (completed) {
+        if (err) {
+          this.logger.error(err);
+        }
+        return;
+      }
+      completed = true;
+      next(err);
+    };
+
+    try {
+      // Not returned to Express: rejections share the once-guard with done()
+      const result = this.onRequestHook!.call(this, req, res, doneOnce);
+      if (result && typeof result.then === 'function') {
+        result.then(undefined, err =>
+          doneOnce(err || new Error('Request hook failed')),
+        );
+      }
+    } catch (err) {
+      doneOnce(err || new Error('Request hook failed'));
+    }
+  }
+
+  /**
+   * Registers a request hook. Call `done()` to continue processing the request;
+   * resolving the returned promise does not continue it. Only the first
+   * completion is forwarded to Express. Errors after `done()` are logged
+   * without advancing the request again.
+   */
+  public setOnRequestHook(
+    onRequestHook: (
+      req: express.Request,
+      res: express.Response,
+      done: (err?: Error) => void,
+    ) => Promise<void> | void,
+  ) {
+    this.onRequestHook = onRequestHook;
+  }
+
+  /**
+   * Registers a hook to run after the response has been sent.
+   * Thrown errors and rejected promises are logged.
+   */
+  public setOnResponseHook(
+    onResponseHook: (
+      req: express.Request,
+      res: express.Response,
+    ) => Promise<void> | void,
+  ) {
+    this.onResponseHook = onResponseHook;
   }
 
   public reply(response: any, body: any, statusCode?: number) {
-    if (statusCode) {
+    if (!isNil(statusCode)) {
       response.status(statusCode);
     }
     if (isNil(body)) {
       return response.send();
+    }
+    if (body instanceof StreamableFile) {
+      // A stream that failed before the reply (e.g. while an interceptor
+      // awaited) has already emitted its 'error' event.
+      const { errored } = body.getStream();
+      if (errored) {
+        return body.errorHandler(errored, response);
+      }
+      this.applyStreamHeaders(response, body);
+      const stream = body.getStream();
+      stream.once('error', err => {
+        this.handleStreamError(body, err, response);
+      });
+      // pipe() leaves the source open when the client disconnects early,
+      // also before reply() runs ("close" has already fired by then), or
+      // while the response waits behind others pipelined on the connection
+      onResponseClose(response, () => {
+        if (!stream.readableEnded) {
+          stream.destroy();
+        }
+      });
+      // Node discards the body of a HEAD response without ever applying
+      // backpressure, so piping would read the whole source. The response
+      // ends once the source is readable or has ended instead, which still
+      // leaves an error opening it (e.g. a missing file) to the error handler.
+      if (response.req?.method === 'HEAD') {
+        const end = () => response.end();
+        if (stream.readableEnded) {
+          end();
+        } else {
+          stream.once('readable', end).once('end', end);
+        }
+        return response.on('error', (err: Error) => body.errorLogger(err));
+      }
+      return this.toWritableChunks(stream)
+        .pipe<Writable>(response)
+        .on('error', (err: Error) => body.errorLogger(err));
+    }
+    // response.json() serializes the enumerable properties of an Error, e.g.
+    // the request config of an HTTP client error.
+    if (
+      body instanceof Error &&
+      response.statusCode >= HttpStatus.BAD_REQUEST
+    ) {
+      body = {
+        statusCode: response.statusCode,
+        message: http.STATUS_CODES[response.statusCode] ?? 'Error',
+      };
+    }
+    const responseContentType = response.getHeader('Content-Type');
+    if (
+      typeof responseContentType === 'string' &&
+      !isJsonContentType(responseContentType) &&
+      (body?.statusCode >= HttpStatus.BAD_REQUEST ||
+        // A custom error body (e.g. "new HttpException({ ... }, 404)") need
+        // not have a "statusCode" of its own
+        (isObject(body) &&
+          !isNil(statusCode) &&
+          statusCode >= HttpStatus.BAD_REQUEST))
+    ) {
+      this.logger.warn(
+        "Content-Type doesn't match Reply body, you might need a custom ExceptionFilter for non-JSON responses",
+      );
+      response.setHeader('Content-Type', 'application/json');
     }
     return isObject(body) ? response.json(body) : response.send(String(body));
   }
@@ -35,8 +245,16 @@ export class ExpressAdapter extends AbstractHttpAdapter {
     return response.status(statusCode);
   }
 
+  public end(response: any, message?: string) {
+    return response.end(message);
+  }
+
   public render(response: any, view: string, options: any) {
-    return response.render(view, options);
+    // res.render() assigns "_locals" (the res.locals of this request) to the
+    // object it is given. Here that is the value the handler returned, which
+    // may outlive the request (e.g. a cached view model). The view gets the
+    // same variables from a copy, as app.render() spreads them anyway.
+    return response.render(view, isObject(options) ? { ...options } : options);
   }
 
   public redirect(response: any, statusCode: number, url: string) {
@@ -44,24 +262,114 @@ export class ExpressAdapter extends AbstractHttpAdapter {
   }
 
   public setErrorHandler(handler: Function, prefix?: string) {
+    const normalizedPrefix = this.normalizePrefix(prefix);
+    if (normalizedPrefix) {
+      const router = express.Router();
+      router.use(handler as any);
+      this.use(normalizedPrefix, router);
+    }
+    // Always mount the error handler at the root as well, so routes living
+    // outside the global prefix (e.g. "setGlobalPrefix" exclusions or
+    // root-mounted routes) still pass through the exception layer.
     return this.use(handler);
   }
 
-  public setNotFoundHandler(handler: Function, prefix?: string) {
-    return this.use(handler);
+  public setNotFoundHandler(
+    handler: Function,
+    prefix?: string,
+    excludedRoutes?: RouteInfo[],
+  ) {
+    const normalizedPrefix = this.normalizePrefix(prefix);
+    if (normalizedPrefix) {
+      this.registeredPrefixes.add(normalizedPrefix);
+      const router = express.Router();
+      router.all('*path', handler as any);
+      this.use(normalizedPrefix, router);
+      // Excluded routes live at the root, out of the prefix router's reach.
+      // Mount the handler on each exact path, for every method, so a method
+      // miss there (`POST /hello` with only `GET /hello`) still reaches the
+      // exception layer. Not `use(path, router)`: a subtree mount would claim
+      // a raw `/hello/live` added after `init()`; a wildcard exclusion covers
+      // its subtree through its own pattern.
+      for (const route of excludedRoutes ?? []) {
+        this.instance.all(addLeadingSlash(route.path), handler as any);
+      }
+      return;
+    }
+    return this.use(
+      (
+        req: express.Request,
+        res: express.Response,
+        next: express.NextFunction,
+      ) => {
+        // When multiple apps share this adapter, a non-prefixed app's 404
+        // handler may be registered before a prefixed app's routes. Skip
+        // requests whose path belongs to another app's prefix so they can
+        // reach the correct route handlers further in the stack.
+        const path = req.originalUrl.split(/[?#]/)[0];
+        for (const registeredPrefix of this.registeredPrefixes) {
+          // Match on full path segments only, so a prefix of "/api" does not
+          // swallow unrelated paths such as "/apiary".
+          if (
+            path === registeredPrefix ||
+            path.startsWith(`${registeredPrefix}/`)
+          ) {
+            return next();
+          }
+        }
+        return (handler as any)(req, res, next);
+      },
+    );
+  }
+
+  public isHeadersSent(response: any): boolean {
+    return response.headersSent;
+  }
+
+  public getHeader(response: any, name: string) {
+    return response.get(name);
   }
 
   public setHeader(response: any, name: string, value: string) {
     return response.set(name, value);
   }
 
-  public listen(port: string | number, callback?: () => void);
-  public listen(port: string | number, hostname: string, callback?: () => void);
-  public listen(port: any, ...args: any[]) {
+  public appendHeader(response: any, name: string, value: string) {
+    return response.append(name, value);
+  }
+
+  public normalizePath(path: string): string {
+    try {
+      const convertedPath = LegacyRouteConverter.tryConvert(path);
+      // Call "pathToRegexp" to trigger a TypeError if the path is invalid
+      pathToRegexp(convertedPath);
+      return convertedPath;
+    } catch (e) {
+      if (e instanceof TypeError) {
+        LegacyRouteConverter.printError(path);
+      }
+      throw e;
+    }
+  }
+
+  public listen(port: string | number, callback?: () => void): Server;
+  public listen(
+    port: string | number,
+    hostname: string,
+    callback?: () => void,
+  ): Server;
+  public listen(port: any, ...args: any[]): Server {
     return this.httpServer.listen(port, ...args);
   }
 
+  public beforeClose() {
+    this.isShuttingDown = true;
+  }
+
   public close() {
+    this.isShuttingDown = true;
+    this.closeOpenConnections();
+
     if (!this.httpServer) {
       return undefined;
     }
@@ -112,37 +420,104 @@ export class ExpressAdapter extends AbstractHttpAdapter {
   }
 
   public enableCors(options: CorsOptions | CorsOptionsDelegate<any>) {
-    return this.use(cors(options));
+    return this.use(cors(options as any));
   }
 
   public createMiddlewareFactory(
     requestMethod: RequestMethod,
   ): (path: string, callback: Function) => any {
-    return this.routerMethodFactory
-      .get(this.instance, requestMethod)
-      .bind(this.instance);
+    return (path: string, callback: Function) => {
+      try {
+        // The core marks an exact-match path with a trailing "$" (e.g. "/api$").
+        // Express 5 reads "$" literally and "use()" matches by prefix, so strip
+        // the marker and register the path as an exact "all()" route instead.
+        const isExactPath = path.endsWith('$');
+        const convertedPath = LegacyRouteConverter.tryConvert(
+          isExactPath ? path.slice(0, -1) : path,
+        );
+        let router = this.routerMethodFactory.get(this.instance, requestMethod);
+        if (isExactPath && router === this.instance.use) {
+          router = this.instance.all;
+        }
+        // Express routes are not strict by default, so "/api" also matches
+        // "/api/", which the wildcard path registered next to it may match too
+        // ("/api/{*path}" does, "/api/*path" does not). The core runs the
+        // middleware for the first of its paths that matches a request only.
+        // With "strict routing", the router serves a route the core passes
+        // with a trailing slash (the root route of a controller, "/users/")
+        // without it ("/users"), so the path is registered without it too.
+        if (
+          this.instance.router?.strict &&
+          convertedPath.length > 1 &&
+          convertedPath.endsWith('/')
+        ) {
+          router.call(this.instance, stripEndSlash(convertedPath), callback);
+        }
+        return router.call(this.instance, convertedPath, callback);
+      } catch (e) {
+        if (e instanceof TypeError) {
+          LegacyRouteConverter.printError(path);
+        }
+        throw e;
+      }
+    };
   }
 
   public initHttpServer(options: NestApplicationOptions) {
     const isHttpsEnabled = options && options.httpsOptions;
     if (isHttpsEnabled) {
       this.httpServer = https.createServer(
-        options.httpsOptions,
+        options.httpsOptions!,
         this.getInstance(),
       );
-      return;
+    } else {
+      this.httpServer = http.createServer(this.getInstance());
     }
-    this.httpServer = http.createServer(this.getInstance());
+
+    if (options?.return503OnClosing) {
+      this.instance.use((req: any, res: any, next: any) => {
+        if (this.isShuttingDown) {
+          res.set('Connection', 'close');
+          res.status(503).send('Service Unavailable');
+        } else {
+          next();
+        }
+      });
+    }
+
+    if (options?.forceCloseConnections) {
+      this.trackOpenConnections();
+    }
   }
 
-  public registerParserMiddleware() {
+  public registerParserMiddleware(prefix?: string, rawBody?: boolean) {
+    const bodyParserJsonOptions = getBodyParserOptions('json', rawBody!);
+    const bodyParserUrlencodedOptions = getBodyParserOptions(
+      'urlencoded',
+      rawBody!,
+      { extended: true },
+    );
+
     const parserMiddleware = {
-      jsonParser: bodyParser.json(),
-      urlencodedParser: bodyParser.urlencoded({ extended: true }),
+      jsonParser: express.json(bodyParserJsonOptions),
+      urlencodedParser: express.urlencoded(bodyParserUrlencodedOptions),
     };
     Object.keys(parserMiddleware)
       .filter(parser => !this.isMiddlewareApplied(parser))
       .forEach(parserKey => this.use(parserMiddleware[parserKey]));
+  }
+
+  public useBodyParser<ParserType extends NestExpressBodyParserType>(
+    type: ParserType,
+    rawBody: boolean,
+    options?: NestExpressBodyParserOptionsFor<ParserType>,
+  ): this {
+    const parserOptions = getBodyParserOptions(type, rawBody, options);
+    const parser = express[type](parserOptions);
+
+    this.use(parser);
+
+    return this;
   }
 
   public setLocal(key: string, value: any) {
@@ -154,15 +529,338 @@ export class ExpressAdapter extends AbstractHttpAdapter {
     return 'express';
   }
 
+  public isRouteOrderSensitive(): boolean {
+    return true;
+  }
+
+  // The return type is spelled out (rather than "RouteMatchingOptions") so
+  // that the declarations still compile against an older "@nestjs/common"
+  public getRouteMatchingOptions(): {
+    caseSensitive: boolean;
+    ignoreTrailingSlash: boolean;
+  } {
+    // Routes are registered on the application router, which takes the
+    // "case sensitive routing" and "strict routing" settings in effect when
+    // it is created and ignores later changes
+    const router = this.getInstance().router;
+    return {
+      caseSensitive: !!router?.caseSensitive,
+      ignoreTrailingSlash: !router?.strict,
+    };
+  }
+
+  public applyVersionFilter(
+    handler: Function,
+    version: VersionValue,
+    versioningOptions: VersioningOptions,
+  ): VersionedRoute {
+    const callNextHandler: VersionedRoute = (req, res, next) => {
+      if (!next) {
+        throw new InternalServerErrorException(
+          'HTTP adapter does not support filtering on version',
+        );
+      }
+      return next();
+    };
+
+    if (
+      version === VERSION_NEUTRAL ||
+      // URL Versioning is done via the path, so the filter continues forward
+      versioningOptions.type === VersioningType.URI
+    ) {
+      const handlerForNoVersioning: VersionedRoute = (req, res, next) =>
+        handler(req, res, next);
+
+      return handlerForNoVersioning;
+    }
+
+    // Custom Extractor Versioning Handler
+    if (versioningOptions.type === VersioningType.CUSTOM) {
+      const handlerForCustomVersioning: VersionedRoute = (req, res, next) => {
+        const extractedVersion = versioningOptions.extractor(req);
+
+        if (Array.isArray(version)) {
+          if (
+            Array.isArray(extractedVersion) &&
+            version.filter(v => extractedVersion.includes(v as string)).length
+          ) {
+            return handler(req, res, next);
+          }
+
+          if (
+            isString(extractedVersion) &&
+            version.includes(extractedVersion)
+          ) {
+            return handler(req, res, next);
+          }
+        } else if (isString(version)) {
+          // Known bug here - if there are multiple versions supported across separate
+          // handlers/controllers, we can't select the highest matching handler.
+          // Since this code is evaluated per-handler, then we can't see if the highest
+          // specified version exists in a different handler.
+          if (
+            Array.isArray(extractedVersion) &&
+            extractedVersion.includes(version)
+          ) {
+            return handler(req, res, next);
+          }
+
+          if (isString(extractedVersion) && version === extractedVersion) {
+            return handler(req, res, next);
+          }
+        }
+
+        return callNextHandler(req, res, next);
+      };
+
+      return handlerForCustomVersioning;
+    }
+
+    // Media Type (Accept Header) Versioning Handler
+    if (versioningOptions.type === VersioningType.MEDIA_TYPE) {
+      const handlerForMediaTypeVersioning: VersionedRoute = (
+        req,
+        res,
+        next,
+      ) => {
+        const MEDIA_TYPE_HEADER = 'Accept';
+        const acceptHeaderValue: string | string[] | undefined =
+          req.headers?.[MEDIA_TYPE_HEADER] ||
+          req.headers?.[MEDIA_TYPE_HEADER.toLowerCase()];
+
+        const headerVersion = getMediaTypeVersion(
+          acceptHeaderValue,
+          versioningOptions.key,
+        );
+
+        // No version was supplied
+        if (isUndefined(headerVersion)) {
+          if (Array.isArray(version)) {
+            if (version.includes(VERSION_NEUTRAL)) {
+              return handler(req, res, next);
+            }
+          }
+        } else {
+          if (Array.isArray(version)) {
+            if (version.includes(headerVersion)) {
+              return handler(req, res, next);
+            }
+          } else if (isString(version)) {
+            if (version === headerVersion) {
+              return handler(req, res, next);
+            }
+          }
+        }
+
+        return callNextHandler(req, res, next);
+      };
+
+      return handlerForMediaTypeVersioning;
+    }
+
+    // Header Versioning Handler
+    if (versioningOptions.type === VersioningType.HEADER) {
+      const handlerForHeaderVersioning: VersionedRoute = (req, res, next) => {
+        const customHeaderVersionParameter: string | undefined =
+          req.headers?.[versioningOptions.header] ||
+          req.headers?.[versioningOptions.header.toLowerCase()];
+
+        // No version was supplied
+        if (isUndefined(customHeaderVersionParameter)) {
+          if (Array.isArray(version)) {
+            if (version.includes(VERSION_NEUTRAL)) {
+              return handler(req, res, next);
+            }
+          }
+        } else {
+          if (Array.isArray(version)) {
+            if (version.includes(customHeaderVersionParameter)) {
+              return handler(req, res, next);
+            }
+          } else if (isString(version)) {
+            if (version === customHeaderVersionParameter) {
+              return handler(req, res, next);
+            }
+          }
+        }
+
+        return callNextHandler(req, res, next);
+      };
+
+      return handlerForHeaderVersioning;
+    }
+
+    throw new Error('Unsupported versioning options');
+  }
+
+  public mapException(error: unknown): unknown {
+    switch (true) {
+      // SyntaxError is thrown by Express body-parser when given invalid JSON (#422, #430)
+      // URIError is thrown by Express when given a path parameter with an invalid percentage
+      // encoding, e.g. '%FF' (#8915)
+      // Both set a 400 status. One without it comes from server code (e.g. a view, or a
+      // middleware passed to "app.use()"), and its message may hold internal details (a
+      // template engine adds the path and lines of the view). It stays unmapped, so the
+      // built-in filter answers it with a generic 500 and logs it.
+      case (error instanceof SyntaxError || error instanceof URIError) &&
+        (error as { status?: unknown }).status === HttpStatus.BAD_REQUEST:
+        return new BadRequestException(error.message, { cause: error });
+      // http-errors (used by body-parser, Express itself, etc.) carry a numeric statusCode
+      // and an expose flag. Without this case, errors like PayloadTooLargeError reach custom
+      // exception filters as a raw http-errors instance rather than an HttpException, so a
+      // @Catch(HttpException) filter never runs and a catch-all filter reports 500 (#18213).
+      // A 5xx one (e.g. EACCES from "send") is a server fault: it stays unmapped,
+      // so the built-in filter still logs it, as it does on Fastify.
+      case isHttpError(error) && error.statusCode < 500:
+        return new HttpException(
+          // An error that must not reach the client only gets a status text,
+          // like the built-in exception filter answers it
+          error.expose === false
+            ? (http.STATUS_CODES[error.statusCode] ?? 'Internal server error')
+            : error.message,
+          error.statusCode,
+          { cause: error },
+        );
+      default:
+        return error;
+    }
+  }
+
+  private normalizePrefix(prefix?: string): string {
+    return stripEndSlash(addLeadingSlash(prefix));
+  }
+
+  private trackOpenConnections() {
+    this.httpServer.on('connection', (socket: Duplex) => {
+      this.openConnections.add(socket);
+
+      socket.on('close', () => this.openConnections.delete(socket));
+    });
+  }
+
+  private closeOpenConnections() {
+    for (const socket of this.openConnections) {
+      socket.destroy();
+      this.openConnections.delete(socket);
+    }
+  }
+
   private isMiddlewareApplied(name: string): boolean {
     const app = this.getInstance();
     return (
-      !!app._router &&
-      !!app._router.stack &&
-      isFunction(app._router.stack.filter) &&
-      app._router.stack.some(
+      !!app.router &&
+      !!app.router.stack &&
+      isFunction(app.router.stack.filter) &&
+      app.router.stack.some(
         (layer: any) => layer && layer.handle && layer.handle.name === name,
       )
     );
   }
+
+  private setHeaderIfNotExists(
+    response: any,
+    name: string,
+    value?: string | string[] | number,
+  ) {
+    if (value !== undefined && response.getHeader(name) === undefined) {
+      const headerValue = Array.isArray(value) ? value.join(',') : value;
+      response.setHeader(name, headerValue);
+    }
+  }
+
+  /**
+   * Runs the error handler of a StreamableFile whose stream failed after its
+   * headers were applied, from an "error" listener, where nothing catches
+   * what the handler throws.
+   */
+  private handleStreamError(
+    streamable: StreamableFile,
+    err: Error,
+    response: any,
+  ) {
+    // The answer is not the file. res.send() also parses the Content-Type it
+    // finds to add a charset, and throws on a malformed one (e.g. "image/").
+    if (!response.headersSent) {
+      response.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    }
+    try {
+      streamable.errorHandler(err, response);
+    } catch (handlerError) {
+      this.logger.error(handlerError);
+      if (!response.writableEnded) {
+        response.destroy();
+      }
+    }
+  }
+
+  /**
+   * response.write() throws for a chunk that is neither a string nor bytes,
+   * inside the "data" listener of pipe(), where nothing catches it. A source
+   * in object mode (e.g. "Readable.from()" over values) is checked as it is
+   * read instead, and fails like any other stream on such a chunk.
+   */
+  private toWritableChunks(stream: Readable): Readable {
+    if (!stream.readableObjectMode) {
+      return stream;
+    }
+    // Passes the chunks on as they are (an empty string, too, which sends
+    // the headers early), one at a time, so that it does not read ahead of
+    // the response
+    const checked = new Transform({
+      objectMode: true,
+      highWaterMark: 1,
+      transform(chunk, _encoding, callback) {
+        callback(null, isWritableChunk(chunk) ? chunk : undefined);
+      },
+    });
+    // Registered before pipe(), so the source fails as it emits the chunk,
+    // before it can end. Its error handler then answers the request, or
+    // aborts a response that has started, as for a file that fails midway.
+    stream.on('data', chunk => {
+      if (!isWritableChunk(chunk)) {
+        checked.destroy();
+        stream.destroy(
+          new TypeError(
+            `A StreamableFile can only send string and Uint8Array chunks, received ${typeof chunk}`,
+          ),
+        );
+      }
+    });
+    return stream.pipe(checked);
+  }
+
+  private applyStreamHeaders(response: any, streamable: StreamableFile) {
+    const headers = streamable.getHeaders();
+
+    this.setHeaderIfNotExists(response, 'Content-Type', headers.type);
+    this.setHeaderIfNotExists(
+      response,
+      'Content-Disposition',
+      headers.disposition,
+    );
+    // A "Transfer-Encoding" forbids a "Content-Length" (RFC 9112)
+    if (response.getHeader('Transfer-Encoding') === undefined) {
+      this.setHeaderIfNotExists(response, 'Content-Length', headers.length);
+    }
+  }
+}
+
+function isWritableChunk(chunk: unknown): chunk is string | Uint8Array {
+  return typeof chunk === 'string' || types.isUint8Array(chunk);
+}
+
+/**
+ * Returns true when `err` is an "http-errors"-shaped error (body-parser, Express, etc.).
+ * Mirrors the same check in BaseExceptionFilter.isHttpError().
+ */
+function isHttpError(
+  err: unknown,
+): err is { statusCode: number; message: string; expose: boolean } {
+  return (
+    isObject(err) &&
+    err instanceof Error &&
+    typeof (err as any).expose === 'boolean' &&
+    typeof (err as any).statusCode === 'number' &&
+    (err as any).status === (err as any).statusCode
+  );
 }

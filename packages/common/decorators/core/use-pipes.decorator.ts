@@ -1,8 +1,8 @@
-import { PIPES_METADATA } from '../../constants';
-import { PipeTransform } from '../../interfaces/index';
-import { extendArrayMetadata } from '../../utils/extend-metadata.util';
-import { isFunction } from '../../utils/shared.utils';
-import { validateEach } from '../../utils/validate-each.util';
+import { PIPES_METADATA } from '../../constants.js';
+import { PipeTransform } from '../../interfaces/index.js';
+import { extendArrayMetadata } from '../../utils/extend-metadata.util.js';
+import { isFunction } from '../../utils/shared.utils.js';
+import { validateEach } from '../../utils/validate-each.util.js';
 
 /**
  * Decorator that binds pipes to the scope of the controller or method,
@@ -35,10 +35,10 @@ export function UsePipes(
     descriptor?: TypedPropertyDescriptor<any>,
   ) => {
     const isPipeValid = <T extends Function | Record<string, any>>(pipe: T) =>
-      pipe &&
-      (isFunction(pipe) || isFunction((pipe as Record<string, any>).transform));
+      pipe && (isFunction(pipe) || isFunction(pipe.transform));
 
     if (descriptor) {
+      validateEach(target.constructor, pipes, isPipeValid, '@UsePipes', 'pipe');
       extendArrayMetadata(PIPES_METADATA, pipes, descriptor.value);
       return descriptor;
     }

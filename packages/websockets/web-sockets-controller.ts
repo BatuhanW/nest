@@ -1,85 +1,260 @@
-import { Type } from '@nestjs/common/interfaces/type.interface';
-import { isFunction } from '@nestjs/common/utils/shared.utils';
-import { ApplicationConfig } from '@nestjs/core/application-config';
-import { MetadataScanner } from '@nestjs/core/metadata-scanner';
-import { from as fromPromise, Observable, of, Subject } from 'rxjs';
+import {
+  from as fromPromise,
+  isObservable,
+  Observable,
+  of,
+  Subject,
+} from 'rxjs';
 import { distinctUntilChanged, mergeAll } from 'rxjs/operators';
-import { GATEWAY_OPTIONS, PORT_METADATA } from './constants';
-import { WsContextCreator } from './context/ws-context-creator';
-import { InvalidSocketPortException } from './errors/invalid-socket-port.exception';
+import {
+  GATEWAY_OPTIONS,
+  MESSAGE_METADATA,
+  PORT_METADATA,
+} from './constants.js';
+import { WsContextCreator } from './context/ws-context-creator.js';
+import { InvalidSocketPortException } from './errors/invalid-socket-port.exception.js';
+import { WsExceptionsHandler } from './exceptions/ws-exceptions-handler.js';
 import {
   GatewayMetadataExplorer,
   MessageMappingProperties,
-} from './gateway-metadata-explorer';
-import { GatewayMetadata } from './interfaces/gateway-metadata.interface';
-import { NestGateway } from './interfaces/nest-gateway.interface';
-import { SocketEventsHost } from './interfaces/socket-events-host.interface';
-import { SocketServerProvider } from './socket-server-provider';
-import { compareElementAt } from './utils/compare-element.util';
+} from './gateway-metadata-explorer.js';
+import { GatewayMetadata } from './interfaces/gateway-metadata.interface.js';
+import { NestGateway } from './interfaces/nest-gateway.interface.js';
+import { ServerAndEventStreamsHost } from './interfaces/server-and-event-streams-host.interface.js';
+import { WebsocketEntrypointMetadata } from './interfaces/websockets-entrypoint-metadata.interface.js';
+import { SocketServerProvider } from './socket-server-provider.js';
+import { compareElementAt } from './utils/compare-element.util.js';
+import { isFunction } from '@nestjs/common/internal';
+import type { NestApplicationContextOptions } from '@nestjs/common/internal';
+import { type Type, Logger } from '@nestjs/common';
+import {
+  type ApplicationConfig,
+  ContextIdFactory,
+  type ContextId,
+  type GraphInspector,
+  MetadataScanner,
+  type NestContainer,
+} from '@nestjs/core';
+import {
+  ExecutionContextHost,
+  type Injector,
+  type InstanceWrapper,
+  type Module,
+  REQUEST_CONTEXT_ID,
+  STATIC_CONTEXT,
+} from '@nestjs/core/internal';
+import { ExceptionFiltersContext } from './context/exception-filters-context.js';
 
 export class WebSocketsController {
+  private readonly logger = new Logger(WebSocketsController.name, {
+    timestamp: true,
+  });
   private readonly metadataExplorer = new GatewayMetadataExplorer(
     new MetadataScanner(),
   );
+  private readonly pendingDisconnects = new WeakMap<ContextId, number>();
+  // For each gateway resolved per connection, a promise per client that
+  // settles once its connection hook has been called
+  private readonly connectionHookCalls = new WeakMap<
+    InstanceWrapper<NestGateway>,
+    WeakMap<object, Promise<void>>
+  >();
 
   constructor(
     private readonly socketServerProvider: SocketServerProvider,
     private readonly config: ApplicationConfig,
     private readonly contextCreator: WsContextCreator,
+    private readonly container: NestContainer,
+    private readonly injector: Injector,
+    private readonly exceptionFiltersContext: ExceptionFiltersContext,
+    private readonly graphInspector: GraphInspector,
+    private readonly appOptions: NestApplicationContextOptions = {},
+    private readonly isAcceptingClients: () => boolean = () => true,
   ) {}
 
+  public connectGatewayToServer(
+    instanceWrapper: InstanceWrapper<NestGateway>,
+    moduleKey: string,
+  ): void;
   public connectGatewayToServer(
     instance: NestGateway,
     metatype: Type<unknown> | Function,
     moduleKey: string,
+    instanceWrapperId: string,
+  ): void;
+  public connectGatewayToServer(
+    instanceOrWrapper: InstanceWrapper<NestGateway> | NestGateway,
+    metatypeOrModuleKey: Type<unknown> | Function | string,
+    moduleKey?: string,
+    instanceWrapperId?: string,
   ) {
-    const options = Reflect.getMetadata(GATEWAY_OPTIONS, metatype) || {};
-    const port = Reflect.getMetadata(PORT_METADATA, metatype) || 0;
+    const isInstanceWrapper =
+      typeof metatypeOrModuleKey === 'string' &&
+      'instance' in (instanceOrWrapper as InstanceWrapper<NestGateway>);
+    const instance = isInstanceWrapper
+      ? (instanceOrWrapper as InstanceWrapper<NestGateway>).instance
+      : (instanceOrWrapper as NestGateway);
+    const metatype = isInstanceWrapper
+      ? (instanceOrWrapper as InstanceWrapper<NestGateway>).metatype
+      : (metatypeOrModuleKey as Type<unknown> | Function);
+    const targetModuleKey = isInstanceWrapper
+      ? (metatypeOrModuleKey as string)
+      : (moduleKey as string);
+    const targetInstanceWrapperId = isInstanceWrapper
+      ? (instanceOrWrapper as InstanceWrapper<NestGateway>).id
+      : (instanceWrapperId as string);
+    const instanceWrapper = isInstanceWrapper
+      ? (instanceOrWrapper as InstanceWrapper<NestGateway>)
+      : ({
+          instance,
+          metatype,
+          id: targetInstanceWrapperId,
+          isDependencyTreeStatic: () => true,
+          isDependencyTreeDurable: () => false,
+          getEnhancersMetadata: (): InstanceWrapper[] => [],
+        } as InstanceWrapper<NestGateway>);
+    const gatewayMetatype = metatype ?? instance.constructor;
+    const options = Reflect.getMetadata(GATEWAY_OPTIONS, gatewayMetatype) || {};
+    const port = Reflect.getMetadata(PORT_METADATA, gatewayMetatype) ?? 0;
 
     if (!Number.isInteger(port)) {
-      throw new InvalidSocketPortException(port, metatype);
+      throw new InvalidSocketPortException(port, gatewayMetatype);
     }
-    this.subscribeToServerEvents(instance, options, port, moduleKey);
+    this.subscribeToServerEvents(
+      instanceWrapper,
+      options,
+      port,
+      targetModuleKey,
+      targetInstanceWrapperId,
+    );
   }
 
+  public subscribeToServerEvents<T extends GatewayMetadata>(
+    instanceWrapper: InstanceWrapper<NestGateway>,
+    options: T,
+    port: number,
+    moduleKey: string,
+    instanceWrapperId: string,
+  ): void;
   public subscribeToServerEvents<T extends GatewayMetadata>(
     instance: NestGateway,
     options: T,
     port: number,
     moduleKey: string,
+    instanceWrapperId: string,
+  ): void;
+  public subscribeToServerEvents<T extends GatewayMetadata>(
+    instanceOrWrapper: InstanceWrapper<NestGateway> | NestGateway,
+    options: T,
+    port: number,
+    moduleKey: string,
+    instanceWrapperId: string,
   ) {
+    const instanceWrapper =
+      'instance' in (instanceOrWrapper as object)
+        ? (instanceOrWrapper as InstanceWrapper<NestGateway>)
+        : ({
+            instance: instanceOrWrapper,
+            metatype: (instanceOrWrapper as NestGateway).constructor,
+            id: instanceWrapperId,
+            isDependencyTreeStatic: () => true,
+            isDependencyTreeDurable: () => false,
+            getEnhancersMetadata: (): InstanceWrapper[] => [],
+          } as InstanceWrapper<NestGateway>);
+    const { instance } = instanceWrapper;
     const nativeMessageHandlers = this.metadataExplorer.explore(instance);
+    const isStatic = instanceWrapper.isDependencyTreeStatic();
+    const hasGlobalScopedEnhancers = this.getGlobalScopedEnhancers().length > 0;
+    const moduleRef = this.container.getModuleByKey(moduleKey)!;
     const messageHandlers = nativeMessageHandlers.map(
-      ({ callback, message, methodName }) => ({
+      ({ callback, isAckHandledManually, message, methodName }) => ({
         message,
         methodName,
-        callback: this.contextCreator.create(
-          instance,
-          callback,
-          moduleKey,
-          methodName,
-        ),
+        callback:
+          isStatic && !hasGlobalScopedEnhancers
+            ? this.contextCreator.create(
+                instance,
+                callback,
+                moduleKey,
+                methodName,
+                STATIC_CONTEXT,
+                instanceWrapper.id,
+              )
+            : this.createRequestScopedHandler(
+                instanceWrapper,
+                moduleRef,
+                moduleKey,
+                methodName,
+              ),
+        isAckHandledManually,
       }),
     );
+
+    this.inspectEntrypointDefinitions(
+      instance,
+      port,
+      messageHandlers,
+      instanceWrapperId,
+    );
+
+    if (this.appOptions.preview) {
+      return;
+    }
     const observableServer = this.socketServerProvider.scanForSocketServer<T>(
       options,
       port,
+      (instanceWrapper.metatype ?? instance.constructor)?.name,
     );
     this.assignServerToProperties(instance, observableServer.server);
-    this.subscribeEvents(instance, messageHandlers, observableServer);
+    this.subscribeEvents(
+      instanceWrapper,
+      messageHandlers,
+      observableServer,
+      isStatic
+        ? this.createStaticEventHandler(
+            instance,
+            moduleKey,
+            'handleConnection',
+            instanceWrapper.id,
+          )
+        : this.createRequestScopedEventHandler(
+            instanceWrapper,
+            moduleRef,
+            moduleKey,
+            'handleConnection',
+            observableServer.server,
+          ),
+      isStatic && !hasGlobalScopedEnhancers
+        ? this.createStaticEventHandler(
+            instance,
+            moduleKey,
+            'handleDisconnect',
+            instanceWrapper.id,
+          )
+        : this.createRequestScopedEventHandler(
+            instanceWrapper,
+            moduleRef,
+            moduleKey,
+            'handleDisconnect',
+            observableServer.server,
+          ),
+    );
   }
 
   public subscribeEvents(
-    instance: NestGateway,
+    instanceWrapper: InstanceWrapper<NestGateway>,
     subscribersMap: MessageMappingProperties[],
-    observableServer: SocketEventsHost,
+    observableServer: ServerAndEventStreamsHost,
+    connectionHandler?: Function,
+    disconnectHandler?: Function,
   ) {
+    const { instance } = instanceWrapper;
     const { init, disconnect, connection, server } = observableServer;
     const adapter = this.config.getIoAdapter();
 
     this.subscribeInitEvent(instance, init);
-    this.subscribeConnectionEvent(instance, connection);
-    this.subscribeDisconnectEvent(instance, disconnect);
+    this.subscribeConnectionEvent(connectionHandler, connection);
+    this.subscribeDisconnectEvent(disconnectHandler, disconnect);
 
     const handler = this.getConnectionHandler(
       this,
@@ -89,6 +264,7 @@ export class WebSocketsController {
       connection,
     );
     adapter.bindClientConnect(server, handler);
+    this.printSubscriptionLogs(instance, subscribersMap);
   }
 
   public getConnectionHandler(
@@ -101,12 +277,38 @@ export class WebSocketsController {
     const adapter = this.config.getIoAdapter();
     return (...args: unknown[]) => {
       const [client] = args;
-      connection.next(args);
-      context.subscribeMessages(subscribersMap, client, instance);
-
+      if (!this.isAcceptingClients()) {
+        // The lifecycle hooks of the application are still running, so the
+        // providers that the gateway, its enhancers and its handlers depend on
+        // may not be initialized yet. The client is dropped before any of
+        // them runs, as if the server was not listening yet.
+        adapter.closeClient?.(client);
+        return;
+      }
+      // Bound before the connection hooks run, since socket.io emits the
+      // disconnect synchronously when one of them calls client.disconnect().
+      // Such a disconnect is held back until every gateway sharing this
+      // server has handled the connection.
+      let isConnecting = true;
+      let heldDisconnect: { reason?: string } | undefined;
       const disconnectHook = adapter.bindClientDisconnect;
       disconnectHook &&
-        disconnectHook.call(adapter, client, () => disconnect.next(client));
+        disconnectHook.call(adapter, client, (reason?: string) => {
+          if (isConnecting) {
+            heldDisconnect = { reason };
+            return;
+          }
+          disconnect.next({ client, reason });
+        });
+
+      try {
+        connection.next(args);
+        context.subscribeMessages(subscribersMap, client, instance);
+      } finally {
+        isConnecting = false;
+        heldDisconnect &&
+          disconnect.next({ client, reason: heldDisconnect.reason });
+      }
     };
   }
 
@@ -116,21 +318,48 @@ export class WebSocketsController {
     }
   }
 
-  public subscribeConnectionEvent(instance: NestGateway, event: Subject<any>) {
-    if (instance.handleConnection) {
+  public subscribeConnectionEvent(
+    handlerOrGateway: Function | NestGateway | undefined,
+    event: Subject<any>,
+  ) {
+    const handler =
+      typeof handlerOrGateway === 'function'
+        ? handlerOrGateway
+        : handlerOrGateway?.handleConnection?.bind(handlerOrGateway);
+    if (handler) {
       event
         .pipe(
           distinctUntilChanged((prev, curr) => compareElementAt(prev, curr, 0)),
         )
-        .subscribe((args: unknown[]) => instance.handleConnection(...args));
+        .subscribe((args: unknown[]) => handler(...args));
     }
   }
 
-  public subscribeDisconnectEvent(instance: NestGateway, event: Subject<any>) {
-    if (instance.handleDisconnect) {
+  public subscribeDisconnectEvent(
+    handlerOrGateway: Function | NestGateway | undefined,
+    event: Subject<any>,
+  ) {
+    const handler =
+      typeof handlerOrGateway === 'function'
+        ? handlerOrGateway
+        : handlerOrGateway?.handleDisconnect?.bind(handlerOrGateway);
+    if (handler) {
       event
-        .pipe(distinctUntilChanged())
-        .subscribe(instance.handleDisconnect.bind(instance));
+        .pipe(
+          distinctUntilChanged((prev, curr) => {
+            const prevClient = prev?.client || prev;
+            const currClient = curr?.client || curr;
+            return prevClient === currClient;
+          }),
+        )
+        .subscribe((data: any) => {
+          if (data && typeof data === 'object' && 'client' in data) {
+            handler(data.client, data.reason);
+          } else {
+            // Backward compatibility: if it's just the client
+            handler(data);
+          }
+        });
     }
   }
 
@@ -140,26 +369,412 @@ export class WebSocketsController {
     instance: NestGateway,
   ) {
     const adapter = this.config.getIoAdapter();
-    const handlers = subscribersMap.map(({ callback, message }) => ({
-      message,
-      callback: callback.bind(instance, client),
-    }));
+    const handlers = subscribersMap.map(
+      ({ callback, message, isAckHandledManually }) => ({
+        message,
+        callback: callback.bind(instance, client),
+        isAckHandledManually,
+      }),
+    );
     adapter.bindMessageHandlers(client, handlers, data =>
       fromPromise(this.pickResult(data)).pipe(mergeAll()),
     );
   }
 
   public async pickResult(
-    defferedResult: Promise<any>,
+    deferredResult: Promise<any>,
   ): Promise<Observable<any>> {
-    const result = await defferedResult;
-    if (result && isFunction(result.subscribe)) {
+    const result = await deferredResult;
+    if (isObservable(result)) {
       return result;
     }
     if (result instanceof Promise) {
       return fromPromise(result);
     }
     return of(result);
+  }
+
+  public inspectEntrypointDefinitions(
+    instance: NestGateway,
+    port: number,
+    messageHandlers: MessageMappingProperties[],
+    instanceWrapperId: string,
+  ) {
+    messageHandlers.forEach(handler => {
+      this.graphInspector.insertEntrypointDefinition<WebsocketEntrypointMetadata>(
+        {
+          type: 'websocket',
+          methodName: handler.methodName,
+          className: instance.constructor?.name,
+          classNodeId: instanceWrapperId,
+          metadata: {
+            port,
+            key: handler.message,
+            message: handler.message,
+          },
+        },
+        instanceWrapperId,
+      );
+    });
+  }
+
+  public createRequestScopedHandler(
+    instanceWrapper: InstanceWrapper<NestGateway>,
+    moduleRef: Module,
+    moduleKey: string,
+    methodName: string,
+  ) {
+    const { instance } = instanceWrapper;
+    const collection = moduleRef.providers;
+    const isStatic = instanceWrapper.isDependencyTreeStatic();
+    const isTreeDurable = isStatic
+      ? this.areGlobalScopedEnhancersDurable()
+      : instanceWrapper.isDependencyTreeDurable();
+    const scopedEnhancers = [
+      ...(isStatic ? instanceWrapper.getEnhancersMetadata() || [] : []),
+      ...this.getGlobalScopedEnhancers(),
+    ];
+    const pattern =
+      Reflect.getMetadata(MESSAGE_METADATA, instance[methodName]) ?? 'unknown';
+    // Kept per gateway, not per handler function: gateways that inherit the
+    // handler from a base class can declare different filters
+    let exceptionFilter: WsExceptionsHandler | undefined;
+
+    return async (...args: unknown[]) => {
+      const [client] = args;
+
+      try {
+        const contextId = this.getContextId(
+          client as Record<any, any>,
+          isTreeDurable,
+        );
+        const contextInstance = isStatic
+          ? instance
+          : await this.injector.loadPerContext(
+              instance,
+              moduleRef,
+              collection,
+              contextId,
+            );
+        // Resolve global enhancers without adding them to the gateway's dependency
+        // tree, so a singleton gateway keeps its state and lifecycle hooks.
+        await this.injector.loadEnhancersPerContext(
+          instanceWrapper,
+          contextId,
+          instanceWrapper,
+          scopedEnhancers,
+        );
+        await this.injector.waitForDeferredLoads(contextId);
+        return this.contextCreator.create(
+          contextInstance,
+          contextInstance[methodName],
+          moduleKey,
+          methodName,
+          contextId,
+          instanceWrapper.id,
+        )(...args);
+      } catch (err) {
+        exceptionFilter ??= this.exceptionFiltersContext.create(
+          instance,
+          instance[methodName],
+          moduleKey,
+        );
+        // The context failed to resolve before `WsProxy` could append the
+        // pattern, so add it here the same way.
+        const host = new ExecutionContextHost([...args, pattern]);
+        host.setType('ws');
+        // Waited for, as WsProxy does for a message that failed later on
+        const pending = exceptionFilter.handle(err as Error, host);
+        if (pending) {
+          await pending;
+        }
+      }
+    };
+  }
+
+  public createRequestScopedEventHandler(
+    instanceWrapper: InstanceWrapper<NestGateway>,
+    moduleRef: Module,
+    moduleKey: string,
+    methodName: 'handleConnection' | 'handleDisconnect',
+    server: object,
+  ) {
+    const { instance } = instanceWrapper;
+    const collection = moduleRef.providers;
+    const isStatic = instanceWrapper.isDependencyTreeStatic();
+    const isTreeDurable = isStatic
+      ? this.areGlobalScopedEnhancersDurable()
+      : instanceWrapper.isDependencyTreeDurable();
+    const targetCallback = instance[methodName];
+    const connectionHookCalls = this.getConnectionHookCalls(instanceWrapper);
+
+    return async (...args: unknown[]) => {
+      const [client] = args;
+      let contextId: ContextId | undefined;
+      let isResolved = false;
+      let markConnectionHookAsCalled: (() => void) | undefined;
+
+      try {
+        contextId = this.getContextId(
+          client as Record<any, any>,
+          isTreeDurable,
+        );
+        if (methodName === 'handleDisconnect') {
+          this.pendingDisconnects.set(
+            contextId,
+            (this.pendingDisconnects.get(contextId) ?? 0) + 1,
+          );
+          // The client can leave while the gateway is still being resolved
+          // for its connection hook. Nothing else orders the two handlers, and
+          // the injector could hand the pending instance to this one first.
+          const connectionHookCall = connectionHookCalls.get(client as object);
+          if (connectionHookCall) {
+            await connectionHookCall;
+          }
+        } else {
+          connectionHookCalls.set(
+            client as object,
+            new Promise<void>(resolve => {
+              markConnectionHookAsCalled = resolve;
+            }),
+          );
+        }
+        const contextInstance = isStatic
+          ? instance
+          : await this.injector.loadPerContext(
+              instance,
+              moduleRef,
+              collection,
+              contextId,
+            );
+        isResolved = true;
+        if (!isStatic) {
+          this.assignServerToProperties(contextInstance, server);
+        }
+        const scopedMethod = contextInstance[methodName] as
+          ((...methodArgs: unknown[]) => unknown) | undefined;
+        const result = scopedMethod?.apply(contextInstance, args);
+        // Not waited for, as a default-scoped gateway does not wait for its
+        // connection hook to finish before it handles the disconnect either
+        markConnectionHookAsCalled?.();
+        return await result;
+      } catch (err) {
+        if (!targetCallback) {
+          // The gateway failed to resolve and has no hook whose exception
+          // filters could handle the error. Nothing awaits this handler, so
+          // rethrowing would end as an unhandled rejection.
+          this.logResolutionError(instance, methodName, err);
+          return;
+        }
+        if (!isResolved && contextId) {
+          // The gateway's enhancers are created in the context of the
+          // connection along with it, so when it failed to resolve, its
+          // filters have to be created here.
+          try {
+            await this.injector.loadEnhancersPerContext(
+              instanceWrapper,
+              contextId,
+              instanceWrapper,
+            );
+          } catch {
+            this.logResolutionError(instance, methodName, err);
+            return;
+          }
+        }
+        // Built for each connection: a request-scoped filter is only
+        // constructed in the context of the connection, and the static one
+        // holds an empty placeholder. The filters of a default-scoped gateway,
+        // resolved here for request-scoped global enhancers, are static, and a
+        // transient one is constructed for the gateway in the static context.
+        const exceptionFilter = this.exceptionFiltersContext.create(
+          instance,
+          targetCallback,
+          moduleKey,
+          isStatic ? STATIC_CONTEXT : contextId,
+          instanceWrapper.id,
+        );
+        // A filter is not the hook: the disconnect hook does not wait for it
+        markConnectionHookAsCalled?.();
+        await this.handleLifecycleHookError(
+          exceptionFilter,
+          methodName,
+          args,
+          err,
+        );
+      } finally {
+        // The hook threw, or is not going to be called at all
+        markConnectionHookAsCalled?.();
+        if (methodName === 'handleDisconnect' && contextId) {
+          this.cleanupRequestScopedContext(
+            instanceWrapper,
+            contextId,
+            client as Record<any, any>,
+          );
+        }
+      }
+    };
+  }
+
+  private getConnectionHookCalls(
+    instanceWrapper: InstanceWrapper<NestGateway>,
+  ): WeakMap<object, Promise<void>> {
+    let connectionHookCalls = this.connectionHookCalls.get(instanceWrapper);
+    if (!connectionHookCalls) {
+      connectionHookCalls = new WeakMap();
+      this.connectionHookCalls.set(instanceWrapper, connectionHookCalls);
+    }
+    return connectionHookCalls;
+  }
+
+  private logResolutionError(
+    instance: NestGateway,
+    methodName: 'handleConnection' | 'handleDisconnect',
+    err: unknown,
+  ) {
+    this.logger.error(
+      `Failed to resolve ${instance.constructor.name} on client ${methodName === 'handleConnection' ? 'connection' : 'disconnection'}`,
+      (err as Error)?.stack,
+    );
+  }
+
+  // A default-scoped gateway is resolved per connection only for its global
+  // scoped enhancers, so their trees decide whether the context is durable
+  // (mirrors InstanceWrapper#isDependencyTreeDurable).
+  private areGlobalScopedEnhancersDurable(): boolean {
+    const scopedEnhancers = this.getGlobalScopedEnhancers().filter(
+      wrapper => !wrapper.isDependencyTreeStatic(),
+    );
+    return (
+      scopedEnhancers.length > 0 &&
+      scopedEnhancers.every(wrapper => wrapper.isDependencyTreeDurable())
+    );
+  }
+
+  /**
+   * Runs a lifecycle hook of a default-scoped gateway and passes the errors it
+   * throws or rejects with to the gateway's exception filters, as for message
+   * handlers. The hook still runs synchronously.
+   */
+  public createStaticEventHandler(
+    instance: NestGateway,
+    moduleKey: string,
+    methodName: 'handleConnection' | 'handleDisconnect',
+    instanceWrapperId?: string,
+  ) {
+    const hook = instance[methodName] as
+      ((...args: unknown[]) => unknown) | undefined;
+    if (!hook) {
+      return undefined;
+    }
+    // Kept per gateway, not per hook function: gateways that inherit the
+    // hook from a base class can declare different filters
+    let exceptionFilter: WsExceptionsHandler | undefined;
+    return (...args: unknown[]) => {
+      const handleError = (err: unknown) => {
+        // With the gateway as the inquirer, as for its message handlers, so
+        // that a transient filter is the one constructed for the gateway
+        exceptionFilter ??= this.exceptionFiltersContext.create(
+          instance,
+          hook,
+          moduleKey,
+          STATIC_CONTEXT,
+          instanceWrapperId,
+        );
+        return this.handleLifecycleHookError(
+          exceptionFilter,
+          methodName,
+          args,
+          err,
+        );
+      };
+      try {
+        const result = hook.apply(instance, args);
+        return isFunction((result as Promise<unknown>)?.then)
+          ? (result as Promise<unknown>).catch(handleError)
+          : result;
+      } catch (err) {
+        return handleError(err);
+      }
+    };
+  }
+
+  private handleLifecycleHookError(
+    exceptionFilter: WsExceptionsHandler,
+    methodName: 'handleConnection' | 'handleDisconnect',
+    args: unknown[],
+    err: unknown,
+  ) {
+    const [client, disconnectReason] = args;
+    // Client first, data second and the pattern last, as for message handlers.
+    // With the raw hook arguments, the filter would send the last one (the
+    // socket itself with socket.io, the upgrade request with ws) back to the
+    // client as the pattern. The disconnect reason is safe to pass as data,
+    // as nothing is sent to a client that has already disconnected.
+    const data =
+      methodName === 'handleDisconnect' ? disconnectReason : undefined;
+    const host = new ExecutionContextHost([client, data, methodName]);
+    host.setType('ws');
+    // Nothing awaits a lifecycle hook, so an error leaving the filter, e.g.
+    // when its reply cannot be serialized, would end the process as an
+    // uncaught exception or an unhandled rejection. It is logged instead, as
+    // the adapters do for message handlers.
+    try {
+      const pending = exceptionFilter.handle(err as Error, host);
+      if (isFunction((pending as Promise<unknown>)?.then)) {
+        return Promise.resolve(pending).catch(filterError =>
+          this.logger.error(filterError),
+        );
+      }
+    } catch (filterError) {
+      this.logger.error(filterError);
+    }
+  }
+
+  private getGlobalScopedEnhancers(): InstanceWrapper[] {
+    return [
+      ...this.config.getGlobalRequestGuards(),
+      ...this.config.getGlobalRequestPipes(),
+      ...this.config.getGlobalRequestInterceptors(),
+    ];
+  }
+
+  public getContextId<T extends Record<any, unknown> = any>(
+    request: T,
+    isTreeDurable: boolean,
+  ): ContextId {
+    const contextId = ContextIdFactory.getByRequest(request);
+    if (!request[REQUEST_CONTEXT_ID as any]) {
+      Object.defineProperty(request, REQUEST_CONTEXT_ID, {
+        value: contextId,
+        enumerable: false,
+        writable: false,
+        configurable: true,
+      });
+
+      const requestProviderValue = isTreeDurable
+        ? contextId.payload
+        : Object.assign(request, contextId.payload);
+      this.container.registerRequestProvider(requestProviderValue, contextId);
+    }
+    return contextId;
+  }
+
+  private cleanupRequestScopedContext(
+    _instanceWrapper: InstanceWrapper<NestGateway>,
+    contextId: ContextId,
+    request: Record<any, any>,
+  ) {
+    const remaining = (this.pendingDisconnects.get(contextId) ?? 1) - 1;
+    if (remaining > 0) {
+      this.pendingDisconnects.set(contextId, remaining);
+      return;
+    }
+    this.pendingDisconnects.delete(contextId);
+    // Other gateways can still be executing their asynchronous disconnect hooks.
+    // A finished cycle must also never remove a newer context on the same client.
+    if (request[REQUEST_CONTEXT_ID as any] === contextId) {
+      Reflect.deleteProperty(request, REQUEST_CONTEXT_ID as any);
+    }
   }
 
   private assignServerToProperties<T = any>(
@@ -171,5 +786,20 @@ export class WebSocketsController {
     )) {
       Reflect.set(instance, propertyKey, server);
     }
+  }
+
+  private printSubscriptionLogs(
+    instance: NestGateway,
+    subscribersMap: MessageMappingProperties[],
+  ) {
+    const gatewayClassName = (instance as object)?.constructor?.name;
+    if (!gatewayClassName) {
+      return;
+    }
+    subscribersMap.forEach(({ message }) =>
+      this.logger.log(
+        `${gatewayClassName} subscribed to the "${message}" message`,
+      ),
+    );
   }
 }

@@ -1,86 +1,115 @@
 import {
-  CanActivate,
-  ExceptionFilter,
-  HttpServer,
-  INestApplication,
-  INestMicroservice,
-  NestHybridApplicationOptions,
-  NestInterceptor,
-  PipeTransform,
-  WebSocketAdapter,
+  type CanActivate,
+  type CsrfProtectionOptions,
+  type ExceptionFilter,
+  type HttpServer,
+  type INestApplication,
+  type INestMicroservice,
+  type NestHybridApplicationOptions,
+  type NestInterceptor,
+  type PipeTransform,
+  type SecurityHeadersOptions,
+  type VersioningOptions,
+  VersioningType,
+  type WebSocketAdapter,
 } from '@nestjs/common';
-import {
-  CorsOptions,
-  CorsOptionsDelegate,
-} from '@nestjs/common/interfaces/external/cors-options.interface';
-import { NestApplicationOptions } from '@nestjs/common/interfaces/nest-application-options.interface';
-import { Logger } from '@nestjs/common/services/logger.service';
-import { loadPackage } from '@nestjs/common/utils/load-package.util';
-import { addLeadingSlash, isObject } from '@nestjs/common/utils/shared.utils';
 import { iterate } from 'iterare';
 import { platform } from 'os';
-import { AbstractHttpAdapter } from './adapters';
-import { ApplicationConfig } from './application-config';
-import { MESSAGES } from './constants';
-import { optionalRequire } from './helpers/optional-require';
-import { NestContainer } from './injector/container';
-import { MiddlewareContainer } from './middleware/container';
-import { MiddlewareModule } from './middleware/middleware-module';
-import { NestApplicationContext } from './nest-application-context';
-import { Resolver } from './router/interfaces/resolver.interface';
-import { RoutesResolver } from './router/routes-resolver';
-
-const { SocketModule } = optionalRequire(
-  '@nestjs/websockets/socket-module',
-  () => require('@nestjs/websockets/socket-module'),
-);
-const {
-  MicroservicesModule,
-} = optionalRequire('@nestjs/microservices/microservices-module', () =>
-  require('@nestjs/microservices/microservices-module'),
-);
+import { Server as TlsServer } from 'tls';
+import { AbstractHttpAdapter } from './adapters/index.js';
+import { ApplicationConfig } from './application-config.js';
+import { MESSAGES } from './constants.js';
+import { CookieSigner } from './helpers/cookies/cookie-signer.js';
+import { optionalRequire } from './helpers/optional-require.js';
+import { makeSafeInstanceDecorator } from './helpers/safe-instance-decorator.js';
+import { NestContainer } from './injector/container.js';
+import { Injector } from './injector/injector.js';
+import { GraphInspector } from './inspector/graph-inspector.js';
+import { MiddlewareContainer } from './middleware/container.js';
+import { MiddlewareModule } from './middleware/middleware-module.js';
+import { mapToExcludeRoute } from './middleware/utils.js';
+import { NestApplicationContext } from './nest-application-context.js';
+import { Resolver } from './router/interfaces/resolver.interface.js';
+import { RoutesResolver } from './router/routes-resolver.js';
+import { type NestApplicationOptions, Logger } from '@nestjs/common';
+import {
+  type GlobalPrefixOptions,
+  loadPackage,
+  loadPackageCached,
+  tryLoadPackage,
+  addLeadingSlash,
+  isFunction,
+  isObject,
+  isString,
+} from '@nestjs/common/internal';
+import { ResolvedRoute } from './router/interfaces/resolved-route.interface.js';
+import { RouteConflictDetector } from './router/route-conflict-detector.js';
+import { RouteSpecificitySorter } from './router/route-specificity-sorter.js';
+import { CrossOriginProtection } from './security/cross-origin-protection.js';
+import { HttpSecurityHook } from './security/http-security-hook.js';
+import { resolveSecurityHeaders } from './security/security-headers.js';
 
 /**
  * @publicApi
  */
 export class NestApplication
-  extends NestApplicationContext
-  implements INestApplication {
-  private readonly logger = new Logger(NestApplication.name, true);
-  private readonly middlewareModule = new MiddlewareModule();
+  extends NestApplicationContext<NestApplicationOptions>
+  implements INestApplication
+{
+  protected readonly logger = new Logger(NestApplication.name, {
+    timestamp: true,
+  });
+  private readonly middlewareModule: MiddlewareModule;
   private readonly middlewareContainer = new MiddlewareContainer(
     this.container,
   );
-  private readonly microservicesModule =
-    MicroservicesModule && new MicroservicesModule();
-  private readonly socketModule = SocketModule && new SocketModule();
+  private microservicesModule: any = null;
+  private socketModule: any = null;
   private readonly routesResolver: Resolver;
   private readonly microservices: any[] = [];
   private httpServer: any;
   private isListening = false;
+  private isWsModuleRegistered = false;
+  private readonly enabledSecurityFeatures = new Set<string>();
+  private securityHook?: HttpSecurityHook;
 
   constructor(
     container: NestContainer,
     private readonly httpAdapter: HttpServer,
     private readonly config: ApplicationConfig,
-    private readonly appOptions: NestApplicationOptions = {},
+    private readonly graphInspector: GraphInspector,
+    appOptions: NestApplicationOptions = {},
   ) {
-    super(container);
+    super(container, appOptions);
 
+    this.config.setRouteConflictPolicy(appOptions.routeConflictPolicy);
+    this.config.setRouteResolutionStrategy(appOptions.routeResolutionStrategy);
+    this.applyCookiesOptions(appOptions);
     this.selectContextModule();
     this.registerHttpServer();
-
+    this.injector = new Injector({
+      preview: this.appOptions.preview!,
+      instanceDecorator: appOptions.instrument?.instanceDecorator,
+    });
+    this.middlewareModule = new MiddlewareModule();
     this.routesResolver = new RoutesResolver(
       this.container,
       this.config,
       this.injector,
+      this.graphInspector,
     );
   }
 
+  protected async prepareClose(): Promise<void> {
+    this.httpAdapter && (await this.httpAdapter.beforeClose?.());
+  }
+
   protected async dispose(): Promise<void> {
-    this.socketModule && (await this.socketModule.close());
-    this.microservicesModule && (await this.microservicesModule.close());
-    this.httpAdapter && (await this.httpAdapter.close());
+    await this.socketModule?.close();
+    await this.microservicesModule?.close();
+    await this.httpAdapter?.close();
+    this.isListening = false;
+    this.container.getHttpAdapterHostRef().listening = false;
 
     await Promise.all(
       iterate(this.microservices).map(async microservice => {
@@ -107,14 +136,11 @@ export class NestApplication
       return undefined;
     }
     const passCustomOptions =
-      isObject(this.appOptions.cors) ||
-      typeof this.appOptions.cors === 'function';
+      isObject(this.appOptions.cors) || isFunction(this.appOptions.cors);
     if (!passCustomOptions) {
       return this.enableCors();
     }
-    return this.enableCors(
-      this.appOptions.cors as CorsOptions | CorsOptionsDelegate<any>,
-    );
+    return this.enableCors(this.appOptions.cors);
   }
 
   public createServer<T = any>(): T {
@@ -123,49 +149,89 @@ export class NestApplication
   }
 
   public async registerModules() {
-    this.registerWsModule();
+    await this.registerWsModule();
 
     if (this.microservicesModule) {
-      this.microservicesModule.register(this.container, this.config);
+      this.microservicesModule.register(
+        this.container,
+        this.graphInspector,
+        this.config,
+        this.appOptions,
+      );
       this.microservicesModule.setupClients(this.container);
     }
+
     await this.middlewareModule.register(
       this.middlewareContainer,
       this.container,
       this.config,
       this.injector,
       this.httpAdapter,
+      this.graphInspector,
+      this.appOptions,
     );
   }
 
-  public registerWsModule() {
+  public async registerWsModule() {
     if (!this.socketModule) {
       return;
     }
-    this.socketModule.register(this.container, this.config, this.httpServer);
+    // A gateway with its own port is listening as soon as it is registered,
+    // which is before the lifecycle hooks have run. Its clients are turned
+    // away until "init()" lets them in.
+    // Optional call, as an older "@nestjs/websockets" may not implement it
+    this.socketModule.rejectClients?.();
+    await this.socketModule.register(
+      this.container,
+      this.config,
+      this.graphInspector,
+      this.appOptions,
+      this.httpServer,
+    );
+    this.isWsModuleRegistered = true;
   }
 
   public async init(): Promise<this> {
-    this.applyOptions();
-    await this.httpAdapter?.init();
+    if (this.isInitialized) {
+      return this;
+    }
 
-    const useBodyParser =
-      this.appOptions && this.appOptions.bodyParser !== false;
-    useBodyParser && this.registerParserMiddleware();
+    try {
+      // Lazy-load optional modules (ESM-compatible)
+      await Promise.all([
+        this.loadSocketModule(),
+        this.loadMicroservicesModule(),
+      ]);
+      this.applyOptions();
+      this.securityHook?.init(this.config);
+      await this.httpAdapter?.init?.();
 
-    await this.registerModules();
-    await this.registerRouter();
-    await this.callInitHook();
-    await this.registerRouterHooks();
-    await this.callBootstrapHook();
+      const useBodyParser =
+        this.appOptions && this.appOptions.bodyParser !== false;
+      useBodyParser && this.registerParserMiddleware();
 
-    this.isInitialized = true;
-    this.logger.log(MESSAGES.APPLICATION_READY);
+      await this.registerModules();
+      await this.registerRouter();
+      await this.callInitHook();
+      await this.registerRouterHooks();
+      await this.callBootstrapHook();
+      this.socketModule?.acceptClients?.();
+
+      this.isInitialized = true;
+      this.logger.log(MESSAGES.APPLICATION_READY);
+    } finally {
+      // Without this, an application that is never started with "listen()"
+      // (e.g. serverless handlers, e2e tests) would buffer logs forever, and
+      // one that fails to initialize would never print them.
+      this.flushLogsIfAutoFlushEnabled();
+    }
     return this;
   }
 
   public registerParserMiddleware() {
-    this.httpAdapter.registerParserMiddleware();
+    const prefix = this.config.getGlobalPrefix();
+    const rawBody = !!this.appOptions?.rawBody;
+    this.httpAdapter.registerParserMiddleware(prefix, rawBody);
   }
 
   public async registerRouter() {
@@ -173,7 +239,104 @@ export class NestApplication
 
     const prefix = this.config.getGlobalPrefix();
     const basePath = addLeadingSlash(prefix);
-    this.routesResolver.resolve(this.httpAdapter, basePath);
+
+    const conflictPolicy = this.config.getRouteConflictPolicy();
+    const resolutionStrategy = this.config.getRouteResolutionStrategy();
+    const adapterIsOrderSensitive =
+      this.httpAdapter.isRouteOrderSensitive?.() ?? true;
+    const shouldSortBySpecificity =
+      resolutionStrategy === 'specificity' && adapterIsOrderSensitive;
+    // Adapters that are not order-sensitive (e.g. Fastify) currently
+    // also reject duplicate (method, URL) registrations synchronously
+    // from the underlying router. Treat the two properties as one
+    // signal until a separate capability flag is introduced.
+    const adapterRejectsDuplicates = !adapterIsOrderSensitive;
+
+    if (!conflictPolicy && !shouldSortBySpecificity) {
+      this.routesResolver.resolve(this.httpAdapter, basePath);
+      return;
+    }
+
+    // Defer registration whenever we collect routes for diagnostics or
+    // re-ordering. In particular, when a conflict policy is set we
+    // must run detection *before* the adapter sees any route, because
+    // duplicate-rejecting adapters like Fastify throw synchronously
+    // from `instance.route()` and would short-circuit both the resolve
+    // loop and the aggregated `RouteConflictException`.
+    const resolvedRoutes: ResolvedRoute[] = [];
+    this.routesResolver.resolve(this.httpAdapter, basePath, {
+      onRouteResolved: route => resolvedRoutes.push(route),
+      deferRegistration: true,
+    });
+
+    // Sort before conflict detection so that winner/shadowed pairs in every
+    // conflict record reflect actual adapter registration order. Without this,
+    // the reported winner could be the declaration-first (less-specific) route
+    // even though the sorted-first (more-specific) route is what really wins.
+    const orderedRoutes = shouldSortBySpecificity
+      ? RouteSpecificitySorter.sort(resolvedRoutes)
+      : resolvedRoutes;
+
+    const routesToSkip = new Set<ResolvedRoute>();
+    if (conflictPolicy) {
+      const conflicts = RouteConflictDetector.detect(
+        orderedRoutes,
+        this.config.getVersioning(),
+      );
+
+      // On adapters that reject duplicate registrations the policy
+      // cannot be honoured by simply logging — the adapter would
+      // throw on the second `instance.route()` call. Drop the
+      // shadowed route of every duplicate conflict so the detector
+      // (not the adapter) decides which one wins. The detector
+      // always picks the earlier-registered route as the winner.
+      if (adapterRejectsDuplicates) {
+        conflicts.forEach(conflict => {
+          if (conflict.kind === 'duplicate') {
+            routesToSkip.add(conflict.shadowed);
+          }
+        });
+      }
+
+      // When specificity sorting is active, shadow conflicts where the sort
+      // promoted the winner (declared later but more specific) are resolved
+      // at runtime: the more-specific route is first-registered and handles
+      // its requests, the less-specific route handles the rest. Filtering
+      // these out prevents shadow: 'error' from aborting an app whose routes
+      // work correctly after specificity ordering. Genuine shadows — where the
+      // winner was already first in declaration order and the sort did not help
+      // — are kept and still apply the configured policy.
+      //
+      // Adapters that are not order-sensitive pick the most specific route,
+      // so a shadow is only real there between routes that differ by their
+      // parameter names alone ("/users/:id" and "/users/:username").
+      const effectiveConflicts = shouldSortBySpecificity
+        ? RouteConflictDetector.filterSortResolvedShadows(
+            conflicts,
+            resolvedRoutes,
+          )
+        : adapterIsOrderSensitive
+          ? conflicts
+          : conflicts.filter(
+              conflict =>
+                conflict.kind === 'duplicate' ||
+                RouteConflictDetector.pathsHaveSameShape(
+                  conflict.winner.path,
+                  conflict.shadowed.path,
+                ),
+            );
+
+      RouteConflictDetector.handle(
+        effectiveConflicts,
+        conflictPolicy,
+        this.logger,
+      );
+    }
+
+    orderedRoutes.forEach(route => {
+      if (routesToSkip.has(route)) return;
+      this.routesResolver.registerResolvedRoute(this.httpAdapter, route);
+    });
   }
 
   public async registerRouterHooks() {
@@ -185,10 +348,9 @@ export class NestApplication
     microserviceOptions: T,
     hybridAppOptions: NestHybridApplicationOptions = {},
   ): INestMicroservice {
-    const { NestMicroservice } = loadPackage(
+    const { NestMicroservice } = loadPackageCached(
       '@nestjs/microservices',
       'NestFactory',
-      () => require('@nestjs/microservices'),
     );
     const { inheritAppConfig } = hybridAppOptions;
     const applicationConfig = inheritAppConfig
@@ -198,11 +360,17 @@ export class NestApplication
     const instance = new NestMicroservice(
       this.container,
       microserviceOptions,
+      this.graphInspector,
       applicationConfig,
     );
-    instance.registerListeners();
-    instance.setIsInitialized(true);
-    instance.setIsInitHookCalled(true);
+    // Optional call, as an older "@nestjs/microservices" may not implement it
+    instance.setIsConnectedToApplication?.(true);
+
+    if (!hybridAppOptions.deferInitialization) {
+      instance.registerListeners();
+      instance.setIsInitialized(true);
+      instance.setIsInitHookCalled(true);
+    }
 
     this.microservices.push(instance);
     return instance;
@@ -216,45 +384,109 @@ export class NestApplication
     return this.httpServer;
   }
 
-  public startAllMicroservices(callback?: () => void): this {
-    Promise.all(this.microservices.map(this.listenToPromise)).then(
-      () => callback && callback(),
-    );
+  public async startAllMicroservices(): Promise<this> {
+    this.assertNotInPreviewMode('startAllMicroservices');
+    await Promise.all(this.microservices.map(msvc => msvc.listen()));
     return this;
-  }
-
-  public startAllMicroservicesAsync(): Promise<void> {
-    return new Promise(resolve => this.startAllMicroservices(resolve));
   }
 
   public use(...args: [any, any?]): this {
-    this.httpAdapter.use(...args);
+    this.httpAdapter.use(...this.applyFunctionDecoratorIfRegistered(args));
     return this;
   }
 
-  public enableCors(options?: CorsOptions | CorsOptionsDelegate<any>): void {
+  public useBodyParser(...args: [any, any?]): this {
+    if (!('useBodyParser' in this.httpAdapter)) {
+      this.logger.warn('Your HTTP Adapter does not support `.useBodyParser`.');
+      return this;
+    }
+
+    const [parserType, ...otherArgs] = args;
+    const rawBody = !!this.appOptions.rawBody;
+
+    this.httpAdapter.useBodyParser?.(...[parserType, rawBody, ...otherArgs]);
+
+    return this;
+  }
+
+  public enableCors(options?: any): void {
     this.httpAdapter.enableCors(options);
   }
 
-  public async listen(
-    port: number | string,
-    callback?: () => void,
-  ): Promise<any>;
-  public async listen(
-    port: number | string,
-    hostname: string,
-    callback?: () => void,
-  ): Promise<any>;
-  public async listen(port: number | string, ...args: any[]): Promise<any> {
-    !this.isInitialized && (await this.init());
-    this.isListening = true;
-    this.httpAdapter.listen(port, ...args);
-    return this.httpServer;
+  public enableCsrfProtection(options?: CsrfProtectionOptions): this {
+    this.assertSecurityFeatureCanBeEnabled('enableCsrfProtection');
+    const protection = new CrossOriginProtection(this.httpAdapter, options);
+    this.getSecurityHook().setCrossOriginProtection(protection);
+    this.enabledSecurityFeatures.add('enableCsrfProtection');
+    return this;
   }
 
-  public listenAsync(port: number | string, hostname?: string): Promise<any> {
-    return new Promise(resolve => {
-      const server: any = this.listen(port, hostname, () => resolve(server));
+  public useSecurityHeaders(options?: SecurityHeadersOptions): this {
+    this.assertSecurityFeatureCanBeEnabled('useSecurityHeaders');
+    const headers = resolveSecurityHeaders(options);
+    this.getSecurityHook().setHeaders(headers);
+    if (headers.removeHeaders.includes('X-Powered-By')) {
+      // Express sets the header before any middleware runs, so the hook alone
+      // misses responses ended by middleware registered ahead of the hook.
+      (this.httpAdapter as { disable?(setting: string): unknown }).disable?.(
+        'x-powered-by',
+      );
+    }
+    this.enabledSecurityFeatures.add('useSecurityHeaders');
+    return this;
+  }
+
+  public enableVersioning(
+    options: VersioningOptions = { type: VersioningType.URI },
+  ): this {
+    this.config.enableVersioning(options);
+    return this;
+  }
+
+  public async listen(port: number | string): Promise<any>;
+  public async listen(port: number | string, hostname: string): Promise<any>;
+  public async listen(port: number | string, ...args: any[]): Promise<any> {
+    this.assertNotInPreviewMode('listen');
+
+    if (!this.isInitialized) {
+      await this.init();
+    }
+
+    const httpAdapterHost = this.container.getHttpAdapterHostRef();
+    return new Promise((resolve, reject) => {
+      const errorHandler = (e: any) => {
+        this.logger.error(e?.toString?.());
+        reject(e);
+      };
+      this.httpServer.once('error', errorHandler);
+
+      const isCallbackInOriginalArgs = isFunction(args[args.length - 1]);
+      const listenFnArgs = isCallbackInOriginalArgs
+        ? args.slice(0, args.length - 1)
+        : args;
+
+      this.httpAdapter.listen(
+        port,
+        ...listenFnArgs,
+        (...originalCallbackArgs: unknown[]) => {
+          this.flushLogsIfAutoFlushEnabled();
+          if (originalCallbackArgs[0] instanceof Error) {
+            return reject(originalCallbackArgs[0]);
+          }
+
+          const address = this.httpServer.address();
+          if (address) {
+            this.httpServer.removeListener('error', errorHandler);
+            this.isListening = true;
+
+            httpAdapterHost.listening = true;
+            resolve(this.httpServer);
+          }
+          if (isCallbackInOriginalArgs) {
+            args[args.length - 1](...originalCallbackArgs);
+          }
+        },
+      );
     });
   }
 
@@ -263,89 +495,221 @@ export class NestApplication
       if (!this.isListening) {
         this.logger.error(MESSAGES.CALL_LISTEN_FIRST);
         reject(MESSAGES.CALL_LISTEN_FIRST);
+        return;
       }
-      this.httpServer.on('listening', () => {
-        const address = this.httpServer.address();
-        if (typeof address === 'string') {
-          if (platform() === 'win32') {
-            return address;
-          }
-          const basePath = encodeURIComponent(address);
-          return `${this.getProtocol()}+unix://${basePath}`;
-        }
-        let host = this.host();
-        if (address && address.family === 'IPv6') {
-          if (host === '::') {
-            host = '[::1]';
-          } else {
-            host = `[${host}]`;
-          }
-        } else if (host === '0.0.0.0') {
-          host = '127.0.0.1';
-        }
-        resolve(`${this.getProtocol()}://${host}:${address.port}`);
-      });
+      const address = this.httpServer.address();
+      resolve(this.formatAddress(address));
     });
   }
 
-  public setGlobalPrefix(prefix: string): this {
+  private formatAddress(address: any): string {
+    if (isString(address)) {
+      if (platform() === 'win32') {
+        return address;
+      }
+      const basePath = encodeURIComponent(address);
+      return `${this.getProtocol()}+unix://${basePath}`;
+    }
+
+    let host = this.host();
+    if (address && address.family === 'IPv6') {
+      if (host === '::') {
+        host = '[::1]';
+      } else {
+        host = `[${host}]`;
+      }
+    } else if (host === '0.0.0.0') {
+      host = '127.0.0.1';
+    }
+
+    return `${this.getProtocol()}://${host}:${address.port}`;
+  }
+
+  public setGlobalPrefix(prefix: string, options?: GlobalPrefixOptions): this {
     this.config.setGlobalPrefix(prefix);
+    if (options) {
+      const exclude = options?.exclude
+        ? mapToExcludeRoute(options.exclude)
+        : [];
+      this.config.setGlobalPrefixOptions({
+        ...options,
+        exclude,
+      });
+    }
     return this;
   }
 
   public useWebSocketAdapter(adapter: WebSocketAdapter): this {
+    if (this.isWsModuleRegistered) {
+      this.logger.warn(
+        'useWebSocketAdapter() was called after WebSocket gateways were already initialized. The provided adapter will be stored but will NOT be applied to existing gateways — they remain bound to the previously installed adapter. To install a custom adapter, call app.useWebSocketAdapter(...) BEFORE app.init() (or app.listen()).',
+      );
+    }
     this.config.setIoAdapter(adapter);
     return this;
   }
 
   public useGlobalFilters(...filters: ExceptionFilter[]): this {
+    filters = this.applyInstanceDecoratorIfRegistered<ExceptionFilter>(
+      ...filters,
+    );
     this.config.useGlobalFilters(...filters);
+    filters.forEach(item =>
+      this.graphInspector.insertOrphanedEnhancer({
+        subtype: 'filter',
+        ref: item,
+      }),
+    );
     return this;
   }
 
   public useGlobalPipes(...pipes: PipeTransform<any>[]): this {
+    pipes = this.applyInstanceDecoratorIfRegistered<PipeTransform<any>>(
+      ...pipes,
+    );
     this.config.useGlobalPipes(...pipes);
+    pipes.forEach(item =>
+      this.graphInspector.insertOrphanedEnhancer({
+        subtype: 'pipe',
+        ref: item,
+      }),
+    );
     return this;
   }
 
   public useGlobalInterceptors(...interceptors: NestInterceptor[]): this {
+    interceptors = this.applyInstanceDecoratorIfRegistered<NestInterceptor>(
+      ...interceptors,
+    );
     this.config.useGlobalInterceptors(...interceptors);
+    interceptors.forEach(item =>
+      this.graphInspector.insertOrphanedEnhancer({
+        subtype: 'interceptor',
+        ref: item,
+      }),
+    );
     return this;
   }
 
   public useGlobalGuards(...guards: CanActivate[]): this {
+    guards = this.applyInstanceDecoratorIfRegistered<CanActivate>(...guards);
     this.config.useGlobalGuards(...guards);
+    guards.forEach(item =>
+      this.graphInspector.insertOrphanedEnhancer({
+        subtype: 'guard',
+        ref: item,
+      }),
+    );
     return this;
   }
 
   public useStaticAssets(options: any): this;
   public useStaticAssets(path: string, options?: any): this;
   public useStaticAssets(pathOrOptions: any, options?: any): this {
-    this.httpAdapter.useStaticAssets &&
-      this.httpAdapter.useStaticAssets(pathOrOptions, options);
+    this.httpAdapter.useStaticAssets?.(pathOrOptions, options);
     return this;
   }
 
   public setBaseViewsDir(path: string | string[]): this {
-    this.httpAdapter.setBaseViewsDir && this.httpAdapter.setBaseViewsDir(path);
+    this.httpAdapter.setBaseViewsDir?.(path);
     return this;
   }
 
   public setViewEngine(engineOrOptions: any): this {
-    this.httpAdapter.setViewEngine &&
-      this.httpAdapter.setViewEngine(engineOrOptions);
+    this.httpAdapter.setViewEngine?.(engineOrOptions);
     return this;
   }
+
+  /**
+   * Pre-loads `@nestjs/microservices` so that `connectMicroservice()` can read
+   * it synchronously from the package cache.
+   *
+   * `@nestjs/platform-express` is deliberately not preloaded here: on this path
+   * the HTTP adapter has already been created (or passed in) by
+   * `NestFactory.create()` before this runs, and `TestingModule` preloads the
+   * package itself in `compile()`. Importing it here would load Express,
+   * body-parser and multer into every process that uses another adapter.
+   */
+  public async preloadLazyPackages(): Promise<void> {
+    // Best-effort: silently swallow if the package is not installed
+    await tryLoadPackage(
+      '@nestjs/microservices',
+      () => import('@nestjs/microservices'),
+    );
+  }
+
+  /**
+   * Builds the cookie signer from the `cookies.secret` option and shares it
+   * between the route params factory (through the config), which verifies
+   * signed cookies, and the HTTP adapter, which signs them in `setCookie()`.
+   */
+  private applyCookiesOptions(appOptions: NestApplicationOptions) {
+    const secret = appOptions.cookies?.secret;
+    if (secret === undefined) {
+      return;
+    }
+    const signer = new CookieSigner(secret);
+    this.config.setCookieSigner(signer);
+    // Duck-typed: the adapter may be a custom `HttpServer` that does not
+    // extend `AbstractHttpAdapter`, or come from another copy of @nestjs/core.
+    (this.httpAdapter as Partial<AbstractHttpAdapter>).setCookieSigner?.(
+      signer,
+    );
+  }
+
   private host(): string | undefined {
     const address = this.httpServer.address();
-    if (typeof address === 'string') {
+    if (isString(address)) {
       return undefined;
     }
     return address && address.address;
   }
 
   private getProtocol(): 'http' | 'https' {
-    return this.appOptions && this.appOptions.httpsOptions ? 'https' : 'http';
+    // Read from the server: `httpsOptions` is not the only way to serve HTTPS,
+    // the Fastify adapter takes its own `https` option and ignores this one.
+    // `https.Server` and `http2.Http2SecureServer` both extend `tls.Server`.
+    return this.httpServer instanceof TlsServer ? 'https' : 'http';
+  }
+
+  /**
+   * Request-level security features are installed as a framework middleware
+   * or hook. After `init()` it would land behind the routes (Express) or be
+   * rejected by the framework (Fastify), leaving routes silently unprotected,
+   * so they fail loudly instead. A second call is rejected as well, as it
+   * would silently replace the first configuration.
+   */
+  private assertSecurityFeatureCanBeEnabled(methodName: string) {
+    if (!this.httpAdapter.registerSecurityHook) {
+      throw new Error(
+        `Your HTTP Adapter does not support \`.${methodName}()\`.`,
+      );
+    }
+    if (this.isInitialized) {
+      throw new Error(
+        `app.${methodName}() must be called before app.init() / app.listen().`,
+      );
+    }
+    if (this.enabledSecurityFeatures.has(methodName)) {
+      throw new Error(`app.${methodName}() can only be called once.`);
+    }
+  }
+
+  /**
+   * Both security features share one request hook, so that they run in a
+   * fixed order (headers, then the CSRF check) whichever is enabled first.
+   * It is registered with the adapter the first time either is enabled,
+   * i.e. at that position in the middleware chain.
+   */
+  private getSecurityHook(): HttpSecurityHook {
+    if (!this.securityHook) {
+      const hook = new HttpSecurityHook();
+      this.httpAdapter.registerSecurityHook!((request, response) =>
+        hook.handle(request, response),
+      );
+      this.securityHook = hook;
+    }
+    return this.securityHook;
   }
 
   private async registerMiddleware(instance: any) {
@@ -355,9 +719,68 @@ export class NestApplication
     );
   }
 
-  private listenToPromise(microservice: INestMicroservice) {
-    return new Promise<void>(async resolve => {
-      await microservice.listen(resolve);
-    });
+  private applyInstanceDecoratorIfRegistered<T>(...instances: T[]): T[] {
+    if (this.appOptions.instrument?.instanceDecorator) {
+      const decorate = makeSafeInstanceDecorator(
+        this.appOptions.instrument.instanceDecorator,
+      );
+      return instances.map(instance => decorate(instance) as T);
+    }
+    return instances;
+  }
+
+  private applyFunctionDecoratorIfRegistered(args: [any, any?]): [any, any?] {
+    if (!this.appOptions.instrument?.instanceDecorator) {
+      return args;
+    }
+    const decorate = makeSafeInstanceDecorator(
+      this.appOptions.instrument.instanceDecorator,
+    );
+
+    // Decorators may return a non-function value for plain middleware
+    // functions; fall back to the original argument so the HTTP adapter
+    // always receives a valid handler.
+    const decorateFunction = (arg: any) => {
+      if (!isFunction(arg)) {
+        return arg;
+      }
+      const decorated = decorate(arg);
+      return isFunction(decorated) ? decorated : arg;
+    };
+
+    // Map over the original arguments to preserve arity: appending a trailing
+    // `undefined` to a single-argument `use(fn)` call would make Express 5's
+    // router throw "argument handler must be a function".
+    return args.map(decorateFunction) as [any, any?];
+  }
+
+  private async loadSocketModule() {
+    if (!this.socketModule) {
+      const socketModule = await optionalRequire(
+        '@nestjs/websockets/socket-module',
+        () => import('@nestjs/websockets/socket-module.js'),
+      );
+      if (socketModule?.SocketModule) {
+        this.socketModule = new socketModule.SocketModule();
+      }
+    }
+  }
+
+  private async loadMicroservicesModule() {
+    if (!this.microservicesModule) {
+      const msModule = await optionalRequire(
+        '@nestjs/microservices/microservices-module',
+        () => import('@nestjs/microservices/microservices-module.js'),
+      );
+      if (msModule?.MicroservicesModule) {
+        this.microservicesModule = new msModule.MicroservicesModule();
+        // Pre-cache the main barrel so connectMicroservice() can stay synchronous
+        await loadPackage(
+          '@nestjs/microservices',
+          'NestFactory',
+          () => import('@nestjs/microservices'),
+        );
+      }
+    }
   }
 }

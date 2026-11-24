@@ -1,27 +1,28 @@
-import { Injector } from '../injector/injector';
-import { InstanceWrapper } from '../injector/instance-wrapper';
-import { Module } from '../injector/module';
-import { MiddlewareContainer } from './container';
+import type { InjectionToken } from '@nestjs/common';
+import { Injector } from '../injector/injector.js';
+import { InstanceWrapper } from '../injector/instance-wrapper.js';
+import { Module } from '../injector/module.js';
+import { MiddlewareContainer } from './container.js';
 
 export class MiddlewareResolver {
-  private readonly instanceLoader = new Injector();
-
-  constructor(private readonly middlewareContainer: MiddlewareContainer) {}
+  constructor(
+    private readonly middlewareContainer: MiddlewareContainer,
+    private readonly injector: Injector,
+  ) {}
 
   public async resolveInstances(moduleRef: Module, moduleName: string) {
-    const middleware = this.middlewareContainer.getMiddlewareCollection(
-      moduleName,
-    );
+    const middlewareMap =
+      this.middlewareContainer.getMiddlewareCollection(moduleName);
     const resolveInstance = async (wrapper: InstanceWrapper) =>
-      this.resolveMiddlewareInstance(wrapper, middleware, moduleRef);
-    await Promise.all([...middleware.values()].map(resolveInstance));
+      this.resolveMiddlewareInstance(wrapper, middlewareMap, moduleRef);
+    await Promise.all([...middlewareMap.values()].map(resolveInstance));
   }
 
   private async resolveMiddlewareInstance(
     wrapper: InstanceWrapper,
-    middleware: Map<string, InstanceWrapper>,
+    middlewareMap: Map<InjectionToken, InstanceWrapper>,
     moduleRef: Module,
   ) {
-    await this.instanceLoader.loadMiddleware(wrapper, middleware, moduleRef);
+    await this.injector.loadMiddleware(wrapper, middlewareMap, moduleRef);
   }
 }

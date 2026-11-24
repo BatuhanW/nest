@@ -1,21 +1,40 @@
-import {
+import type {
   CanActivate,
   ExceptionFilter,
   NestInterceptor,
   PipeTransform,
+  PreRequestHook,
+  RouteConflictPolicy,
+  RouteResolutionStrategy,
+  VersioningOptions,
   WebSocketAdapter,
 } from '@nestjs/common';
-import { InstanceWrapper } from './injector/instance-wrapper';
+import type { GlobalPrefixOptions } from '@nestjs/common/internal';
+import {
+  assertEnhancer,
+  warnOnInvalidFilter,
+} from './helpers/assert-enhancer.js';
+import type { CookieSigner } from './helpers/cookies/cookie-signer.js';
+import { InstanceWrapper } from './injector/instance-wrapper.js';
+import { ExcludeRouteMetadata } from './router/interfaces/exclude-route-metadata.interface.js';
 
 export class ApplicationConfig {
   private globalPrefix = '';
-  private globalPipes: PipeTransform[] = [];
-  private globalFilters: ExceptionFilter[] = [];
-  private globalInterceptors: NestInterceptor[] = [];
-  private globalGuards: CanActivate[] = [];
+  private globalPrefixOptions: GlobalPrefixOptions<ExcludeRouteMetadata> = {};
+  private globalPipes: Array<PipeTransform> = [];
+  private globalFilters: Array<ExceptionFilter> = [];
+  private globalInterceptors: Array<NestInterceptor> = [];
+  private globalGuards: Array<CanActivate> = [];
+  private globalPreRequestHooks: Array<PreRequestHook> = [];
+  private versioningOptions: VersioningOptions;
+  private routeConflictPolicy: RouteConflictPolicy | undefined;
+  private routeResolutionStrategy: RouteResolutionStrategy | undefined;
+  private cookieSigner: CookieSigner | undefined;
   private readonly globalRequestPipes: InstanceWrapper<PipeTransform>[] = [];
-  private readonly globalRequestFilters: InstanceWrapper<ExceptionFilter>[] = [];
-  private readonly globalRequestInterceptors: InstanceWrapper<NestInterceptor>[] = [];
+  private readonly globalRequestFilters: InstanceWrapper<ExceptionFilter>[] =
+    [];
+  private readonly globalRequestInterceptors: InstanceWrapper<NestInterceptor>[] =
+    [];
   private readonly globalRequestGuards: InstanceWrapper<CanActivate>[] = [];
 
   constructor(private ioAdapter: WebSocketAdapter | null = null) {}
@@ -28,12 +47,22 @@ export class ApplicationConfig {
     return this.globalPrefix;
   }
 
+  public setGlobalPrefixOptions(
+    options: GlobalPrefixOptions<ExcludeRouteMetadata>,
+  ) {
+    this.globalPrefixOptions = options;
+  }
+
+  public getGlobalPrefixOptions(): GlobalPrefixOptions<ExcludeRouteMetadata> {
+    return this.globalPrefixOptions;
+  }
+
   public setIoAdapter(ioAdapter: WebSocketAdapter) {
     this.ioAdapter = ioAdapter;
   }
 
   public getIoAdapter(): WebSocketAdapter {
-    return this.ioAdapter;
+    return this.ioAdapter!;
   }
 
   public addGlobalPipe(pipe: PipeTransform<any>) {
@@ -41,6 +70,7 @@ export class ApplicationConfig {
   }
 
   public useGlobalPipes(...pipes: PipeTransform<any>[]) {
+    pipes.forEach(item => item != null && assertEnhancer(item, 'pipe'));
     this.globalPipes = this.globalPipes.concat(pipes);
   }
 
@@ -53,6 +83,7 @@ export class ApplicationConfig {
   }
 
   public useGlobalFilters(...filters: ExceptionFilter[]) {
+    filters.forEach(item => item != null && warnOnInvalidFilter(item));
     this.globalFilters = this.globalFilters.concat(filters);
   }
 
@@ -69,6 +100,9 @@ export class ApplicationConfig {
   }
 
   public useGlobalInterceptors(...interceptors: NestInterceptor[]) {
+    interceptors.forEach(
+      item => item != null && assertEnhancer(item, 'interceptor'),
+    );
     this.globalInterceptors = this.globalInterceptors.concat(interceptors);
   }
 
@@ -81,6 +115,7 @@ export class ApplicationConfig {
   }
 
   public useGlobalGuards(...guards: CanActivate[]) {
+    guards.forEach(item => item != null && assertEnhancer(item, 'guard'));
     this.globalGuards = this.globalGuards.concat(guards);
   }
 
@@ -116,5 +151,52 @@ export class ApplicationConfig {
 
   public getGlobalRequestGuards(): InstanceWrapper<CanActivate>[] {
     return this.globalRequestGuards;
+  }
+
+  public registerPreRequestHook(...hooks: PreRequestHook[]) {
+    this.globalPreRequestHooks = this.globalPreRequestHooks.concat(hooks);
+  }
+
+  public getGlobalPreRequestHooks(): PreRequestHook[] {
+    return this.globalPreRequestHooks;
+  }
+
+  public enableVersioning(options: VersioningOptions): void {
+    if (Array.isArray(options.defaultVersion)) {
+      // Drop duplicated versions
+      options.defaultVersion = Array.from(new Set(options.defaultVersion));
+    }
+
+    this.versioningOptions = options;
+  }
+
+  public getVersioning(): VersioningOptions | undefined {
+    return this.versioningOptions;
+  }
+
+  public setRouteConflictPolicy(policy: RouteConflictPolicy | undefined): void {
+    this.routeConflictPolicy = policy;
+  }
+
+  public getRouteConflictPolicy(): RouteConflictPolicy | undefined {
+    return this.routeConflictPolicy;
+  }
+
+  public setRouteResolutionStrategy(
+    strategy: RouteResolutionStrategy | undefined,
+  ): void {
+    this.routeResolutionStrategy = strategy;
+  }
+
+  public getRouteResolutionStrategy(): RouteResolutionStrategy | undefined {
+    return this.routeResolutionStrategy;
+  }
+
+  public setCookieSigner(signer: CookieSigner | undefined): void {
+    this.cookieSigner = signer;
+  }
+
+  public getCookieSigner(): CookieSigner | undefined {
+    return this.cookieSigner;
   }
 }

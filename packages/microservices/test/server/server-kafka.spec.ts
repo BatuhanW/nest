@@ -1,13 +1,18 @@
 import { Logger } from '@nestjs/common';
-import { expect } from 'chai';
-import * as sinon from 'sinon';
-import { NO_MESSAGE_HANDLER } from '../../constants';
-import { KafkaHeaders } from '../../enums';
+import { concat, EMPTY, of, Subject, throwError } from 'rxjs';
+import { DEFAULT_GRACE_PERIOD, NO_MESSAGE_HANDLER } from '../../constants.js';
+import { KafkaContext } from '../../ctx-host/index.js';
+import { KafkaHeaders } from '../../enums/index.js';
+import { InvalidPacketIdException } from '../../errors/invalid-packet-id.exception.js';
+import { MaxPacketLengthExceededException } from '../../errors/max-packet-length-exceeded.exception.js';
+import { KafkaRetriableException } from '../../exceptions/index.js';
+import { RpcExceptionsHandler } from '../../exceptions/rpc-exceptions-handler.js';
 import {
   EachMessagePayload,
   KafkaMessage,
-} from '../../external/kafka.interface';
-import { ServerKafka } from '../../server';
+} from '../../external/kafka.interface.js';
+import { ServerKafka } from '../../server/index.js';
+import { objectToMap } from './utils/object-to-map.js';
 
 class NoopLogger extends Logger {
   log(message: any, context?: string): void {}
@@ -16,9 +21,6 @@ class NoopLogger extends Logger {
 }
 
 describe('ServerKafka', () => {
-  const objectToMap = obj =>
-    new Map(Object.keys(obj).map(i => [i, obj[i]]) as any);
-
   const topic = 'test.topic';
   const replyTopic = 'test.topic.reply';
   const replyPartition = '0';
@@ -26,6 +28,8 @@ describe('ServerKafka', () => {
   const key = '1';
   const timestamp = new Date().toISOString();
   const messageValue = 'test-message';
+  const heartbeat = async () => {};
+  const pause = () => () => {};
 
   const eventMessage: KafkaMessage = {
     key: Buffer.from(key),
@@ -44,6 +48,8 @@ describe('ServerKafka', () => {
       },
       eventMessage,
     ),
+    heartbeat,
+    pause,
   };
 
   const eventWithCorrelationIdPayload: EachMessagePayload = {
@@ -57,6 +63,8 @@ describe('ServerKafka', () => {
       },
       eventMessage,
     ),
+    heartbeat,
+    pause,
   };
 
   const message: KafkaMessage = Object.assign(
@@ -73,154 +81,589 @@ describe('ServerKafka', () => {
     topic,
     partition: 0,
     message,
+    heartbeat,
+    pause,
   };
 
   let server: ServerKafka;
-  let callback: sinon.SinonSpy;
-  let bindEventsStub: sinon.SinonStub;
-  let connect: sinon.SinonSpy;
-  let subscribe: sinon.SinonSpy;
-  let run: sinon.SinonSpy;
-  let send: sinon.SinonSpy;
-  let consumerStub: sinon.SinonStub;
-  let producerStub: sinon.SinonStub;
-  let client;
+  let untypedServer: any;
+  let callback: ReturnType<typeof vi.fn>;
+  let bindEventsStub: ReturnType<typeof vi.fn>;
+  let connect: ReturnType<typeof vi.fn>;
+  let subscribe: ReturnType<typeof vi.fn>;
+  let run: ReturnType<typeof vi.fn>;
+  let send: ReturnType<typeof vi.fn>;
+  let on: ReturnType<typeof vi.fn>;
+  let consumerStub: ReturnType<typeof vi.fn>;
+  let producerStub: ReturnType<typeof vi.fn>;
+  let client: any;
 
   beforeEach(() => {
     server = new ServerKafka({});
-    callback = sinon.spy();
-    connect = sinon.spy();
-    subscribe = sinon.spy();
-    run = sinon.spy();
-    send = sinon.spy();
+    untypedServer = server as any;
 
-    consumerStub = sinon.stub(server as any, 'consumer').callsFake(() => {
+    callback = vi.fn();
+    connect = vi.fn();
+    subscribe = vi.fn();
+    run = vi.fn();
+    send = vi.fn();
+    on = vi.fn();
+
+    consumerStub = vi.fn(() => {
       return {
         connect,
         subscribe,
         run,
+        on,
+        events: {
+          GROUP_JOIN: 'consumer.group_join',
+          HEARTBEAT: 'consumer.heartbeat',
+          COMMIT_OFFSETS: 'consumer.commit_offsets',
+          FETCH_START: 'consumer.fetch_start',
+          FETCH: 'consumer.fetch',
+          START_BATCH_PROCESS: 'consumer.start_batch_process',
+          END_BATCH_PROCESS: 'consumer.end_batch_process',
+          CONNECT: 'consumer.connect',
+          DISCONNECT: 'consumer.disconnect',
+          STOP: 'consumer.stop',
+          CRASH: 'consumer.crash',
+          REBALANCING: 'consumer.rebalancing',
+          RECEIVED_UNSUBSCRIBED_TOPICS: 'consumer.received_unsubscribed_topics',
+          REQUEST: 'consumer.network.request',
+          REQUEST_TIMEOUT: 'consumer.network.request_timeout',
+          REQUEST_QUEUE_SIZE: 'consumer.network.request_queue_size',
+        },
       };
     });
-    producerStub = sinon.stub(server as any, 'producer').callsFake(() => {
+    producerStub = vi.fn(() => {
       return {
         connect,
         send,
+        on,
+        events: {
+          CONNECT: 'producer.connect',
+          DISCONNECT: 'producer.disconnect',
+          REQUEST: 'producer.network.request',
+          REQUEST_TIMEOUT: 'producer.network.request_timeout',
+          REQUEST_QUEUE_SIZE: 'producer.network.request_queue_size',
+        },
       };
     });
     client = {
       consumer: consumerStub,
       producer: producerStub,
     };
-    sinon.stub(server, 'createClient').callsFake(() => client);
+    vi.spyOn(server, 'createClient').mockImplementation(async () => client);
+
+    untypedServer = server as any;
   });
 
   describe('listen', () => {
     it('should call "bindEvents"', async () => {
-      bindEventsStub = sinon
-        .stub(server, 'bindEvents')
-        .callsFake(() => ({} as any));
-      await server.listen(callback);
-      expect(bindEventsStub.called).to.be.true;
+      bindEventsStub = vi
+        .spyOn(server, 'bindEvents')
+        .mockImplementation(() => ({}) as any);
+
+      await server.listen(() => {});
+      expect(bindEventsStub).toHaveBeenCalled();
     });
     it('should call callback', async () => {
       await server.listen(callback);
-      expect(callback.called).to.be.true;
+      expect(callback).toHaveBeenCalled();
+    });
+    it('should skip startup when closed while creating the client', async () => {
+      let resolveClient!: (value: any) => void;
+      vi.spyOn(server, 'createClient').mockImplementation(
+        () =>
+          new Promise(resolve => {
+            resolveClient = resolve;
+          }),
+      );
+      const startSpy = vi.spyOn(server, 'start');
+
+      const listenPromise = server.listen(callback);
+      await server.close();
+      resolveClient(client);
+      await listenPromise;
+
+      expect(startSpy).not.toHaveBeenCalled();
+      expect(consumerStub).not.toHaveBeenCalled();
+      expect(producerStub).not.toHaveBeenCalled();
+      expect(untypedServer.client).toBeNull();
+      expect(callback).toHaveBeenCalledExactlyOnceWith(
+        new Error('Connection closed'),
+      );
+    });
+    it.each(['consumer.connect', 'producer.connect', 'consumer.run'] as const)(
+      'should disconnect and stop startup when closed during %s',
+      async step => {
+        const disconnect = vi.fn().mockResolvedValue(undefined);
+        let finishStep!: () => void;
+        const pending = () =>
+          new Promise<void>(resolve => {
+            finishStep = resolve;
+          });
+        let connects = 0;
+        connect.mockImplementation(() => {
+          connects++;
+          return (step === 'consumer.connect' && connects === 1) ||
+            (step === 'producer.connect' && connects === 2)
+            ? pending()
+            : Promise.resolve();
+        });
+        if (step === 'consumer.run') {
+          run.mockImplementation(pending);
+        }
+        consumerStub.mockImplementation(() => ({
+          connect,
+          subscribe,
+          run,
+          on,
+          disconnect,
+          events: {},
+        }));
+        producerStub.mockImplementation(() => ({
+          connect,
+          send,
+          on,
+          disconnect,
+          events: {},
+        }));
+        server.addHandler('topic', vi.fn() as any);
+
+        const listening = server.listen(callback);
+        await vi.waitFor(() => expect(finishStep).toBeDefined());
+        await server.close();
+        finishStep();
+        await listening;
+
+        expect(callback).toHaveBeenCalledExactlyOnceWith(
+          new Error('Connection closed'),
+        );
+        expect(connect).toHaveBeenCalledTimes(
+          step === 'consumer.connect' ? 1 : 2,
+        );
+        // Once by "close()", then once more after the step finished
+        expect(disconnect).toHaveBeenCalledTimes(4);
+      },
+    );
+    describe('when "start" throws an exception', () => {
+      it('should call callback with a thrown error as an argument', async () => {
+        const error = new Error('random error');
+
+        const callbackSpy = vi.fn();
+        vi.spyOn(server, 'start').mockImplementation(() => {
+          throw error;
+        });
+        await server.listen(callbackSpy);
+        expect(callbackSpy).toHaveBeenCalledWith(error);
+      });
     });
   });
 
   describe('close', () => {
-    const consumer = { disconnect: sinon.spy() };
-    const producer = { disconnect: sinon.spy() };
+    const flush = () => new Promise(resolve => setImmediate(resolve));
+    let requestPayload: EachMessagePayload;
+    let consumer: { disconnect: ReturnType<typeof vi.fn> };
+    let producer: {
+      disconnect: ReturnType<typeof vi.fn>;
+      send: ReturnType<typeof vi.fn>;
+    };
     beforeEach(() => {
-      (server as any).consumer = consumer;
-      (server as any).producer = producer;
+      requestPayload = { ...payload, message: { ...message } };
+      consumer = { disconnect: vi.fn() };
+      producer = {
+        disconnect: vi.fn(),
+        send: vi.fn().mockResolvedValue([]),
+      };
+      untypedServer.consumer = consumer;
+      untypedServer.producer = producer;
+      untypedServer.client = client;
+      untypedServer.logger = new NoopLogger();
     });
+    afterEach(() => vi.useRealTimers());
     it('should close server', async () => {
       await server.close();
 
-      expect(consumer.disconnect.calledOnce).to.be.true;
-      expect(producer.disconnect.calledOnce).to.be.true;
-      expect((server as any).consumer).to.be.null;
-      expect((server as any).producer).to.be.null;
-      expect((server as any).client).to.be.null;
+      expect(consumer.disconnect).toHaveBeenCalledOnce();
+      expect(producer.disconnect).toHaveBeenCalledOnce();
+      expect(untypedServer.consumer).toBeNull();
+      expect(untypedServer.producer).toBeNull();
+      expect(untypedServer.client).toBeNull();
+    });
+    // Replies of the handlers the consumer waits for go through the producer
+    it('should disconnect the producer only once the consumer has disconnected', async () => {
+      let resolveConsumer!: () => void;
+      consumer.disconnect.mockReturnValue(
+        new Promise<void>(resolve => (resolveConsumer = resolve)),
+      );
+
+      const closing = server.close();
+      await new Promise(resolve => setImmediate(resolve));
+      expect(producer.disconnect).not.toHaveBeenCalled();
+
+      resolveConsumer();
+      await closing;
+      expect(producer.disconnect).toHaveBeenCalledOnce();
+    });
+    it('should publish the remaining response stream before disconnecting', async () => {
+      const responses = new Subject<string>();
+      server.addHandler(topic, () => concat(of('first'), responses));
+      // The eachMessage callback settles after the first value, before the
+      // response stream and its publishes have finished.
+      await server.handleMessage(requestPayload);
+      await flush();
+      const closing = server.close();
+      await flush();
+      const disconnectedEarly = producer.disconnect.mock.calls.length > 0;
+
+      responses.next('last');
+      responses.complete();
+      await closing;
+      await flush();
+
+      expect(disconnectedEarly).toBe(false);
+      expect(
+        producer.send.mock.calls.map(([record]) => record.messages[0].value),
+      ).toEqual(['first', 'last']);
+    });
+
+    it('should publish a response still being serialized before disconnecting', async () => {
+      let finishSerialization!: () => void;
+      const serialization = new Promise<void>(resolve => {
+        finishSerialization = resolve;
+      });
+      untypedServer.serializer = {
+        serialize: async (value: string) => {
+          await serialization;
+          return { value, headers: {} };
+        },
+      };
+      server.addHandler(topic, () => 'result');
+      await server.handleMessage(requestPayload);
+      await flush();
+      const closing = server.close();
+      await flush();
+      const disconnectedEarly = producer.disconnect.mock.calls.length > 0;
+
+      finishSerialization();
+      await closing;
+      await flush();
+
+      expect(disconnectedEarly).toBe(false);
+      expect(producer.send).toHaveBeenCalledOnce();
+    });
+
+    it('should wait for a pending publish before disconnecting', async () => {
+      let finishPublish!: () => void;
+      producer.send.mockReturnValue(
+        new Promise<void>(resolve => {
+          finishPublish = resolve;
+        }),
+      );
+      server.addHandler(topic, () => 'result');
+      await server.handleMessage(requestPayload);
+      await flush();
+      const closing = server.close();
+      await flush();
+      const disconnectedEarly = producer.disconnect.mock.calls.length > 0;
+
+      finishPublish();
+      await closing;
+
+      expect(disconnectedEarly).toBe(false);
+      expect(producer.disconnect).toHaveBeenCalledOnce();
+    });
+
+    it('should bound the wait for a stream that never completes and close again immediately', async () => {
+      vi.useFakeTimers();
+      const responses = new Subject<string>();
+      server.addHandler(topic, () => concat(of('first'), responses));
+      await server.handleMessage(requestPayload);
+      const closing = server.close();
+      await vi.advanceTimersByTimeAsync(DEFAULT_GRACE_PERIOD - 1);
+      const disconnectedEarly = producer.disconnect.mock.calls.length > 0;
+      await vi.advanceTimersByTimeAsync(1);
+      await closing;
+
+      let closedAgain = false;
+      const secondClose = server.close().then(() => (closedAgain = true));
+      await vi.advanceTimersByTimeAsync(0);
+      const closedAgainImmediately = closedAgain;
+      // Settle the test even if a repeated close incorrectly waits again.
+      await vi.advanceTimersByTimeAsync(DEFAULT_GRACE_PERIOD);
+      await secondClose;
+      responses.complete();
+
+      expect(disconnectedEarly).toBe(false);
+      expect(producer.disconnect).toHaveBeenCalledOnce();
+      expect(closedAgainImmediately).toBe(true);
+    });
+
+    it('should wait for "gracePeriod" at most when the option is set', async () => {
+      vi.useFakeTimers();
+      untypedServer.options.gracePeriod = 500;
+      const responses = new Subject<string>();
+      server.addHandler(topic, () => concat(of('first'), responses));
+      await server.handleMessage(requestPayload);
+      const closing = server.close();
+      await vi.advanceTimersByTimeAsync(499);
+      const disconnectedEarly = producer.disconnect.mock.calls.length > 0;
+      await vi.advanceTimersByTimeAsync(1);
+      await closing;
+      responses.complete();
+
+      expect(disconnectedEarly).toBe(false);
+      expect(producer.disconnect).toHaveBeenCalledOnce();
+    });
+
+    it('should not wait for the pending replies when "gracePeriod" is 0', async () => {
+      vi.useFakeTimers();
+      untypedServer.options.gracePeriod = 0;
+      const responses = new Subject<string>();
+      server.addHandler(topic, () => concat(of('first'), responses));
+      await server.handleMessage(requestPayload);
+      const closing = server.close();
+      await vi.advanceTimersByTimeAsync(0);
+      await closing;
+      responses.complete();
+
+      expect(producer.disconnect).toHaveBeenCalledOnce();
+    });
+
+    it('should close without a grace timer when no replies are pending', async () => {
+      vi.useFakeTimers();
+      await server.close();
+
+      expect(producer.disconnect).toHaveBeenCalledOnce();
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('should disconnect the producer and reset the clients when the consumer fails to disconnect', async () => {
+      const error = new Error('consumer');
+      consumer.disconnect.mockRejectedValue(error);
+
+      await expect(server.close()).rejects.toBe(error);
+
+      expect(producer.disconnect).toHaveBeenCalledOnce();
+      expect(untypedServer.consumer).toBeNull();
+      expect(untypedServer.producer).toBeNull();
+      expect(untypedServer.client).toBeNull();
+    });
+    it('should reset the clients when the producer fails to disconnect', async () => {
+      const error = new Error('producer');
+      producer.disconnect.mockRejectedValue(error);
+
+      await expect(server.close()).rejects.toBe(error);
+
+      expect(consumer.disconnect).toHaveBeenCalledOnce();
+      expect(untypedServer.consumer).toBeNull();
+      expect(untypedServer.producer).toBeNull();
+      expect(untypedServer.client).toBeNull();
+    });
+    it('should reject with the consumer error and log the producer error when both fail to disconnect', async () => {
+      const consumerError = new Error('consumer');
+      const producerError = new Error('producer');
+      consumer.disconnect.mockRejectedValue(consumerError);
+      producer.disconnect.mockRejectedValue(producerError);
+      const logError = vi
+        .spyOn(untypedServer.logger, 'error')
+        .mockImplementation(() => {});
+
+      await expect(server.close()).rejects.toBe(consumerError);
+
+      expect(logError).toHaveBeenCalledWith(producerError);
     });
   });
 
   describe('bindEvents', () => {
     it('should not call subscribe nor run on consumer when there are no messageHandlers', async () => {
-      (server as any).logger = new NoopLogger();
+      untypedServer.logger = new NoopLogger();
       await server.listen(callback);
-      await server.bindEvents((server as any).consumer);
-      expect(subscribe.called).to.be.false;
-      expect(run.called).to.be.true;
-      expect(connect.called).to.be.true;
+      await server.bindEvents(untypedServer.consumer);
+      expect(subscribe).not.toHaveBeenCalled();
+      expect(run).toHaveBeenCalled();
+      expect(connect).toHaveBeenCalled();
     });
     it('should call subscribe and run on consumer when there are messageHandlers', async () => {
-      (server as any).logger = new NoopLogger();
+      untypedServer.logger = new NoopLogger();
       await server.listen(callback);
 
       const pattern = 'test';
-      const handler = sinon.spy();
-      (server as any).messageHandlers = objectToMap({
+      const handler = vi.fn();
+      untypedServer.messageHandlers = objectToMap({
         [pattern]: handler,
       });
 
-      await server.bindEvents((server as any).consumer);
+      await server.bindEvents(untypedServer.consumer);
 
-      expect(subscribe.called).to.be.true;
-      expect(
-        subscribe.calledWith({
-          topic: pattern,
-        }),
-      ).to.be.true;
+      expect(subscribe).toHaveBeenCalled();
+      expect(subscribe).toHaveBeenCalledWith({
+        topics: [pattern],
+      });
 
-      expect(run.called).to.be.true;
-      expect(connect.called).to.be.true;
+      expect(run).toHaveBeenCalled();
+      expect(connect).toHaveBeenCalled();
     });
     it('should call subscribe with options and run on consumer when there are messageHandlers', async () => {
-      (server as any).logger = new NoopLogger();
-      (server as any).options.subscribe = {};
-      (server as any).options.subscribe.fromBeginning = true;
+      untypedServer.logger = new NoopLogger();
+      untypedServer.options.subscribe = {};
+      untypedServer.options.subscribe.fromBeginning = true;
       await server.listen(callback);
 
       const pattern = 'test';
-      const handler = sinon.spy();
-      (server as any).messageHandlers = objectToMap({
+      const handler = vi.fn();
+      untypedServer.messageHandlers = objectToMap({
         [pattern]: handler,
       });
 
-      await server.bindEvents((server as any).consumer);
+      await server.bindEvents(untypedServer.consumer);
 
-      expect(subscribe.called).to.be.true;
-      expect(
-        subscribe.calledWith({
-          topic: pattern,
-          fromBeginning: true,
+      expect(subscribe).toHaveBeenCalled();
+      expect(subscribe).toHaveBeenCalledWith({
+        topics: [pattern],
+        fromBeginning: true,
+      });
+
+      expect(run).toHaveBeenCalled();
+      expect(connect).toHaveBeenCalled();
+    });
+    it('should subscribe to regex message patterns', async () => {
+      untypedServer.logger = new NoopLogger();
+      await server.listen(callback);
+
+      const pattern = /test\..*/;
+      const handler = vi.fn();
+      server.addHandler(pattern, handler);
+
+      await server.bindEvents(untypedServer.consumer);
+
+      expect(subscribe).toHaveBeenCalled();
+      expect(subscribe).toHaveBeenCalledWith({
+        topics: [pattern],
+      });
+
+      expect(run).toHaveBeenCalled();
+      expect(connect).toHaveBeenCalled();
+    });
+    it('should pass run options with partitionsConsumedConcurrently to consumer.run()', async () => {
+      untypedServer.logger = new NoopLogger();
+      untypedServer.options.run = {
+        partitionsConsumedConcurrently: 5,
+      };
+      await server.listen(callback);
+      await server.bindEvents(untypedServer.consumer);
+
+      expect(run).toHaveBeenCalled();
+      expect(run.mock.calls[0][0]).toEqual(
+        expect.objectContaining({
+          partitionsConsumedConcurrently: 5,
         }),
-      ).to.be.true;
+      );
+      expect(run.mock.calls[0][0]).toHaveProperty('eachMessage');
+    });
+    it('should pass multiple run options to consumer.run()', async () => {
+      untypedServer.logger = new NoopLogger();
+      untypedServer.options.run = {
+        partitionsConsumedConcurrently: 3,
+        autoCommit: false,
+        autoCommitInterval: 5000,
+      };
+      await server.listen(callback);
+      await server.bindEvents(untypedServer.consumer);
 
-      expect(run.called).to.be.true;
-      expect(connect.called).to.be.true;
+      expect(run).toHaveBeenCalled();
+      const callArg = run.mock.calls[0][0];
+      expect(callArg).toEqual(
+        expect.objectContaining({
+          partitionsConsumedConcurrently: 3,
+          autoCommit: false,
+          autoCommitInterval: 5000,
+        }),
+      );
+      expect(callArg).toHaveProperty('eachMessage');
     });
   });
 
   describe('getMessageHandler', () => {
     it(`should return function`, () => {
-      expect(typeof server.getMessageHandler()).to.be.eql('function');
+      expect(typeof server.getMessageHandler()).toEqual('function');
     });
     describe('handler', () => {
       it('should call "handleMessage"', async () => {
-        const handleMessageStub = sinon
-          .stub(server, 'handleMessage')
-          .callsFake(() => null);
-        (await server.getMessageHandler())(null);
-        expect(handleMessageStub.called).to.be.true;
+        const handleMessageStub = vi
+          .spyOn(server, 'handleMessage')
+          .mockImplementation(() => null!);
+        await server.getMessageHandler()(null!);
+        expect(handleMessageStub).toHaveBeenCalled();
+      });
+
+      it('should reject with what "handleMessage" rejects with', async () => {
+        const error = new Error('handler failed');
+        vi.spyOn(server, 'handleMessage').mockRejectedValue(error);
+
+        await expect(server.getMessageHandler()(null!)).rejects.toBe(error);
+      });
+
+      it('should reject with a "KafkaRetriableException" as it is', async () => {
+        const error = new KafkaRetriableException('retriable');
+        vi.spyOn(server, 'handleMessage').mockRejectedValue(error);
+
+        await expect(server.getMessageHandler()(null!)).rejects.toBe(error);
+      });
+
+      it('should reject with what is not an error as it is', async () => {
+        const error = { status: 'error', message: 'Internal server error' };
+        vi.spyOn(server, 'handleMessage').mockRejectedValue(error);
+
+        await expect(server.getMessageHandler()(null!)).rejects.toBe(error);
+      });
+
+      // kafkajs does not retry these, and leaves the consumer stopped
+      it.each([TypeError, RangeError, ReferenceError, SyntaxError])(
+        'should reject with an error kafkajs retries when "handleMessage" rejects with a %o',
+        async ErrorType => {
+          const error = new ErrorType('handler failed');
+          vi.spyOn(server, 'handleMessage').mockRejectedValue(error);
+
+          const rejection = await server
+            .getMessageHandler()(null!)
+            .catch(err => err);
+
+          expect(rejection).toBeInstanceOf(Error);
+          expect(rejection.name).toBe('Error');
+          expect(rejection.message).toBe('handler failed');
+          expect(rejection.stack).toBe(error.stack);
+          expect(rejection.cause).toBe(error);
+        },
+      );
+
+      it('should reject with an error kafkajs retries when an event handler fails with a TypeError', async () => {
+        // What a filter written for HTTP throws when given the RPC context
+        const error = new TypeError('response.status is not a function');
+        untypedServer.messageHandlers = objectToMap({
+          [topic]: Object.assign(
+            async () => {
+              throw error;
+            },
+            { isEventHandler: true },
+          ),
+        });
+
+        const rejection = await server
+          .getMessageHandler()(eventPayload)
+          .catch(err => err);
+
+        expect(rejection.name).toBe('Error');
+        expect(rejection.message).toBe(error.message);
+        expect(rejection.cause).toBe(error);
       });
     });
   });
 
   describe('getPublisher', () => {
-    let sendMessageStub: sinon.SinonStub;
+    const context = new KafkaContext([] as any);
+    let sendMessageStub: ReturnType<typeof vi.fn>;
     let publisher;
 
     beforeEach(() => {
@@ -228,15 +671,16 @@ describe('ServerKafka', () => {
         replyTopic,
         replyPartition,
         correlationId,
+        context,
       );
-      sendMessageStub = sinon
-        .stub(server, 'sendMessage')
-        .callsFake(async () => []);
+      sendMessageStub = vi
+        .spyOn(server, 'sendMessage')
+        .mockImplementation(async () => []);
     });
     it(`should return function`, () => {
-      expect(typeof server.getPublisher(null, null, correlationId)).to.be.eql(
-        'function',
-      );
+      expect(
+        typeof server.getPublisher(null!, null!, correlationId, context),
+      ).toEqual('function');
     });
     it(`should call "publish" with expected arguments`, () => {
       const data = {
@@ -245,70 +689,938 @@ describe('ServerKafka', () => {
       };
       publisher(data);
 
-      expect(
-        sendMessageStub.calledWith(
-          data,
-          replyTopic,
-          replyPartition,
-          correlationId,
-        ),
-      ).to.be.true;
+      expect(sendMessageStub).toHaveBeenCalledWith(
+        data,
+        replyTopic,
+        replyPartition,
+        correlationId,
+        context,
+      );
+    });
+  });
+
+  describe('getHandlerByPattern', () => {
+    it('should chain event handlers registered with equal regex patterns', () => {
+      const first = vi.fn();
+      const second = vi.fn();
+      server.addHandler(/test\..*/, first, true);
+      server.addHandler(/test\..*/, second, true);
+
+      expect(server.getHandlers().size).toBe(1);
+      expect(server.getHandlerByPattern(topic)).toBe(first);
+      expect(first.next).toBe(second);
+    });
+
+    it('should return a handler when topic matches a regex pattern', () => {
+      const handler = vi.fn();
+      server.addHandler(/test\..*/, handler);
+
+      expect(server.getHandlerByPattern(topic)).toBe(handler);
+    });
+
+    it('should return the handler of a string pattern that reads as json', () => {
+      const handler = vi.fn();
+      server.addHandler('true', handler);
+
+      expect(server.getHandlerByPattern('true')).toBe(handler);
+    });
+
+    it('should return null when topic does not match a regex pattern', () => {
+      const handler = vi.fn();
+      server.addHandler(/another\..*/, handler);
+
+      expect(server.getHandlerByPattern(topic)).toBeNull();
     });
   });
 
   describe('handleMessage', () => {
-    let getPublisherSpy: sinon.SinonSpy;
+    let getPublisherSpy: ReturnType<typeof vi.fn>;
 
     beforeEach(() => {
-      sinon.stub(server, 'sendMessage').callsFake(async () => []);
-      getPublisherSpy = sinon.spy();
+      vi.spyOn(server, 'sendMessage').mockImplementation(async () => []);
+      getPublisherSpy = vi.fn();
 
-      sinon.stub(server, 'getPublisher').callsFake(() => getPublisherSpy);
-    });
-    it('should call "handleEvent" if correlation identifier is not present', () => {
-      const handleEventSpy = sinon.spy(server, 'handleEvent');
-      server.handleMessage(eventPayload);
-      expect(handleEventSpy.called).to.be.true;
+      vi.spyOn(server, 'getPublisher').mockImplementation(
+        () => getPublisherSpy,
+      );
     });
 
-    it('should call "handleEvent" if correlation identifier is present by the reply topic is not present', () => {
-      const handleEventSpy = sinon.spy(server, 'handleEvent');
-      server.handleMessage(eventWithCorrelationIdPayload);
-      expect(handleEventSpy.called).to.be.true;
+    it('should call "handleEvent" if correlation identifier is not present', async () => {
+      const handleEventSpy = vi.spyOn(server, 'handleEvent');
+      await server.handleMessage(eventPayload);
+      expect(handleEventSpy).toHaveBeenCalled();
     });
 
-    it(`should publish NO_MESSAGE_HANDLER if pattern not exists in messageHandlers object`, () => {
-      server.handleMessage(payload);
-      expect(
-        getPublisherSpy.calledWith({
-          id: payload.message.headers[KafkaHeaders.CORRELATION_ID].toString(),
-          err: NO_MESSAGE_HANDLER,
-        }),
-      ).to.be.true;
+    it('should call "handleEvent" if correlation identifier is present but the reply topic is not present', async () => {
+      const handleEventSpy = vi.spyOn(server, 'handleEvent');
+      await server.handleMessage(eventWithCorrelationIdPayload);
+      expect(handleEventSpy).toHaveBeenCalled();
     });
-    it(`should call handler with expected arguments`, () => {
-      const handler = sinon.spy();
-      (server as any).messageHandlers = objectToMap({
+
+    describe('packet metadata', () => {
+      const handleWithHeaders = async (headers: Record<string, any>) => {
+        const handleEventSpy = vi
+          .spyOn(server, 'handleEvent')
+          .mockResolvedValue(undefined);
+        await server.handleMessage({
+          ...eventPayload,
+          message: { ...eventMessage, headers },
+        });
+        const context: KafkaContext = handleEventSpy.mock.calls[0][2];
+        return context.getMetadata();
+      };
+
+      it('should expose the text headers on the context, as they arrived', async () => {
+        const metadata = await handleWithHeaders({
+          'x-request-id': Buffer.from('trace-1'),
+          // Decoded into an object in the message the context returns
+          'x-json': Buffer.from('{"a":1}'),
+          plain: 'already a string',
+        });
+
+        expect(metadata).toEqual({
+          'x-request-id': 'trace-1',
+          'x-json': '{"a":1}',
+          plain: 'already a string',
+        });
+      });
+
+      it('should leave out repeated and binary headers', async () => {
+        const metadata = await handleWithHeaders({
+          'x-request-id': Buffer.from('trace-1'),
+          'x-tag': [Buffer.from('a'), Buffer.from('b')],
+          'x-binary': Buffer.from([0x00, 0xff, 0xfe]),
+          'x-absent': undefined,
+        });
+
+        expect(metadata).toEqual({ 'x-request-id': 'trace-1' });
+      });
+
+      it('should be undefined for a message without headers', async () => {
+        expect(await handleWithHeaders({})).toBeUndefined();
+      });
+    });
+
+    it('should call event handler when "handleEvent" is called', async () => {
+      const messageHandler = vi.fn();
+      const context = { test: true } as any;
+      const messageData = 'some data';
+      vi.spyOn(server, 'getHandlerByPattern').mockImplementation(
+        () => messageHandler,
+      );
+
+      await server.handleEvent(
+        topic,
+        { data: messageData, pattern: topic },
+        context,
+      );
+      expect(messageHandler).toHaveBeenCalledWith(messageData, context);
+    });
+
+    it('should not catch error thrown by event handler as part of "handleEvent"', async () => {
+      const error = new Error('handler error');
+      const messageHandler = vi.fn().mockImplementation(() => {
+        throw error;
+      });
+      vi.spyOn(server, 'getHandlerByPattern').mockImplementation(
+        () => messageHandler,
+      );
+
+      await expect(
+        server.handleEvent(
+          topic,
+          { data: 'some data', pattern: topic },
+          {} as any,
+        ),
+      ).rejects.toBe(error);
+    });
+
+    it('should call "handleEvent" if correlation identifier and reply topic are present but the handler is of type eventHandler', async () => {
+      const handler = vi.fn();
+      (handler as any).isEventHandler = true;
+      untypedServer.messageHandlers = objectToMap({
+        [topic]: handler,
+      });
+      const handleEventSpy = vi.spyOn(server, 'handleEvent');
+      await server.handleMessage(payload);
+      expect(handleEventSpy).toHaveBeenCalled();
+    });
+
+    it('should NOT call "handleEvent" if correlation identifier and reply topic are present but the handler is not of type eventHandler', async () => {
+      const handler = vi.fn();
+      (handler as any).isEventHandler = false;
+      untypedServer.messageHandlers = objectToMap({
+        [topic]: handler,
+      });
+      const handleEventSpy = vi.spyOn(server, 'handleEvent');
+      await server.handleMessage(payload);
+      expect(handleEventSpy).not.toHaveBeenCalled();
+    });
+
+    it(`should publish NO_MESSAGE_HANDLER if pattern not exists in messageHandlers object`, async () => {
+      await server.handleMessage(payload);
+      expect(getPublisherSpy).toHaveBeenCalledWith({
+        id: payload.message.headers![KafkaHeaders.CORRELATION_ID]!.toString(),
+        err: NO_MESSAGE_HANDLER,
+      });
+    });
+
+    it(`should call handler with expected arguments`, async () => {
+      const handler = vi.fn();
+      untypedServer.messageHandlers = objectToMap({
         [topic]: handler,
       });
 
-      server.handleMessage(payload);
-      expect(handler.called).to.be.true;
+      await server.handleMessage(payload);
+      expect(handler).toHaveBeenCalled();
+    });
+
+    it('should call handler when topic matches a regex pattern', async () => {
+      const handler = vi.fn();
+      server.addHandler(/test\..*/, handler);
+
+      await server.handleMessage(payload);
+      expect(handler).toHaveBeenCalled();
+    });
+
+    describe('when the server receives its own reply on a regex-matched topic', () => {
+      // What ServerKafka#sendMessage publishes to the reply topic
+      const replyPayload: EachMessagePayload = {
+        topic: replyTopic,
+        partition: 0,
+        message: Object.assign({}, eventMessage, {
+          headers: {
+            [KafkaHeaders.CORRELATION_ID]: Buffer.from(correlationId),
+            [KafkaHeaders.NEST_IS_DISPOSED]: Buffer.alloc(1),
+          },
+        }),
+        heartbeat,
+        pause,
+      };
+
+      it.each([
+        ['a message handler', false],
+        ['an event handler', true],
+      ])(
+        'should not dispatch it to %s of a regex that matches the request topic',
+        async (_, isEvent) => {
+          const handler = vi.fn();
+          server.addHandler(/^test\..+$/, handler, isEvent);
+
+          await server.handleMessage(replyPayload);
+          expect(handler).not.toHaveBeenCalled();
+        },
+      );
+
+      it('should still dispatch a request published to a reply topic', async () => {
+        const handler = vi.fn();
+        server.addHandler(/^test\..+$/, handler);
+
+        await server.handleMessage({
+          ...replyPayload,
+          message: Object.assign({}, eventMessage, {
+            headers: {
+              [KafkaHeaders.CORRELATION_ID]: Buffer.from(correlationId),
+              [KafkaHeaders.REPLY_TOPIC]: Buffer.from(replyTopic),
+            },
+          }),
+        });
+        expect(handler).toHaveBeenCalled();
+      });
+
+      it('should still call a regex handler that targets reply topics', async () => {
+        const handler = vi.fn();
+        server.addHandler(/\.reply$/, handler, true);
+
+        await server.handleMessage(replyPayload);
+        expect(handler).toHaveBeenCalled();
+      });
+
+      it('should still call the handler registered for the reply topic', async () => {
+        const regexHandler = vi.fn();
+        const handler = vi.fn();
+        server.addHandler(/^test\..+$/, regexHandler, true);
+        server.addHandler(replyTopic, handler, true);
+
+        await server.handleMessage(replyPayload);
+        expect(handler).toHaveBeenCalled();
+        expect(regexHandler).not.toHaveBeenCalled();
+      });
+
+      it('should still call a regex handler for a message without a correlation id', async () => {
+        const handler = vi.fn();
+        server.addHandler(/^test\..+$/, handler, true);
+
+        await server.handleMessage({ ...eventPayload, topic: replyTopic });
+        expect(handler).toHaveBeenCalled();
+      });
+    });
+
+    describe('when the reply topic is not a valid topic name', () => {
+      const withReplyTopic = (
+        replyTopicHeader: string,
+      ): EachMessagePayload => ({
+        ...payload,
+        message: {
+          ...message,
+          headers: {
+            ...message.headers,
+            [KafkaHeaders.REPLY_TOPIC]: Buffer.from(replyTopicHeader),
+          },
+        },
+      });
+      let loggerErrorSpy: ReturnType<typeof vi.spyOn>;
+
+      beforeEach(() => {
+        loggerErrorSpy = vi
+          .spyOn(untypedServer.logger, 'error')
+          .mockImplementation(() => {});
+      });
+
+      it.each([
+        ['an object', '{}'],
+        ['an array', '["test.topic.reply"]'],
+        ['a schema payload', '\0test.topic.reply'],
+        ['too long', 'a'.repeat(250)],
+        ['made of illegal characters', 'test topic/reply'],
+      ])(
+        'should log an error and not run the handler if it is %s',
+        async (_, replyTopicHeader) => {
+          const handler = vi.fn();
+          untypedServer.messageHandlers = objectToMap({
+            [topic]: handler,
+          });
+          const handleEventSpy = vi.spyOn(server, 'handleEvent');
+
+          await server.handleMessage(withReplyTopic(replyTopicHeader));
+
+          expect(loggerErrorSpy).toHaveBeenCalledOnce();
+          expect(handler).not.toHaveBeenCalled();
+          expect(handleEventSpy).not.toHaveBeenCalled();
+          expect(getPublisherSpy).not.toHaveBeenCalled();
+        },
+      );
+
+      it('should not publish NO_MESSAGE_HANDLER', async () => {
+        await server.handleMessage(withReplyTopic('{}'));
+
+        expect(loggerErrorSpy).toHaveBeenCalledOnce();
+        expect(getPublisherSpy).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('when the reply topic is one the server does not reply on', () => {
+      const withReplyTopic = (
+        replyTopicHeader: string,
+      ): EachMessagePayload => ({
+        ...payload,
+        message: {
+          ...message,
+          headers: {
+            ...message.headers,
+            [KafkaHeaders.REPLY_TOPIC]: Buffer.from(replyTopicHeader),
+          },
+        } as KafkaMessage,
+      });
+      let loggerErrorSpy: ReturnType<typeof vi.spyOn>;
+      let getPublisher: ReturnType<typeof vi.spyOn>;
+      let handler: ReturnType<typeof vi.fn>;
+      let otherHandler: ReturnType<typeof vi.fn>;
+
+      beforeEach(() => {
+        loggerErrorSpy = vi
+          .spyOn(untypedServer.logger, 'error')
+          .mockImplementation(() => {});
+        getPublisher = vi.spyOn(server, 'getPublisher');
+        handler = vi.fn();
+        otherHandler = vi.fn();
+        untypedServer.messageHandlers = objectToMap({
+          [topic]: handler,
+          'other.topic': otherHandler,
+        });
+      });
+
+      const expectDropped = () => {
+        expect(loggerErrorSpy).toHaveBeenCalledOnce();
+        expect(handler).not.toHaveBeenCalled();
+        expect(otherHandler).not.toHaveBeenCalled();
+        expect(getPublisher).not.toHaveBeenCalled();
+      };
+
+      // kafkajs keeps state per topic in plain objects
+      it.each(['__proto__', 'constructor', 'toString', 'hasOwnProperty'])(
+        'should log an error and not run the handler if it is "%s"',
+        async replyTopicHeader => {
+          await server.handleMessage(withReplyTopic(replyTopicHeader));
+
+          expectDropped();
+        },
+      );
+
+      it.each([
+        ['the topic of the request', topic],
+        ['another topic the server has a handler for', 'other.topic'],
+      ])(
+        'should log an error and not run the handler if it is %s',
+        async (_, replyTopicHeader) => {
+          await server.handleMessage(withReplyTopic(replyTopicHeader));
+
+          expectDropped();
+        },
+      );
+
+      it('should log an error if a regex handler matches it', async () => {
+        server.addHandler(/^audit\..+$/, otherHandler as any);
+
+        await server.handleMessage(withReplyTopic('audit.log'));
+
+        expectDropped();
+      });
+
+      it('should not publish NO_MESSAGE_HANDLER', async () => {
+        untypedServer.messageHandlers = objectToMap({
+          'other.topic': otherHandler,
+        });
+
+        await server.handleMessage(withReplyTopic('other.topic'));
+
+        expect(loggerErrorSpy).toHaveBeenCalledOnce();
+        expect(getPublisherSpy).not.toHaveBeenCalled();
+      });
+
+      it('should reply on a topic the server has no handler for, as a renamed reply topic is', async () => {
+        await server.handleMessage(withReplyTopic(`replies.${topic}`));
+
+        expect(loggerErrorSpy).not.toHaveBeenCalled();
+        expect(handler).toHaveBeenCalled();
+        expect(getPublisher).toHaveBeenCalledWith(
+          `replies.${topic}`,
+          replyPartition,
+          correlationId,
+          expect.any(KafkaContext),
+        );
+      });
+
+      it('should reply on "<topic>.reply" when a catch-all regex handles the topic', async () => {
+        // The server skips its own replies there
+        const catchAll = vi.fn();
+        untypedServer.messageHandlers = new Map();
+        server.addHandler(/.*/, catchAll as any);
+
+        await server.handleMessage(withReplyTopic(replyTopic));
+
+        expect(loggerErrorSpy).not.toHaveBeenCalled();
+        expect(catchAll).toHaveBeenCalled();
+        expect(getPublisher).toHaveBeenCalledWith(
+          replyTopic,
+          replyPartition,
+          correlationId,
+          expect.any(KafkaContext),
+        );
+      });
+
+      it('should not reply on a renamed reply topic that a catch-all regex handles', async () => {
+        const catchAll = vi.fn();
+        untypedServer.messageHandlers = new Map();
+        server.addHandler(/.*/, catchAll as any);
+
+        await server.handleMessage(withReplyTopic(`replies.${topic}`));
+
+        expect(loggerErrorSpy).toHaveBeenCalledOnce();
+        expect(catchAll).not.toHaveBeenCalled();
+        expect(getPublisher).not.toHaveBeenCalled();
+      });
+
+      it('should still pass the message to an event handler', async () => {
+        const eventHandler = Object.assign(vi.fn(), { isEventHandler: true });
+        untypedServer.messageHandlers = objectToMap({ [topic]: eventHandler });
+
+        await server.handleMessage(withReplyTopic('__proto__'));
+
+        expect(loggerErrorSpy).not.toHaveBeenCalled();
+        expect(eventHandler).toHaveBeenCalled();
+      });
+    });
+
+    describe('when the correlation id is longer than a request id may be', () => {
+      const withCorrelationId = (
+        correlationIdHeader: string,
+      ): EachMessagePayload => ({
+        ...payload,
+        message: {
+          ...message,
+          headers: {
+            ...message.headers,
+            [KafkaHeaders.CORRELATION_ID]: Buffer.from(correlationIdHeader),
+          },
+        } as KafkaMessage,
+      });
+      let loggerErrorSpy: ReturnType<typeof vi.spyOn>;
+      let getPublisher: ReturnType<typeof vi.spyOn>;
+
+      beforeEach(() => {
+        loggerErrorSpy = vi
+          .spyOn(untypedServer.logger, 'error')
+          .mockImplementation(() => {});
+        getPublisher = vi.spyOn(server, 'getPublisher');
+      });
+
+      it('should log an error and not run the handler', async () => {
+        const handler = vi.fn();
+        untypedServer.messageHandlers = objectToMap({ [topic]: handler });
+        const handleEventSpy = vi.spyOn(server, 'handleEvent');
+
+        // A rejection would make kafkajs redeliver the message
+        await expect(
+          server.handleMessage(withCorrelationId('a'.repeat(257))),
+        ).resolves.toBeUndefined();
+
+        expect(loggerErrorSpy).toHaveBeenCalledExactlyOnceWith(
+          expect.stringContaining(new InvalidPacketIdException(256).message),
+        );
+        expect(handler).not.toHaveBeenCalled();
+        expect(handleEventSpy).not.toHaveBeenCalled();
+        expect(getPublisher).not.toHaveBeenCalled();
+      });
+
+      it('should not publish NO_MESSAGE_HANDLER', async () => {
+        await server.handleMessage(withCorrelationId('a'.repeat(257)));
+
+        expect(loggerErrorSpy).toHaveBeenCalledOnce();
+        expect(getPublisher).not.toHaveBeenCalled();
+        expect(getPublisherSpy).not.toHaveBeenCalled();
+      });
+
+      it('should answer a request whose correlation id is at the limit', async () => {
+        const handler = vi.fn();
+        untypedServer.messageHandlers = objectToMap({ [topic]: handler });
+
+        await server.handleMessage(withCorrelationId('a'.repeat(256)));
+
+        expect(loggerErrorSpy).not.toHaveBeenCalled();
+        expect(handler).toHaveBeenCalled();
+        expect(getPublisher).toHaveBeenCalledWith(
+          replyTopic,
+          replyPartition,
+          'a'.repeat(256),
+          expect.any(KafkaContext),
+        );
+      });
+
+      it('should still pass the message to an event handler', async () => {
+        const handler = Object.assign(vi.fn(), { isEventHandler: true });
+        untypedServer.messageHandlers = objectToMap({ [topic]: handler });
+
+        await server.handleMessage(withCorrelationId('a'.repeat(257)));
+
+        expect(loggerErrorSpy).not.toHaveBeenCalled();
+        expect(handler).toHaveBeenCalled();
+        expect(getPublisher).not.toHaveBeenCalled();
+      });
+    });
+
+    it('should reply with the correlation id as text', async () => {
+      const jsonCorrelationId = '{"length":200000000}';
+      const getPublisher = vi.spyOn(server, 'getPublisher');
+      untypedServer.messageHandlers = objectToMap({
+        [topic]: vi.fn(),
+      });
+
+      await server.handleMessage({
+        ...payload,
+        message: {
+          ...message,
+          headers: {
+            ...message.headers,
+            [KafkaHeaders.CORRELATION_ID]: Buffer.from(jsonCorrelationId),
+          },
+        },
+      });
+
+      expect(getPublisher).toHaveBeenCalledWith(
+        replyTopic,
+        replyPartition,
+        jsonCorrelationId,
+        expect.any(KafkaContext),
+      );
+    });
+
+    it('should log and skip a message that the parser rejects', async () => {
+      untypedServer.parser = {
+        parse: () => {
+          throw new MaxPacketLengthExceededException(17);
+        },
+      };
+      const handler = vi.fn();
+      untypedServer.messageHandlers = objectToMap({
+        [topic]: handler,
+      });
+      const loggerErrorSpy = vi
+        .spyOn(untypedServer.logger, 'error')
+        .mockImplementation(() => {});
+
+      // A rejection would make kafkajs redeliver the message
+      await expect(server.handleMessage(payload)).resolves.toBeUndefined();
+
+      expect(loggerErrorSpy).toHaveBeenCalledOnce();
+      expect(handler).not.toHaveBeenCalled();
+      expect(getPublisherSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  function bindHandler(
+    handler: (...args: any[]) => unknown,
+    { isEventHandler }: { isEventHandler: boolean },
+  ) {
+    const endHook = vi.fn();
+    untypedServer.onProcessingStartHook = (
+      _transportId: unknown,
+      _ctx: unknown,
+      fn: () => Promise<void>,
+    ) => fn();
+    untypedServer.onProcessingEndHook = endHook;
+    untypedServer.messageHandlers = objectToMap({
+      [topic]: Object.assign(handler, { isEventHandler }),
+    });
+    return endHook;
+  }
+
+  describe('handleEvent', () => {
+    const context = new KafkaContext([] as any);
+
+    it('should run the end hook when the handler returns a plain value', async () => {
+      const endHook = bindHandler(async () => 'plain', {
+        isEventHandler: true,
+      });
+
+      await server.handleEvent(topic, { pattern: topic, data: null }, context);
+
+      expect(endHook).toHaveBeenCalledOnce();
+    });
+
+    it('should run the end hook when the returned stream completes', async () => {
+      const endHook = bindHandler(async () => of('streamed'), {
+        isEventHandler: true,
+      });
+
+      await server.handleEvent(topic, { pattern: topic, data: null }, context);
+
+      expect(endHook).toHaveBeenCalledOnce();
+    });
+
+    it('should run the end hook when the returned stream completes without emitting', async () => {
+      const endHook = bindHandler(async () => EMPTY, {
+        isEventHandler: true,
+      });
+
+      // A rejection would make kafkajs redeliver a message that was handled.
+      await server.handleEvent(topic, { pattern: topic, data: null }, context);
+
+      expect(endHook).toHaveBeenCalledOnce();
+    });
+
+    it('should run the end hook when the returned stream fails', async () => {
+      const endHook = bindHandler(
+        async () => throwError(() => new Error('failed')),
+        { isEventHandler: true },
+      );
+
+      // The rejection has to travel on so that kafkajs can report it.
+      await expect(
+        server.handleEvent(topic, { pattern: topic, data: null }, context),
+      ).rejects.toThrow('failed');
+      expect(endHook).toHaveBeenCalledOnce();
+    });
+
+    it('should run the end hook when the handler throws an error', async () => {
+      const endHook = bindHandler(
+        async () => {
+          throw new Error('handler failed');
+        },
+        { isEventHandler: true },
+      );
+
+      await expect(
+        server.handleEvent(topic, { pattern: topic, data: null }, context),
+      ).rejects.toThrow('handler failed');
+      expect(endHook).toHaveBeenCalledOnce();
+    });
+
+    it('should run the end hook once per event', async () => {
+      const endHook = bindHandler(async () => of('first', 'second'), {
+        isEventHandler: true,
+      });
+
+      await server.handleEvent(topic, { pattern: topic, data: null }, context);
+
+      expect(endHook).toHaveBeenCalledOnce();
+    });
+  });
+
+  describe('handleMessage (request-response)', () => {
+    let producerSend: ReturnType<typeof vi.fn>;
+
+    // `Server#send` drains its queue on `process.nextTick`, so the replies are
+    // published after `handleMessage` has already resolved.
+    const flushPublishes = () => new Promise(resolve => setImmediate(resolve));
+
+    beforeEach(() => {
+      // The end hook used to live in `sendMessage`, so the real one has to run
+      // for these specs to observe how often it fires.
+      producerSend = vi.fn(async () => []);
+      untypedServer.producer = { send: producerSend };
+    });
+
+    it('should run the end hook when the handler returns a plain value', async () => {
+      const endHook = bindHandler(async () => 'plain', {
+        isEventHandler: false,
+      });
+
+      await server.handleMessage(payload);
+      await flushPublishes();
+
+      expect(endHook).toHaveBeenCalledOnce();
+      // The span closes once processing has settled, before the reply is
+      // produced to Kafka, in line with the other transports.
+      expect(endHook.mock.invocationCallOrder[0]).toBeLessThan(
+        producerSend.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('should run the end hook once for a stream of several responses', async () => {
+      const endHook = bindHandler(async () => of('first', 'second', 'third'), {
+        isEventHandler: false,
+      });
+
+      await server.handleMessage(payload);
+      await flushPublishes();
+
+      // Three replies are published, but the span they belong to closes once,
+      // before the first of them is produced.
+      expect(producerSend).toHaveBeenCalledTimes(3);
+      expect(endHook).toHaveBeenCalledOnce();
+      expect(endHook.mock.invocationCallOrder[0]).toBeLessThan(
+        producerSend.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('should run the end hook when the returned stream completes without emitting', async () => {
+      const endHook = bindHandler(async () => EMPTY, {
+        isEventHandler: false,
+      });
+
+      await server.handleMessage(payload);
+      await flushPublishes();
+
+      expect(endHook).toHaveBeenCalledOnce();
+    });
+
+    it('should run the end hook when the returned stream fails', async () => {
+      const endHook = bindHandler(
+        async () => throwError(() => new Error('failed')),
+        { isEventHandler: false },
+      );
+
+      await server.handleMessage(payload);
+      await flushPublishes();
+
+      expect(endHook).toHaveBeenCalledOnce();
+    });
+
+    it('should run the end hook when the handler throws an error', async () => {
+      const endHook = bindHandler(
+        async () => {
+          throw new Error('handler failed');
+        },
+        { isEventHandler: false },
+      );
+
+      await server.handleMessage(payload);
+      await flushPublishes();
+
+      expect(endHook).toHaveBeenCalledOnce();
+    });
+
+    it('should run the end hook when the handler throws a retriable exception', async () => {
+      const endHook = bindHandler(
+        async () => {
+          throw new KafkaRetriableException('retry me');
+        },
+        { isEventHandler: false },
+      );
+
+      // The rejection has to travel on so that kafkajs redelivers the message.
+      await expect(server.handleMessage(payload)).rejects.toThrow(
+        KafkaRetriableException,
+      );
+      await flushPublishes();
+
+      expect(producerSend).not.toHaveBeenCalled();
+      expect(endHook).toHaveBeenCalledOnce();
+    });
+
+    it('should reject with a retriable exception that passed through the exception filter', async () => {
+      const exceptionHandler = new RpcExceptionsHandler();
+      const endHook = bindHandler(
+        () =>
+          exceptionHandler.handle(
+            new KafkaRetriableException('retry me'),
+            null!,
+          ),
+        { isEventHandler: false },
+      );
+
+      // The rejection has to travel on so that kafkajs redelivers the message.
+      await expect(server.handleMessage(payload)).rejects.toThrow(
+        KafkaRetriableException,
+      );
+      await flushPublishes();
+
+      expect(producerSend).not.toHaveBeenCalled();
+      expect(endHook).toHaveBeenCalledOnce();
+    });
+
+    it('should not run the end hook when there is no message handler', async () => {
+      const endHook = bindHandler(async () => 'plain', {
+        isEventHandler: false,
+      });
+      untypedServer.messageHandlers = objectToMap({});
+
+      await server.handleMessage(payload);
+      await flushPublishes();
+
+      expect(endHook).not.toHaveBeenCalled();
+    });
+
+    it('should mark a completion that comes after the replies as carrying no response', async () => {
+      const completion$ = new Subject<never>();
+      bindHandler(async () => concat(of('first'), completion$), {
+        isEventHandler: false,
+      });
+
+      await server.handleMessage(payload);
+      await flushPublishes();
+      // The stream completes once its reply has already been produced
+      completion$.complete();
+      await flushPublishes();
+
+      expect(producerSend).toHaveBeenCalledTimes(2);
+      const [reply] = producerSend.mock.calls[0][0].messages;
+      const [completion] = producerSend.mock.calls[1][0].messages;
+      expect(reply.value).toBe('first');
+      expect(reply.headers).not.toHaveProperty(KafkaHeaders.NEST_NO_RESPONSE);
+      expect(completion.value).toBeNull();
+      expect(completion.headers).toHaveProperty(KafkaHeaders.NEST_IS_DISPOSED);
+      expect(completion.headers).toHaveProperty(KafkaHeaders.NEST_NO_RESPONSE);
+    });
+
+    it('should still reply null to a stream that completes without emitting', async () => {
+      bindHandler(async () => EMPTY, { isEventHandler: false });
+
+      await server.handleMessage(payload);
+      await flushPublishes();
+
+      expect(producerSend).toHaveBeenCalledOnce();
+      const [reply] = producerSend.mock.calls[0][0].messages;
+      expect(reply.value).toBeNull();
+      expect(reply.headers).toHaveProperty(KafkaHeaders.NEST_IS_DISPOSED);
+      expect(reply.headers).not.toHaveProperty(KafkaHeaders.NEST_NO_RESPONSE);
+    });
+
+    it('should reply with what a stream emits before and after its first response, in order', async () => {
+      const later$ = new Subject<string>();
+      bindHandler(async () => concat(of('first', 'second'), later$), {
+        isEventHandler: false,
+      });
+
+      await server.handleMessage(payload);
+      later$.next('third');
+      await flushPublishes();
+      later$.next('fourth');
+      later$.complete();
+      await flushPublishes();
+
+      const replies = producerSend.mock.calls.map(
+        ([{ messages }]) => messages[0],
+      );
+      expect(replies.map(reply => reply.value)).toEqual([
+        'first',
+        'second',
+        'third',
+        'fourth',
+      ]);
+      expect(replies[3].headers).toHaveProperty(KafkaHeaders.NEST_IS_DISPOSED);
+    });
+
+    it('should reply with the error of a stream that fails after its first response', async () => {
+      const later$ = new Subject<string>();
+      bindHandler(async () => concat(of('first'), later$), {
+        isEventHandler: false,
+      });
+
+      await server.handleMessage(payload);
+      later$.error('failed');
+      await flushPublishes();
+
+      expect(producerSend).toHaveBeenCalledTimes(2);
+      const [reply] = producerSend.mock.calls[0][0].messages;
+      const [failure] = producerSend.mock.calls[1][0].messages;
+      expect(reply.value).toBe('first');
+      expect(failure.headers).toHaveProperty(KafkaHeaders.NEST_ERR);
+      expect(failure.headers).toHaveProperty(KafkaHeaders.NEST_IS_DISPOSED);
+    });
+
+    it('should not keep the responses of a stream once they have been passed on', async () => {
+      const later$ = new Subject<string>();
+      const sendSpy = vi.spyOn(server, 'send');
+      bindHandler(async () => concat(of('first'), later$), {
+        isEventHandler: false,
+      });
+
+      await server.handleMessage(payload);
+      later$.next('second');
+      await flushPublishes();
+      expect(producerSend).toHaveBeenCalledTimes(2);
+
+      // Whatever the reply stream still held would be replayed to a new
+      // subscriber. The stream is still open, so all of a long one would be.
+      const [stream$] = sendSpy.mock.calls[0];
+      const replayed = vi.fn();
+      stream$.subscribe(replayed).unsubscribe();
+      expect(replayed).not.toHaveBeenCalled();
+    });
+
+    it('should log a failed publish and still run the end hook once', async () => {
+      const error = new Error('broker down');
+      const loggerErrorSpy = vi
+        .spyOn(untypedServer.logger, 'error')
+        .mockImplementation(() => {});
+      producerSend.mockRejectedValueOnce(error);
+      const endHook = bindHandler(async () => 'plain', {
+        isEventHandler: false,
+      });
+
+      await server.handleMessage(payload);
+      await flushPublishes();
+
+      expect(loggerErrorSpy).toHaveBeenCalledExactlyOnceWith(error);
+      expect(endHook).toHaveBeenCalledOnce();
     });
   });
 
   describe('sendMessage', () => {
-    let sendSpy: sinon.SinonSpy;
+    const context = new KafkaContext([] as any);
+    let sendSpy: ReturnType<typeof vi.fn>;
 
     beforeEach(() => {
-      sendSpy = sinon.spy();
-      sinon.stub(server as any, 'producer').value({
+      sendSpy = vi.fn().mockImplementation(() => Promise.resolve());
+      vi.spyOn(server as any, 'producer', 'get').mockReturnValue({
         send: sendSpy,
       });
     });
 
-    it('should send message', () => {
-      server.sendMessage(
+    it('should send message', async () => {
+      await server.sendMessage(
         {
           id: correlationId,
           response: messageValue,
@@ -316,25 +1628,51 @@ describe('ServerKafka', () => {
         replyTopic,
         replyPartition,
         correlationId,
+        context,
       );
 
-      expect(
-        sendSpy.calledWith({
-          topic: replyTopic,
-          messages: [
-            {
-              partition: parseFloat(replyPartition),
-              value: messageValue,
-              headers: {
-                [KafkaHeaders.CORRELATION_ID]: Buffer.from(correlationId),
-              },
+      expect(sendSpy).toHaveBeenCalledWith({
+        topic: replyTopic,
+        messages: [
+          {
+            partition: parseFloat(replyPartition),
+            value: messageValue,
+            headers: {
+              [KafkaHeaders.CORRELATION_ID]: Buffer.from(correlationId),
             },
-          ],
-        }),
-      ).to.be.true;
+          },
+        ],
+      });
     });
-    it('should send message without reply partition', () => {
-      server.sendMessage(
+    it('should not send the headers that ask for a reply', async () => {
+      // As a handler that returns what it received replies
+      await server.sendMessage(
+        {
+          id: correlationId,
+          response: {
+            value: messageValue,
+            headers: {
+              [KafkaHeaders.REPLY_TOPIC]: 'other.topic',
+              [KafkaHeaders.REPLY_PARTITION]: '3',
+              'x-origin': 'request',
+            },
+          },
+        },
+        replyTopic,
+        replyPartition,
+        correlationId,
+        context,
+      );
+
+      const [reply] = sendSpy.mock.calls[0][0].messages;
+      expect(reply.headers).toEqual({
+        'x-origin': 'request',
+        [KafkaHeaders.CORRELATION_ID]: Buffer.from(correlationId),
+      });
+      expect(reply.partition).toBe(parseFloat(replyPartition));
+    });
+    it('should send message without reply partition', async () => {
+      await server.sendMessage(
         {
           id: correlationId,
           response: messageValue,
@@ -342,24 +1680,23 @@ describe('ServerKafka', () => {
         replyTopic,
         undefined,
         correlationId,
+        context,
       );
 
-      expect(
-        sendSpy.calledWith({
-          topic: replyTopic,
-          messages: [
-            {
-              value: messageValue,
-              headers: {
-                [KafkaHeaders.CORRELATION_ID]: Buffer.from(correlationId),
-              },
+      expect(sendSpy).toHaveBeenCalledWith({
+        topic: replyTopic,
+        messages: [
+          {
+            value: messageValue,
+            headers: {
+              [KafkaHeaders.CORRELATION_ID]: Buffer.from(correlationId),
             },
-          ],
-        }),
-      ).to.be.true;
+          },
+        ],
+      });
     });
-    it('should send error message', () => {
-      server.sendMessage(
+    it('should send error message', async () => {
+      await server.sendMessage(
         {
           id: correlationId,
           err: NO_MESSAGE_HANDLER,
@@ -367,26 +1704,25 @@ describe('ServerKafka', () => {
         replyTopic,
         replyPartition,
         correlationId,
+        context,
       );
 
-      expect(
-        sendSpy.calledWith({
-          topic: replyTopic,
-          messages: [
-            {
-              value: null,
-              partition: parseFloat(replyPartition),
-              headers: {
-                [KafkaHeaders.CORRELATION_ID]: Buffer.from(correlationId),
-                [KafkaHeaders.NEST_ERR]: Buffer.from(NO_MESSAGE_HANDLER),
-              },
+      expect(sendSpy).toHaveBeenCalledWith({
+        topic: replyTopic,
+        messages: [
+          {
+            value: null,
+            partition: parseFloat(replyPartition),
+            headers: {
+              [KafkaHeaders.CORRELATION_ID]: Buffer.from(correlationId),
+              [KafkaHeaders.NEST_ERR]: Buffer.from(NO_MESSAGE_HANDLER),
             },
-          ],
-        }),
-      ).to.be.true;
+          },
+        ],
+      });
     });
-    it('should send `isDisposed` message', () => {
-      server.sendMessage(
+    it('should send `isDisposed` message', async () => {
+      await server.sendMessage(
         {
           id: correlationId,
           isDisposed: true,
@@ -394,23 +1730,72 @@ describe('ServerKafka', () => {
         replyTopic,
         replyPartition,
         correlationId,
+        context,
       );
 
-      expect(
-        sendSpy.calledWith({
-          topic: replyTopic,
-          messages: [
-            {
-              value: null,
-              partition: parseFloat(replyPartition),
-              headers: {
-                [KafkaHeaders.CORRELATION_ID]: Buffer.from(correlationId),
-                [KafkaHeaders.NEST_IS_DISPOSED]: Buffer.alloc(1),
-              },
+      expect(sendSpy).toHaveBeenCalledWith({
+        topic: replyTopic,
+        messages: [
+          {
+            value: null,
+            partition: parseFloat(replyPartition),
+            headers: {
+              [KafkaHeaders.CORRELATION_ID]: Buffer.from(correlationId),
+              [KafkaHeaders.NEST_IS_DISPOSED]: Buffer.alloc(1),
+              [KafkaHeaders.NEST_NO_RESPONSE]: Buffer.alloc(1),
             },
-          ],
-        }),
-      ).to.be.true;
+          },
+        ],
+      });
+    });
+    it('should send `isDisposed` message with its response', async () => {
+      await server.sendMessage(
+        {
+          id: correlationId,
+          // what a handler that returns nothing replies with
+          response: undefined,
+          isDisposed: true,
+        },
+        replyTopic,
+        replyPartition,
+        correlationId,
+        context,
+      );
+
+      expect(sendSpy).toHaveBeenCalledWith({
+        topic: replyTopic,
+        messages: [
+          {
+            value: null,
+            partition: parseFloat(replyPartition),
+            headers: {
+              [KafkaHeaders.CORRELATION_ID]: Buffer.from(correlationId),
+              [KafkaHeaders.NEST_IS_DISPOSED]: Buffer.alloc(1),
+            },
+          },
+        ],
+      });
+    });
+  });
+
+  describe('createClient', () => {
+    it('should accept a custom logCreator in client options', async () => {
+      const logCreatorSpy = vi.fn(() => 'test');
+      const logCreator = () => logCreatorSpy;
+
+      server = new ServerKafka({
+        client: {
+          brokers: [],
+          logCreator,
+        },
+      });
+
+      const kafkaClient = await server.createClient();
+      const logger = kafkaClient.logger();
+
+      logger.info({ namespace: '', level: 1, log: 'test' });
+
+      expect(logCreatorSpy).toHaveBeenCalled();
     });
   });
 });

@@ -1,7 +1,7 @@
 import { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import * as request from 'supertest';
-import { AppModule } from '../../src/app.module';
+import request from 'supertest';
+import { AppModule } from '../../src/app.module.js';
 
 describe('E2E JWT Sample', () => {
   let app: INestApplication;
@@ -19,14 +19,17 @@ describe('E2E JWT Sample', () => {
     const loginReq = await request(app.getHttpServer())
       .post('/auth/login')
       .send({ username: 'john', password: 'changeme' })
-      .expect(201);
+      .expect(200);
 
     const token = loginReq.body.access_token;
     return request(app.getHttpServer())
-      .get('/profile')
+      .get('/auth/profile')
       .set('Authorization', 'Bearer ' + token)
       .expect(200)
-      .expect({ userId: 1, username: 'john' });
+      .expect(({ body }) => {
+        expect(body.sub).toEqual(1);
+        expect(body.username).toEqual('john');
+      });
   });
 
   afterAll(async () => {

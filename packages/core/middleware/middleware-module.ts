@@ -1,44 +1,58 @@
-import { HttpServer } from '@nestjs/common';
-import { RequestMethod } from '@nestjs/common/enums/request-method.enum';
+import { type HttpServer, type InjectionToken, Logger } from '@nestjs/common';
+import { ApplicationConfig } from '../application-config.js';
+import { InvalidMiddlewareException } from '../errors/exceptions/invalid-middleware.exception.js';
+import { RuntimeException } from '../errors/exceptions/runtime.exception.js';
+import { ExceptionsHandler } from '../exceptions/exceptions-handler.js';
+import { ContextIdFactory } from '../helpers/context-id-factory.js';
+import { ExecutionContextHost } from '../helpers/execution-context-host.js';
+import { STATIC_CONTEXT } from '../injector/constants.js';
+import { NestContainer } from '../injector/container.js';
+import { Injector } from '../injector/injector.js';
+import { ContextId, InstanceWrapper } from '../injector/instance-wrapper.js';
+import { Module } from '../injector/module.js';
+import { GraphInspector } from '../inspector/graph-inspector.js';
 import {
-  MiddlewareConfiguration,
-  RouteInfo,
-} from '@nestjs/common/interfaces/middleware/middleware-configuration.interface';
-import { NestMiddleware } from '@nestjs/common/interfaces/middleware/nest-middleware.interface';
-import { NestModule } from '@nestjs/common/interfaces/modules/nest-module.interface';
+  Entrypoint,
+  MiddlewareEntrypointMetadata,
+} from '../inspector/interfaces/entrypoint.interface.js';
+import { REQUEST_CONTEXT_ID } from '../router/request/request-constants.js';
+import { RouterExceptionFilters } from '../router/router-exception-filters.js';
+import { RouterProxy } from '../router/router-proxy.js';
+import { isRequestMethodAll } from '../router/utils/index.js';
+import { MiddlewareBuilder } from './builder.js';
+import { MiddlewareContainer } from './container.js';
+import { MiddlewareResolver } from './resolver.js';
+import { RouteInfoPathExtractor } from './route-info-path-extractor.js';
+import { RoutesMapper } from './routes-mapper.js';
+import { RequestMethod, type NestMiddleware } from '@nestjs/common';
 import {
-  addLeadingSlash,
+  EXCEPTION_FILTERS_METADATA,
+  type MiddlewareConfiguration,
+  type RouteInfo,
+  type NestApplicationContextOptions,
+  isFunction,
   isUndefined,
-} from '@nestjs/common/utils/shared.utils';
-import { ApplicationConfig } from '../application-config';
-import { InvalidMiddlewareException } from '../errors/exceptions/invalid-middleware.exception';
-import { RuntimeException } from '../errors/exceptions/runtime.exception';
-import { ContextIdFactory } from '../helpers/context-id-factory';
-import { ExecutionContextHost } from '../helpers/execution-context-host';
-import { STATIC_CONTEXT } from '../injector/constants';
-import { NestContainer } from '../injector/container';
-import { Injector } from '../injector/injector';
-import { InstanceWrapper } from '../injector/instance-wrapper';
-import { Module } from '../injector/module';
-import { REQUEST_CONTEXT_ID } from '../router/request/request-constants';
-import { RouterExceptionFilters } from '../router/router-exception-filters';
-import { RouterProxy } from '../router/router-proxy';
-import { MiddlewareBuilder } from './builder';
-import { MiddlewareContainer } from './container';
-import { MiddlewareResolver } from './resolver';
-import { RoutesMapper } from './routes-mapper';
+} from '@nestjs/common/internal';
 
-export class MiddlewareModule {
+export class MiddlewareModule<
+  TAppOptions extends NestApplicationContextOptions =
+    NestApplicationContextOptions,
+> {
   private readonly routerProxy = new RouterProxy();
-  private readonly exceptionFiltersCache = new WeakMap();
+  private readonly logger = new Logger(MiddlewareModule.name);
+  // Middleware already checked for filter classes (see
+  // "warnAboutFilterClasses()")
+  private readonly checkedFilterBindings = new WeakSet<object>();
 
   private injector: Injector;
   private routerExceptionFilter: RouterExceptionFilters;
   private routesMapper: RoutesMapper;
   private resolver: MiddlewareResolver;
-  private config: ApplicationConfig;
   private container: NestContainer;
   private httpAdapter: HttpServer;
+  private graphInspector: GraphInspector;
+  private appOptions: TAppOptions;
+  private routeInfoPathExtractor: RouteInfoPathExtractor;
 
   public async register(
     middlewareContainer: MiddlewareContainer,
@@ -46,20 +60,26 @@ export class MiddlewareModule {
     config: ApplicationConfig,
     injector: Injector,
     httpAdapter: HttpServer,
+    graphInspector: GraphInspector,
+    options: TAppOptions,
   ) {
+    this.appOptions = options;
+
     const appRef = container.getHttpAdapterRef();
     this.routerExceptionFilter = new RouterExceptionFilters(
       container,
       config,
       appRef,
     );
-    this.routesMapper = new RoutesMapper(container);
-    this.resolver = new MiddlewareResolver(middlewareContainer);
-
-    this.config = config;
+    this.routesMapper = new RoutesMapper(container, config);
+    this.resolver = new MiddlewareResolver(middlewareContainer, injector);
+    this.routeInfoPathExtractor = new RouteInfoPathExtractor(config, () =>
+      this.routesMapper.mapControllersToRouteInfo(),
+    );
     this.injector = injector;
     this.container = container;
     this.httpAdapter = httpAdapter;
+    this.graphInspector = graphInspector;
 
     const modules = container.getModules();
     await this.resolveMiddleware(middlewareContainer, modules);
@@ -70,30 +90,46 @@ export class MiddlewareModule {
     modules: Map<string, Module>,
   ) {
     const moduleEntries = [...modules.entries()];
-    const loadMiddlewareConfiguration = async ([name, module]: [
+    const loadMiddlewareConfiguration = async ([moduleName, moduleRef]: [
       string,
       Module,
     ]) => {
-      const instance = module.instance;
-      await this.loadConfiguration(middlewareContainer, instance, name);
-      await this.resolver.resolveInstances(module, name);
+      await this.loadConfiguration(middlewareContainer, moduleRef, moduleName);
+      await this.resolver.resolveInstances(moduleRef, moduleName);
     };
     await Promise.all(moduleEntries.map(loadMiddlewareConfiguration));
   }
 
   public async loadConfiguration(
     middlewareContainer: MiddlewareContainer,
-    instance: NestModule,
+    moduleRef: Module,
     moduleKey: string,
   ) {
+    const { instance } = moduleRef;
     if (!instance.configure) {
       return;
     }
+    // The modules' "configure()" methods run concurrently, and
+    // "registerMiddleware()" mounts the middleware of modules at the same
+    // distance in the order of their configurations: a module whose
+    // "configure()" awaits must not end up behind the modules after it
+    middlewareContainer.reserveConfig(moduleKey);
     const middlewareBuilder = new MiddlewareBuilder(
       this.routesMapper,
       this.httpAdapter,
+      this.routeInfoPathExtractor,
     );
-    await instance.configure(middlewareBuilder);
+    try {
+      await instance.configure(middlewareBuilder);
+    } catch (err) {
+      if (!this.appOptions.preview) {
+        throw err;
+      }
+      const warningMessage =
+        `Warning! "${moduleRef.name}" module exposes a "configure" method that throws an exception in the preview mode` +
+        ` (possibly due to missing dependencies). Note: you can ignore this message, just be aware that some of those conditional middlewares will not be reflected in your graph.`;
+      this.logger.warn(warningMessage);
+    }
 
     if (!(middlewareBuilder instanceof MiddlewareBuilder)) {
       return;
@@ -123,10 +159,20 @@ export class MiddlewareModule {
 
     const entriesSortedByDistance = [...configs.entries()].sort(
       ([moduleA], [moduleB]) => {
-        return (
-          this.container.getModuleByKey(moduleA).distance -
-          this.container.getModuleByKey(moduleB).distance
-        );
+        const moduleARef = this.container.getModuleByKey(moduleA)!;
+        const moduleBRef = this.container.getModuleByKey(moduleB)!;
+        const isModuleAGlobal = moduleARef.distance === Number.MAX_VALUE;
+        const isModuleBGlobal = moduleBRef.distance === Number.MAX_VALUE;
+        if (isModuleAGlobal && isModuleBGlobal) {
+          return 0;
+        }
+        if (isModuleAGlobal) {
+          return -1;
+        }
+        if (isModuleBGlobal) {
+          return 1;
+        }
+        return moduleARef.distance - moduleBRef.distance;
       },
     );
     for (const [moduleRef, moduleConfigurations] of entriesSortedByDistance) {
@@ -141,6 +187,12 @@ export class MiddlewareModule {
     applicationRef: any,
   ) {
     const { forRoutes } = config;
+    // Shared by the routes of this configuration that differ only in their
+    // version (see `getHandledRequests()`)
+    const handledRequestsByRoute = new Map<
+      unknown,
+      Map<string, WeakSet<object>>
+    >();
     for (const routeInfo of forRoutes) {
       await this.registerRouteMiddleware(
         middlewareContainer,
@@ -148,6 +200,7 @@ export class MiddlewareModule {
         config,
         moduleKey,
         applicationRef,
+        handledRequestsByRoute,
       );
     }
   }
@@ -158,26 +211,50 @@ export class MiddlewareModule {
     config: MiddlewareConfiguration,
     moduleKey: string,
     applicationRef: any,
+    handledRequestsByRoute = new Map<unknown, Map<string, WeakSet<object>>>(),
   ) {
     const middlewareCollection = [].concat(config.middleware);
-    const moduleRef = this.container.getModuleByKey(moduleKey);
+    const moduleRef = this.container.getModuleByKey(moduleKey)!;
 
     for (const metatype of middlewareCollection) {
       const collection = middlewareContainer.getMiddlewareCollection(moduleKey);
-      const instanceWrapper = collection.get(metatype.name);
+      const instanceWrapper = collection.get(metatype);
+
       if (isUndefined(instanceWrapper)) {
         throw new RuntimeException();
       }
-      if (instanceWrapper.isTransient) {
-        return;
-      }
+
+      this.graphInspector.insertClassNode(
+        moduleRef,
+        instanceWrapper,
+        'middleware',
+      );
+      const middlewareDefinition: Entrypoint<MiddlewareEntrypointMetadata> = {
+        type: 'middleware',
+        methodName: 'use',
+        className: instanceWrapper.name,
+        classNodeId: instanceWrapper.id,
+        metadata: {
+          key: routeInfo.path,
+          path: routeInfo.path,
+          requestMethod:
+            (RequestMethod[routeInfo.method] as keyof typeof RequestMethod) ??
+            'ALL',
+          version: routeInfo.version,
+        },
+      };
+      this.graphInspector.insertEntrypointDefinition(
+        middlewareDefinition,
+        instanceWrapper.id,
+      );
+
       await this.bindHandler(
         instanceWrapper,
         applicationRef,
-        routeInfo.method,
-        routeInfo.path,
+        routeInfo,
         moduleRef,
         collection,
+        this.getHandledRequests(handledRequestsByRoute, metatype, routeInfo),
       );
     }
   }
@@ -185,40 +262,46 @@ export class MiddlewareModule {
   private async bindHandler(
     wrapper: InstanceWrapper<NestMiddleware>,
     applicationRef: HttpServer,
-    method: RequestMethod,
-    path: string,
+    routeInfo: RouteInfo,
     moduleRef: Module,
-    collection: Map<string, InstanceWrapper>,
+    collection: Map<InjectionToken, InstanceWrapper>,
+    handledRequests: WeakSet<object>,
   ) {
     const { instance, metatype } = wrapper;
-    if (isUndefined(instance.use)) {
-      throw new InvalidMiddlewareException(metatype.name);
+
+    if (isUndefined(instance?.use)) {
+      throw new InvalidMiddlewareException(metatype!.name);
     }
-    const router = await applicationRef.createMiddlewareFactory(method);
-    const isStatic = wrapper.isDependencyTreeStatic();
+    this.warnAboutFilterClasses(metatype, instance.use);
+    // A transient middleware is its own inquirer, and the injector creates
+    // such an instance only for a context: it is resolved per request, like a
+    // request-scoped one (its static instance is never constructed)
+    const isStatic = wrapper.isDependencyTreeStatic() && !wrapper.isTransient;
     if (isStatic) {
       const proxy = await this.createProxy(instance);
-      return this.registerHandler(router, path, proxy);
+      return this.registerHandler(
+        applicationRef,
+        routeInfo,
+        proxy,
+        handledRequests,
+      );
     }
-    this.registerHandler(
-      router,
-      path,
+
+    const isTreeDurable = wrapper.isDependencyTreeDurable();
+    // Kept per route, not per "use" function: middleware that inherits it
+    // from a base class can declare different filters
+    let exceptionsHandler: ExceptionsHandler | undefined;
+
+    await this.registerHandler(
+      applicationRef,
+      routeInfo,
       async <TRequest, TResponse>(
         req: TRequest,
         res: TResponse,
         next: () => void,
       ) => {
         try {
-          const contextId = ContextIdFactory.getByRequest(req);
-          if (!req[REQUEST_CONTEXT_ID]) {
-            Object.defineProperty(req, REQUEST_CONTEXT_ID, {
-              value: contextId,
-              enumerable: false,
-              writable: false,
-              configurable: false,
-            });
-            this.container.registerRequestProvider(req, contextId);
-          }
+          const contextId = this.getContextId(req, isTreeDurable);
           const contextInstance = await this.injector.loadPerContext(
             instance,
             moduleRef,
@@ -231,20 +314,71 @@ export class MiddlewareModule {
           );
           return proxy(req, res, next);
         } catch (err) {
-          let exceptionsHandler = this.exceptionFiltersCache.get(instance.use);
-          if (!exceptionsHandler) {
-            exceptionsHandler = this.routerExceptionFilter.create(
-              instance,
-              instance.use,
-              undefined,
-            );
-            this.exceptionFiltersCache.set(instance.use, exceptionsHandler);
-          }
+          exceptionsHandler ??= this.routerExceptionFilter.create(
+            instance,
+            instance.use,
+            undefined,
+          );
           const host = new ExecutionContextHost([req, res, next]);
           exceptionsHandler.next(err, host);
         }
       },
+      handledRequests,
     );
+  }
+
+  /**
+   * Exception filters bound to a middleware with @UseFilters() apply only
+   * when they are instances: a filter class has no module to be resolved in
+   * for a middleware, so it is left out. Warns once per middleware.
+   */
+  private warnAboutFilterClasses(
+    metatype: InstanceWrapper['metatype'],
+    use: Function,
+  ) {
+    if (!metatype || this.checkedFilterBindings.has(metatype)) {
+      return;
+    }
+    this.checkedFilterBindings.add(metatype);
+    const filterClasses = [
+      ...(Reflect.getMetadata(EXCEPTION_FILTERS_METADATA, metatype) ?? []),
+      ...(Reflect.getMetadata(EXCEPTION_FILTERS_METADATA, use) ?? []),
+    ].filter(filter => isFunction(filter) && !isFunction(filter.catch));
+    if (filterClasses.length === 0) {
+      return;
+    }
+    const names = [
+      ...new Set(filterClasses.map(filter => `"${filter.name}"`)),
+    ].join(', ');
+    this.logger.warn(
+      `The exception filter classes ${names} bound to the "${metatype.name}" middleware with @UseFilters() are not applied to it: a middleware only applies filter instances, such as @UseFilters(new ${filterClasses[0].name}()). Pass instances, or register the filters globally.`,
+    );
+  }
+
+  /**
+   * Returns the requests the middleware already ran for on the route. Routes
+   * that differ only in their version (e.g. a controller with the versions
+   * `['1', '2']`) share it: unless the version is part of the path (URI
+   * versioning), they are mounted on the same path, and the middleware would
+   * run once for each of them.
+   */
+  private getHandledRequests(
+    handledRequestsByRoute: Map<unknown, Map<string, WeakSet<object>>>,
+    middleware: unknown,
+    { path, method }: RouteInfo,
+  ): WeakSet<object> {
+    let byRoute = handledRequestsByRoute.get(middleware);
+    if (!byRoute) {
+      byRoute = new Map();
+      handledRequestsByRoute.set(middleware, byRoute);
+    }
+    const key = `${method}:${path}`;
+    let handledRequests = byRoute.get(key);
+    if (!handledRequests) {
+      handledRequests = new WeakSet();
+      byRoute.set(key, handledRequests);
+    }
+    return handledRequests;
   }
 
   private async createProxy<TRequest = unknown, TResponse = unknown>(
@@ -261,22 +395,75 @@ export class MiddlewareModule {
     return this.routerProxy.createProxy(middleware, exceptionsHandler);
   }
 
-  private registerHandler(
-    router: (...args: any[]) => void,
-    path: string,
+  private async registerHandler(
+    applicationRef: HttpServer,
+    routeInfo: RouteInfo,
     proxy: <TRequest, TResponse>(
       req: TRequest,
       res: TResponse,
       next: () => void,
     ) => void,
+    handledRequests: WeakSet<object>,
   ) {
-    const prefix = this.config.getGlobalPrefix();
-    const basePath = addLeadingSlash(prefix);
-    if (basePath && path === '/*') {
-      // strip slash when a wildcard is being used
-      // and global prefix has been set
-      path = '*';
+    const { method } = routeInfo;
+    const paths = this.routeInfoPathExtractor.extractPathsFrom(routeInfo);
+    const isMethodAll = isRequestMethodAll(method);
+    const requestMethod = RequestMethod[method];
+    const router = await applicationRef.createMiddlewareFactory(method);
+    const middlewareFunction = isMethodAll
+      ? proxy
+      : <TRequest, TResponse>(
+          req: TRequest,
+          res: TResponse,
+          next: () => void,
+        ) => {
+          const actualRequestMethod = applicationRef.getRequestMethod?.(req);
+          if (
+            actualRequestMethod === requestMethod ||
+            (actualRequestMethod === RequestMethod[RequestMethod.HEAD] &&
+              requestMethod === RequestMethod[RequestMethod.GET])
+          ) {
+            return proxy(req, res, next);
+          }
+          return next();
+        };
+    // The paths may overlap (e.g. "/" and "/api/*" when the root path is
+    // excluded from the global prefix): the middleware runs for the first of
+    // them that matches a request, and the others skip that request
+    const handler = <TRequest, TResponse>(
+      req: TRequest,
+      res: TResponse,
+      next: () => void,
+    ) => {
+      if (handledRequests.has(req as object)) {
+        return next();
+      }
+      handledRequests.add(req as object);
+      return middlewareFunction(req, res, next);
+    };
+    // The root path goes first: mounted with Express "use()", it then runs
+    // the middleware for every request, with "req.url" left as it is
+    const pathsToApplyMiddleware = paths
+      .map(path => path || '/')
+      .sort((a, b) => Number(b === '/') - Number(a === '/'));
+    pathsToApplyMiddleware.forEach(path => router(path, handler));
+  }
+
+  private getContextId(request: unknown, isTreeDurable: boolean): ContextId {
+    const contextId = ContextIdFactory.getByRequest(request as object);
+    if (!request![REQUEST_CONTEXT_ID]) {
+      Object.defineProperty(request, REQUEST_CONTEXT_ID, {
+        value: contextId,
+        enumerable: false,
+        writable: false,
+        configurable: false,
+      });
+
+      const requestProviderValue = isTreeDurable
+        ? contextId.payload
+        : Object.assign(request as object, contextId.payload);
+      this.container.registerRequestProvider(requestProviderValue, contextId);
     }
-    router(basePath + path, proxy);
+    return contextId;
   }
 }

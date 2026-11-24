@@ -1,30 +1,48 @@
-import { flatten } from '@nestjs/common/decorators/core/dependencies.decorator';
-import {
+import { iterate } from 'iterare';
+import { pathToRegexp } from 'path-to-regexp';
+import { LegacyRouteConverter } from '../router/legacy-route-converter.js';
+import { isRequestMethodAll } from '../router/utils/index.js';
+import { RouteInfoPathExtractor } from './route-info-path-extractor.js';
+import { RoutesMapper } from './routes-mapper.js';
+import { filterMiddleware, isStaticPath } from './utils.js';
+import type {
   HttpServer,
   MiddlewareConsumer,
+  RequestMethod,
   Type,
-} from '@nestjs/common/interfaces';
+} from '@nestjs/common';
 import {
-  MiddlewareConfigProxy,
-  RouteInfo,
-} from '@nestjs/common/interfaces/middleware';
-import { MiddlewareConfiguration } from '@nestjs/common/interfaces/middleware/middleware-configuration.interface';
-import { RoutesMapper } from './routes-mapper';
-import { filterMiddleware } from './utils';
-import { iterate } from 'iterare';
+  type MiddlewareConfigProxy,
+  type MiddlewareConfiguration,
+  type RouteInfo,
+} from '@nestjs/common/internal';
+
+/**
+ * Returns the path the router serves the routes of a mount path at, which is
+ * also the path the adapters mount it on: without the "$" that marks an
+ * exact-match path, and without a trailing slash.
+ */
+const toServedPath = (mountPath: string): string =>
+  mountPath.replace(/\$$/, '').replace(/\/+$/, '') || '/';
 
 export class MiddlewareBuilder implements MiddlewareConsumer {
   private readonly middlewareCollection = new Set<MiddlewareConfiguration>();
+  private servedRoutes?: RouteInfo[];
 
   constructor(
     private readonly routesMapper: RoutesMapper,
     private readonly httpAdapter: HttpServer,
+    private readonly routeInfoPathExtractor: RouteInfoPathExtractor,
   ) {}
 
   public apply(
-    ...middleware: Array<Type<any> | Function | any>
+    ...middleware: Array<Type<any> | Function | Array<Type<any> | Function>>
   ): MiddlewareConfigProxy {
-    return new MiddlewareBuilder.ConfigProxy(this, flatten(middleware));
+    return new MiddlewareBuilder.ConfigProxy(
+      this,
+      middleware.flat(),
+      this.routeInfoPathExtractor,
+    );
   }
 
   public build(): MiddlewareConfiguration[] {
@@ -35,12 +53,27 @@ export class MiddlewareBuilder implements MiddlewareConsumer {
     return this.httpAdapter;
   }
 
+  /**
+   * Returns the routes of the controllers of the application at the paths
+   * the router serves them at (global prefix and version included).
+   */
+  public getServedRoutes(): RouteInfo[] {
+    return (this.servedRoutes ??= this.routesMapper
+      .mapControllersToRouteInfo()
+      .flatMap(route =>
+        this.routeInfoPathExtractor
+          .extractPathsFrom(route)
+          .map(path => ({ ...route, path: toServedPath(path) })),
+      ));
+  }
+
   private static readonly ConfigProxy = class implements MiddlewareConfigProxy {
     private excludedRoutes: RouteInfo[] = [];
 
     constructor(
       private readonly builder: MiddlewareBuilder,
-      private readonly middleware: Array<Type<any> | Function | any>,
+      private readonly middleware: Array<Type<any> | Function>,
+      private routeInfoPathExtractor: RouteInfoPathExtractor,
     ) {}
 
     public getExcludedRoutes(): RouteInfo[] {
@@ -50,7 +83,17 @@ export class MiddlewareBuilder implements MiddlewareConsumer {
     public exclude(
       ...routes: Array<string | RouteInfo>
     ): MiddlewareConfigProxy {
-      this.excludedRoutes = this.getRoutesFlatList(routes);
+      this.excludedRoutes = [
+        ...this.excludedRoutes,
+        ...this.getRoutesFlatList(routes).flatMap(route =>
+          this.routeInfoPathExtractor.extractExclusionsFrom(route, {
+            caseSensitive:
+              this.builder.getHttpAdapter().getRouteMatchingOptions?.()
+                ?.caseSensitive ?? true,
+          }),
+        ),
+      ];
+
       return this;
     }
 
@@ -59,12 +102,17 @@ export class MiddlewareBuilder implements MiddlewareConsumer {
     ): MiddlewareConsumer {
       const { middlewareCollection } = this.builder;
 
-      const forRoutes = this.getRoutesFlatList(routes);
+      const flattedRoutes = this.getRoutesFlatList(routes);
+      const forRoutes = this.removeOverlappedRoutes(
+        this.addCoveredExcludedRoutes(flattedRoutes),
+      );
       const configuration = {
         middleware: filterMiddleware(
           this.middleware,
           this.excludedRoutes,
           this.builder.getHttpAdapter(),
+          this.routeInfoPathExtractor.getVersioningOptions(),
+          () => this.builder.getServedRoutes(),
         ),
         forRoutes,
       };
@@ -81,6 +129,99 @@ export class MiddlewareBuilder implements MiddlewareConsumer {
         .map(route => routesMapper.mapRouteToRouteInfo(route))
         .flatten()
         .toArray();
+    }
+
+    /**
+     * Adds the routes excluded from the global prefix that a route covers
+     * without being excluded itself (e.g. "users/me" for "users/:id"): the
+     * router serves them outside of the prefix the route is mounted under.
+     * Also adds the routes of the controllers that a route covers on the
+     * other side of the prefix (see `extractControllerRoutesCoveredBy()`).
+     */
+    private addCoveredExcludedRoutes(routes: RouteInfo[]): RouteInfo[] {
+      const allRoutes = [...routes];
+      for (const route of routes) {
+        for (const excludedRoute of [
+          ...this.routeInfoPathExtractor.extractExcludedRoutesCoveredBy(route),
+          ...this.routeInfoPathExtractor.extractControllerRoutesCoveredBy(
+            route,
+          ),
+        ]) {
+          const isListed = allRoutes.some(
+            item =>
+              item.path === excludedRoute.path &&
+              item.method === excludedRoute.method &&
+              item.version === excludedRoute.version,
+          );
+          if (!isListed) {
+            allRoutes.push(excludedRoute);
+          }
+        }
+      }
+      return allRoutes;
+    }
+
+    /**
+     * Removes the routes that a parameterized route of the same method is
+     * mounted on as well (e.g. "/users/me" next to "/users/:id"), so that
+     * the middleware runs once for them. Only a route without parameters or
+     * wildcards is removed, and only when the parameterized route matches
+     * every path it would be mounted on (global prefix and version included).
+     *
+     * The paths are compared as the router serves them, without a trailing
+     * slash: the root route of a controller is mounted on "/cats/" and served
+     * at "/cats", which "/:id/{*path}" matches only with the slash.
+     */
+    private removeOverlappedRoutes(routes: RouteInfo[]) {
+      const routesWithRegex = routes
+        .filter(route => route.path.includes(':'))
+        .map(route => ({
+          method: route.method,
+          regexes: this.compileMountPaths(route),
+        }));
+
+      return routes.filter(route => {
+        const mountPaths = this.routeInfoPathExtractor.extractPathsFrom(route);
+        if (!mountPaths.every(isStaticPath)) {
+          return true;
+        }
+        const isOverlapped = (item: {
+          method: RequestMethod;
+          regexes: RegExp[];
+        }): boolean =>
+          // A parameterized route mounted for every method (a plain string
+          // passed to forRoutes(), or RequestMethod.ALL) also serves the
+          // requests of a route declared for a specific method, while a
+          // specific-method parameterized route covers none of the methods
+          // an all-methods route is mounted on. A plain string is only covered
+          // by another one: Express and the node adapter mount it with use(),
+          // which also matches paths below it, while RequestMethod.ALL only
+          // matches its own pattern
+          (route.method === item.method ||
+            (isRequestMethodAll(item.method) &&
+              (route.method as number) !== -1)) &&
+          mountPaths.every(path =>
+            item.regexes.some(regex => regex.test(toServedPath(path))),
+          );
+        return !routesWithRegex.some(isOverlapped);
+      });
+    }
+
+    private compileMountPaths(route: RouteInfo): RegExp[] {
+      try {
+        return this.routeInfoPathExtractor.extractPathsFrom(route).map(
+          path =>
+            pathToRegexp(
+              LegacyRouteConverter.tryConvert(toServedPath(path), {
+                logs: false,
+              }),
+              { sensitive: true },
+            ).regexp,
+        );
+      } catch {
+        // The adapter reports a path it cannot mount; it covers nothing here
+        return [];
+      }
     }
   };
 }

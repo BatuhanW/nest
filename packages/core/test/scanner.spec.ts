@@ -1,25 +1,38 @@
-import { Injectable } from '@nestjs/common';
-import { expect } from 'chai';
-import * as sinon from 'sinon';
-import { GUARDS_METADATA } from '../../common/constants';
-import { Controller } from '../../common/decorators/core/controller.decorator';
-import { UseGuards } from '../../common/decorators/core/use-guards.decorator';
-import { Module } from '../../common/decorators/modules/module.decorator';
-import { Scope } from '../../common/interfaces';
-import { ApplicationConfig } from '../application-config';
-import { APP_FILTER, APP_GUARD, APP_INTERCEPTOR, APP_PIPE } from '../constants';
-import { NestContainer } from '../injector/container';
-import { InstanceWrapper } from '../injector/instance-wrapper';
-import { MetadataScanner } from '../metadata-scanner';
-import { DependenciesScanner } from '../scanner';
-import { UndefinedModuleException } from '../errors/exceptions/undefined-module.exception';
-import { InvalidModuleException } from '../errors/exceptions/invalid-module.exception';
+import { Catch, Injectable, Logger } from '@nestjs/common';
+import { GUARDS_METADATA } from '../../common/constants.js';
+import { Controller } from '../../common/decorators/core/controller.decorator.js';
+import { UseGuards } from '../../common/decorators/core/use-guards.decorator.js';
+import { Param } from '../../common/decorators/http/route-params.decorator.js';
+import { Module } from '../../common/decorators/modules/module.decorator.js';
+import { Scope } from '../../common/interfaces/index.js';
+import { ApplicationConfig } from '../application-config.js';
+import {
+  APP_FILTER,
+  APP_GUARD,
+  APP_INTERCEPTOR,
+  APP_PIPE,
+} from '../constants.js';
+import { InvalidClassModuleException } from '../errors/exceptions/invalid-class-module.exception.js';
+import { InvalidModuleException } from '../errors/exceptions/invalid-module.exception.js';
+import { RequestScopedGlobalEnhancerException } from '../errors/exceptions/request-scoped-global-enhancer.exception.js';
+import { UndefinedModuleException } from '../errors/exceptions/undefined-module.exception.js';
+import { InvalidEnhancerException } from '../errors/exceptions/invalid-enhancer.exception.js';
+import { UninstantiatedGlobalEnhancerException } from '../errors/exceptions/uninstantiated-global-enhancer.exception.js';
+import { NestContainer } from '../injector/container.js';
+import { InstanceWrapper } from '../injector/instance-wrapper.js';
+import { GraphInspector } from '../inspector/graph-inspector.js';
+import { ModuleOverride } from '../interfaces/module-override.interface.js';
+import { MetadataScanner } from '../metadata-scanner.js';
+import { DependenciesScanner } from '../scanner.js';
 
 describe('DependenciesScanner', () => {
   class Guard {}
 
   @Injectable()
   class TestComponent {}
+
+  @Catch()
+  class TestExceptionFilterWithoutInjectable {}
 
   @Controller('')
   class TestController {}
@@ -39,145 +52,494 @@ describe('DependenciesScanner', () => {
   class TestModule {}
 
   @Module({
-    imports: [undefined],
+    imports: [undefined!],
   })
   class UndefinedModule {}
 
   @Module({
-    imports: [null],
+    imports: [null!],
   })
   class InvalidModule {}
 
   let scanner: DependenciesScanner;
-  let mockContainer: sinon.SinonMock;
+  let untypedScanner: any;
   let container: NestContainer;
+  let graphInspector: GraphInspector;
 
   beforeEach(() => {
     container = new NestContainer();
-    mockContainer = sinon.mock(container);
+    graphInspector = new GraphInspector(container);
 
     scanner = new DependenciesScanner(
       container,
       new MetadataScanner(),
+      graphInspector,
       new ApplicationConfig(),
     );
-    sinon.stub(scanner, 'registerCoreModule').callsFake(async () => {});
+    untypedScanner = scanner as any;
+    vi.spyOn(scanner, 'registerCoreModule').mockImplementation(async () => {});
   });
 
   afterEach(() => {
-    mockContainer.restore();
+    vi.restoreAllMocks();
   });
 
-  it('should "insertModule" call twice (2 modules) container method "addModule"', async () => {
-    const expectation = mockContainer.expects('addModule').twice();
+  it('should "insertOrOverrideModule" call twice (2 modules) container method "addModule"', async () => {
+    const addModuleSpy = vi.spyOn(container, 'addModule');
+    const replaceModuleSpy = vi.spyOn(container, 'replaceModule');
 
-    await scanner.scan(TestModule as any);
-    expectation.verify();
+    await scanner.scan(TestModule);
+    expect(addModuleSpy).toHaveBeenCalledTimes(2);
+    expect(replaceModuleSpy).not.toHaveBeenCalled();
   });
 
   it('should "insertProvider" call twice (2 components) container method "addProvider"', async () => {
-    const expectation = mockContainer.expects('addProvider').twice();
-    const stub = sinon.stub(scanner, 'insertExportedProvider');
+    const addProviderSpy = vi.spyOn(container, 'addProvider');
+    const stub = vi
+      .spyOn(scanner, 'insertExportedProviderOrModule')
+      .mockImplementation(() => ({}) as any);
 
-    await scanner.scan(TestModule as any);
-    expectation.verify();
-    stub.restore();
+    await scanner.scan(TestModule);
+    expect(addProviderSpy).toHaveBeenCalledTimes(2);
+    stub.mockRestore();
   });
 
   it('should "insertController" call twice (2 components) container method "addController"', async () => {
-    const expectation = mockContainer.expects('addController').twice();
-    await scanner.scan(TestModule as any);
-    expectation.verify();
+    const addControllerSpy = vi.spyOn(container, 'addController');
+    await scanner.scan(TestModule);
+    expect(addControllerSpy).toHaveBeenCalledTimes(2);
   });
 
-  it('should "insertExportedProvider" call once (1 component) container method "addExportedProvider"', async () => {
-    const expectation = mockContainer.expects('addExportedProvider').once();
-    await scanner.scan(TestModule as any);
-    expectation.verify();
+  it('should "insertExportedProviderOrModule" call once (1 component) container method "addExportedProviderOrModule"', async () => {
+    const addExportedSpy = vi.spyOn(container, 'addExportedProviderOrModule');
+    await scanner.scan(TestModule);
+    expect(addExportedSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('should register a module that extends an imported module', async () => {
+    @Injectable()
+    class ChildComponent {}
+
+    @Module({ providers: [TestComponent] })
+    class ParentModule {}
+
+    @Module({ providers: [ChildComponent] })
+    class ChildModule extends ParentModule {}
+
+    @Module({ imports: [ParentModule, ChildModule] })
+    class AppModule {}
+
+    await scanner.scan(AppModule);
+
+    const childModuleRef = [...container.getModules().values()].find(
+      moduleRef => moduleRef.metatype === ChildModule,
+    );
+    expect(childModuleRef?.providers.has(ChildComponent)).toBe(true);
+  });
+
+  describe('when there is modules overrides', () => {
+    @Injectable()
+    class OverwrittenTestComponent {}
+
+    @Controller('')
+    class OverwrittenControllerOne {}
+
+    @Controller('')
+    class OverwrittenControllerTwo {}
+
+    @Module({
+      controllers: [OverwrittenControllerOne],
+      providers: [OverwrittenTestComponent],
+    })
+    class OverwrittenModuleOne {}
+
+    @Module({
+      controllers: [OverwrittenControllerTwo],
+    })
+    class OverwrittenModuleTwo {}
+
+    @Module({
+      imports: [OverwrittenModuleOne, OverwrittenModuleTwo],
+    })
+    class OverrideTestModule {}
+
+    @Injectable()
+    class OverrideTestComponent {}
+
+    @Controller('')
+    class OverrideControllerOne {}
+
+    @Controller('')
+    class OverrideControllerTwo {}
+
+    @Module({
+      controllers: [OverwrittenControllerOne],
+      providers: [OverrideTestComponent],
+    })
+    class OverrideModuleOne {}
+
+    @Module({
+      controllers: [OverrideControllerTwo],
+    })
+    class OverrideModuleTwo {}
+
+    const modulesToOverride: ModuleOverride[] = [
+      { moduleToReplace: OverwrittenModuleOne, newModule: OverrideModuleOne },
+      { moduleToReplace: OverwrittenModuleTwo, newModule: OverrideModuleTwo },
+    ];
+
+    it('should "putModule" call twice (2 modules) container method "replaceModule"', async () => {
+      const replaceModuleSpy = vi.spyOn(container, 'replaceModule');
+      const addModuleSpy = vi.spyOn(container, 'addModule');
+
+      await scanner.scan(OverrideTestModule, {
+        overrides: modulesToOverride,
+      });
+
+      expect(replaceModuleSpy).toHaveBeenCalledTimes(2);
+      expect(addModuleSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('should "insertProvider" call once container method "addProvider"', async () => {
+      const addProviderSpy = vi.spyOn(container, 'addProvider');
+
+      await scanner.scan(OverrideTestModule);
+      expect(addProviderSpy).toHaveBeenCalled();
+    });
+
+    it('should "insertController" call twice (2 components) container method "addController"', async () => {
+      const addControllerSpy = vi.spyOn(container, 'addController');
+      await scanner.scan(OverrideTestModule);
+      expect(addControllerSpy).toHaveBeenCalledTimes(2);
+    });
+
+    it('should "putModule" call container method "replaceModule" with forwardRef() when forwardRef property exists', async () => {
+      const overwrittenForwardRefSpy = vi.fn();
+
+      @Module({})
+      class OverwrittenForwardRef {}
+
+      @Module({})
+      class Overwritten {
+        public static forwardRef() {
+          overwrittenForwardRefSpy();
+          return OverwrittenForwardRef;
+        }
+      }
+
+      const overrideForwardRefSpy = vi.fn();
+
+      @Module({})
+      class OverrideForwardRef {}
+
+      @Module({})
+      class Override {
+        public static forwardRef() {
+          overrideForwardRefSpy();
+          return OverrideForwardRef;
+        }
+      }
+
+      @Module({
+        imports: [Overwritten],
+      })
+      class OverrideForwardRefTestModule {}
+
+      await scanner.scan(OverrideForwardRefTestModule, {
+        overrides: [
+          {
+            moduleToReplace: Overwritten,
+            newModule: Override,
+          },
+        ],
+      });
+
+      expect(overwrittenForwardRefSpy).toHaveBeenCalled();
+      expect(overrideForwardRefSpy).toHaveBeenCalled();
+    });
   });
 
   describe('reflectDynamicMetadata', () => {
     describe('when param has prototype', () => {
       it('should call "reflectParamInjectables" and "reflectInjectables"', () => {
-        const reflectInjectables = sinon
-          .stub(scanner, 'reflectInjectables')
-          .callsFake(() => undefined);
+        const reflectInjectables = vi
+          .spyOn(scanner, 'reflectInjectables')
+          .mockImplementation(() => undefined);
 
-        const reflectParamInjectables = sinon
-          .stub(scanner, 'reflectParamInjectables')
-          .callsFake(() => undefined);
+        const reflectParamInjectables = vi
+          .spyOn(scanner, 'reflectParamInjectables')
+          .mockImplementation(() => undefined);
 
         scanner.reflectDynamicMetadata({ prototype: true } as any, '');
-        expect(reflectInjectables.called).to.be.true;
-        expect(reflectParamInjectables.called).to.be.true;
+        expect(reflectInjectables).toHaveBeenCalled();
+        expect(reflectParamInjectables).toHaveBeenCalled();
       });
     });
     describe('when param has not prototype', () => {
       it('should not call ""reflectParamInjectables" and "reflectInjectables"', () => {
-        const reflectInjectables = sinon
-          .stub(scanner, 'reflectInjectables')
-          .callsFake(() => undefined);
-        const reflectParamInjectables = sinon
-          .stub(scanner, 'reflectParamInjectables')
-
-          .callsFake(() => undefined);
+        const reflectInjectables = vi
+          .spyOn(scanner, 'reflectInjectables')
+          .mockImplementation(() => undefined);
+        const reflectParamInjectables = vi
+          .spyOn(scanner, 'reflectParamInjectables')
+          .mockImplementation(() => undefined);
         scanner.reflectDynamicMetadata({} as any, '');
 
-        expect(reflectInjectables.called).to.be.false;
-        expect(reflectParamInjectables.called).to.be.false;
+        expect(reflectInjectables).not.toHaveBeenCalled();
+        expect(reflectParamInjectables).not.toHaveBeenCalled();
       });
     });
   });
 
-  describe('insertInjectable', () => {
-    it('should call "addInjectable"', () => {
-      const addInjectable = sinon
-        .stub((scanner as any).container, 'addInjectable')
-        .callsFake(() => undefined);
-      const comp = {};
-      const token = 'token';
+  describe('reflectProviders', () => {
+    class ClassProviderGuard {}
 
-      scanner.insertInjectable(comp as any, token, null);
-      expect(addInjectable.calledWith(comp, token)).to.be.true;
+    @Injectable()
+    class GuardedComponent {
+      @UseGuards(ClassProviderGuard)
+      public method() {}
+    }
+
+    @Module({
+      providers: [{ provide: 'GUARDED', useClass: GuardedComponent }],
+    })
+    class ClassProviderModule {}
+
+    it('should register the enhancers of a class provider and bind them to its token', async () => {
+      await scanner.scan(ClassProviderModule);
+
+      const moduleRef = [...container.getModules().values()].find(
+        ({ metatype }) => metatype === ClassProviderModule,
+      )!;
+      const enhancerWrapper = moduleRef.injectables.get(ClassProviderGuard);
+      expect(enhancerWrapper).toBeInstanceOf(InstanceWrapper);
+      expect(
+        moduleRef.providers.get('GUARDED')!.getEnhancersMetadata(),
+      ).toEqual([enhancerWrapper]);
+    });
+  });
+
+  describe('reflectParamInjectables', () => {
+    class ParamPipe {
+      transform(value: unknown) {
+        return value;
+      }
+    }
+    class OwnPipe extends ParamPipe {}
+
+    class Routes {
+      public findOne(@Param('id', ParamPipe) id: unknown) {}
+    }
+    // What the TypeScript handbook's `applyMixins()` does
+    const applyRoutes = (host: Function) =>
+      Object.defineProperties(
+        host.prototype,
+        Object.getOwnPropertyDescriptors(Routes.prototype),
+      );
+
+    const getInjectables = async (controller: Function) => {
+      @Module({ controllers: [controller] })
+      class HostModule {}
+
+      await scanner.scan(HostModule);
+      return [...container.getModules().values()].find(
+        ({ metatype }) => metatype === HostModule,
+      )!.injectables;
+    };
+
+    it('should register the pipes of the parameters of an inherited handler', async () => {
+      @Controller()
+      class InheritedController extends Routes {}
+
+      const injectables = await getInjectables(InheritedController);
+      expect(injectables.get(ParamPipe)).toBeInstanceOf(InstanceWrapper);
+    });
+
+    it('should register the pipes of the parameters of handlers copied by a mixin helper and of the own ones', async () => {
+      @Controller()
+      class MixedInController {
+        public own(@Param('id', OwnPipe) id: unknown) {}
+      }
+      applyRoutes(MixedInController);
+
+      const injectables = await getInjectables(MixedInController);
+      expect(injectables.get(ParamPipe)).toBeInstanceOf(InstanceWrapper);
+      expect(injectables.get(OwnPipe)).toBeInstanceOf(InstanceWrapper);
+    });
+
+    it('should register the pipes of the parameters when a class decorator returned a proxy', async () => {
+      const Proxied = (): ClassDecorator => (target: any) => {
+        const proxy = new Proxy(target, {});
+        Reflect.getMetadataKeys(target).forEach(key =>
+          Reflect.defineMetadata(key, Reflect.getMetadata(key, target), proxy),
+        );
+        return proxy;
+      };
+
+      @Proxied()
+      @Controller()
+      class ProxiedController {
+        public findOne(@Param('id', OwnPipe) id: unknown) {}
+      }
+
+      const injectables = await getInjectables(ProxiedController);
+      expect(injectables.get(OwnPipe)).toBeInstanceOf(InstanceWrapper);
+    });
+  });
+
+  describe('insertInjectable', () => {
+    class InjectableCls {}
+    class HostCls {}
+
+    const instanceWrapper = { id: 'random_id' };
+    const token = 'token';
+    const methodKey = 'methodKey';
+
+    let addInjectableStub: ReturnType<typeof vi.fn>;
+    let insertEnhancerMetadataCacheStub: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+      addInjectableStub = vi
+        .spyOn(untypedScanner.container, 'addInjectable')
+        .mockImplementation(() => instanceWrapper);
+      insertEnhancerMetadataCacheStub = vi
+        .spyOn(graphInspector, 'insertEnhancerMetadataCache')
+        .mockImplementation(() => undefined);
+    });
+
+    describe('when injectable is of type function', () => {
+      const subtype = 'filter';
+      beforeEach(() => {
+        scanner.insertInjectable(
+          InjectableCls,
+          token,
+          HostCls,
+          subtype,
+          methodKey,
+        );
+      });
+
+      it('should call "addInjectable"', () => {
+        expect(addInjectableStub).toHaveBeenCalledWith(
+          InjectableCls,
+          token,
+          subtype,
+          HostCls,
+        );
+      });
+
+      it('should call "insertEnhancerMetadataCache"', () => {
+        expect(insertEnhancerMetadataCacheStub).toHaveBeenCalledWith({
+          moduleToken: token,
+          classRef: HostCls,
+          enhancerInstanceWrapper: instanceWrapper,
+          targetNodeId: instanceWrapper.id,
+          methodKey,
+          subtype,
+        });
+      });
+    });
+    describe('when injectable is not of type function', () => {
+      const injectableRef = new InjectableCls();
+      const subtype = 'interceptor';
+
+      beforeEach(() => {
+        scanner.insertInjectable(
+          injectableRef,
+          token,
+          HostCls,
+          subtype,
+          methodKey,
+        );
+      });
+
+      it('should not call "addInjectable"', () => {
+        expect(addInjectableStub).not.toHaveBeenCalled();
+      });
+
+      it('should call "insertEnhancerMetadataCache"', () => {
+        expect(insertEnhancerMetadataCacheStub).toHaveBeenCalledWith({
+          moduleToken: token,
+          classRef: HostCls,
+          enhancerRef: injectableRef,
+          methodKey,
+          subtype,
+        });
+      });
     });
   });
 
   class CompMethod {
     @UseGuards(Guard)
     public method() {}
+
+    @UseGuards(Guard, Guard)
+    public method2() {}
   }
   describe('reflectKeyMetadata', () => {
     it('should return undefined', () => {
       const result = scanner.reflectKeyMetadata(TestComponent, 'key', 'method');
-      expect(result).to.be.undefined;
+      expect(result).toBeUndefined();
     });
-    it('should return array', () => {
+    it('should return an array that consists of 1 element', () => {
+      const methodKey = 'method';
       const result = scanner.reflectKeyMetadata(
         CompMethod,
         GUARDS_METADATA,
-        'method',
+        methodKey,
       );
-      expect(result).to.be.eql([Guard]);
+      expect(result).toEqual({ methodKey, metadata: [Guard] });
+    });
+    it('should return an array that consists of 2 elements', () => {
+      const methodKey = 'method2';
+      const result = scanner.reflectKeyMetadata(
+        CompMethod,
+        GUARDS_METADATA,
+        methodKey,
+      );
+      expect(result).toEqual({ methodKey, metadata: [Guard, Guard] });
     });
   });
 
   describe('insertModule', () => {
-    it('should call forwardRef() when forwardRef property exists', () => {
-      const module = { forwardRef: sinon.spy() };
+    it('should call forwardRef() when forwardRef property exists', async () => {
+      vi.spyOn(container, 'addModule').mockReturnValue({} as any);
 
-      sinon.stub(container, 'addModule').returns({} as any);
-      scanner.insertModule(module as any, [] as any);
-      expect(module.forwardRef.called).to.be.true;
+      const module = { forwardRef: vi.fn().mockReturnValue(class {}) };
+      await scanner.insertModule(module, []);
+
+      expect(module.forwardRef).toHaveBeenCalled();
+    });
+    it('should throw "InvalidClassModuleException" exception when supplying a class annotated with `@Injectable()` decorator', async () => {
+      vi.spyOn(container, 'addModule').mockReturnValue({} as any);
+
+      await expect(scanner.insertModule(TestComponent, [])).rejects.toThrow(
+        InvalidClassModuleException,
+      );
+    });
+    it('should throw "InvalidClassModuleException" exception when supplying a class annotated with `@Controller()` decorator', async () => {
+      vi.spyOn(container, 'addModule').mockReturnValue({} as any);
+
+      await expect(scanner.insertModule(TestController, [])).rejects.toThrow(
+        InvalidClassModuleException,
+      );
+    });
+    it('should throw "InvalidClassModuleException" exception when supplying a class annotated with (only) `@Catch()` decorator', async () => {
+      vi.spyOn(container, 'addModule').mockReturnValue({} as any);
+
+      await expect(
+        scanner.insertModule(TestExceptionFilterWithoutInjectable, []),
+      ).rejects.toThrow(InvalidClassModuleException);
     });
   });
 
   describe('insertImport', () => {
     it('should call forwardRef() when forwardRef property exists', async () => {
-      const module = { forwardRef: sinon.stub().returns({}) };
+      const module = { forwardRef: vi.fn().mockReturnValue({}) };
 
-      sinon.stub(container, 'addImport').returns({} as any);
-      await scanner.insertImport(module as any, [] as any, 'test');
-      expect(module.forwardRef.called).to.be.true;
+      vi.spyOn(container, 'addImport').mockReturnValue({} as any);
+      await scanner.insertImport(module, [] as any, 'test');
+      expect(module.forwardRef).toHaveBeenCalled();
     });
     describe('when "related" is nil', () => {
       it('should throw exception', async () => {
@@ -187,7 +549,7 @@ describe('DependenciesScanner', () => {
         } catch (e) {
           error = e;
         }
-        expect(error).to.not.be.undefined;
+        expect(error).not.toBeUndefined();
       });
     });
   });
@@ -198,14 +560,13 @@ describe('DependenciesScanner', () => {
     describe('when provider is not custom', () => {
       it('should call container "addProvider" with expected args', () => {
         const provider = {};
-        const expectation = mockContainer
-          .expects('addProvider')
-          .withArgs(provider, token);
+        const addProviderSpy = vi
+          .spyOn(container, 'addProvider')
+          .mockImplementation(() => false as any);
 
-        mockContainer.expects('addProvider').callsFake(() => false);
         scanner.insertProvider(provider as any, token);
 
-        expectation.verify();
+        expect(addProviderSpy).toHaveBeenCalledWith(provider, token);
       });
     });
     describe('when provider is custom', () => {
@@ -216,20 +577,23 @@ describe('DependenciesScanner', () => {
         };
 
         it('should call container "addProvider" with expected args', () => {
-          const expectation = mockContainer.expects('addProvider').atLeast(1);
+          const addProviderSpy = vi
+            .spyOn(container, 'addProvider')
+            .mockImplementation(() => false as any);
 
-          mockContainer.expects('addProvider').callsFake(() => false);
           scanner.insertProvider(provider, token);
 
-          expectation.verify();
+          expect(addProviderSpy).toHaveBeenCalled();
         });
         it('should push new object to "applicationProvidersApplyMap" array', () => {
-          mockContainer.expects('addProvider').callsFake(() => false);
+          vi.spyOn(container, 'addProvider').mockImplementation(
+            () => false as any,
+          );
           scanner.insertProvider(provider, token);
-          const applyMap = (scanner as any).applicationProvidersApplyMap;
+          const applyMap = untypedScanner.applicationProvidersApplyMap;
 
-          expect(applyMap).to.have.length(1);
-          expect(applyMap[0].moduleKey).to.be.eql(token);
+          expect(applyMap).toHaveLength(1);
+          expect(applyMap[0].moduleKey).toEqual(token);
         });
       });
       describe('and is global and request/transient scoped', () => {
@@ -239,12 +603,60 @@ describe('DependenciesScanner', () => {
           scope: Scope.REQUEST,
         };
         it('should call container "addInjectable" with expected args', () => {
-          const expectation = mockContainer.expects('addInjectable').atLeast(1);
+          const addInjectableSpy = vi
+            .spyOn(container, 'addInjectable')
+            .mockImplementation(() => false as any);
 
-          mockContainer.expects('addInjectable').callsFake(() => false);
           scanner.insertProvider(provider, token);
 
-          expectation.verify();
+          expect(addInjectableSpy).toHaveBeenCalled();
+        });
+      });
+      describe('and is global and aliases a request-scoped class', () => {
+        @Injectable({ scope: Scope.REQUEST })
+        class ScopedGuard {}
+
+        const provider = {
+          provide: APP_GUARD,
+          useExisting: ScopedGuard,
+        };
+        it('should call container "addInjectable" with the scope of the class', () => {
+          const addInjectableSpy = vi
+            .spyOn(container, 'addInjectable')
+            .mockImplementation(() => false as any);
+
+          scanner.insertProvider(provider, token);
+
+          expect(addInjectableSpy).toHaveBeenCalledWith(
+            expect.objectContaining({
+              useExisting: ScopedGuard,
+              scope: Scope.REQUEST,
+            }),
+            token,
+            'guard',
+          );
+          expect(untypedScanner.applicationProvidersApplyMap[0].scope).toBe(
+            Scope.REQUEST,
+          );
+        });
+      });
+      describe('and is global and aliases a default-scoped class', () => {
+        @Injectable()
+        class StaticGuard {}
+
+        it('should call container "addProvider"', () => {
+          const addProviderSpy = vi
+            .spyOn(container, 'addProvider')
+            .mockImplementation(() => false as any);
+          const addInjectableSpy = vi.spyOn(container, 'addInjectable');
+
+          scanner.insertProvider(
+            { provide: APP_GUARD, useExisting: StaticGuard },
+            token,
+          );
+
+          expect(addProviderSpy).toHaveBeenCalled();
+          expect(addInjectableSpy).not.toHaveBeenCalled();
         });
       });
       describe('and is not global', () => {
@@ -253,25 +665,22 @@ describe('DependenciesScanner', () => {
           useValue: true,
         };
         it('should call container "addProvider" with expected args', () => {
-          const expectation = mockContainer
-            .expects('addProvider')
-            .withArgs(component, token);
+          const addProviderSpy = vi
+            .spyOn(container, 'addProvider')
+            .mockImplementation(() => false as any);
 
-          mockContainer.expects('addProvider').callsFake(() => false);
           scanner.insertProvider(component, token);
 
-          expectation.verify();
+          expect(addProviderSpy).toHaveBeenCalledWith(component, token);
         });
         it('should not push new object to "applicationProvidersApplyMap" array', () => {
-          expect((scanner as any).applicationProvidersApplyMap).to.have.length(
-            0,
-          );
+          expect(untypedScanner.applicationProvidersApplyMap).toHaveLength(0);
 
-          mockContainer.expects('addProvider').callsFake(() => false);
-          scanner.insertProvider(component, token);
-          expect((scanner as any).applicationProvidersApplyMap).to.have.length(
-            0,
+          vi.spyOn(container, 'addProvider').mockImplementation(
+            () => false as any,
           );
+          scanner.insertProvider(component, token);
+          expect(untypedScanner.applicationProvidersApplyMap).toHaveLength(0);
         });
       });
     });
@@ -283,21 +692,238 @@ describe('DependenciesScanner', () => {
         providerKey: 'providerToken',
         type: APP_GUARD,
       };
-      (scanner as any).applicationProvidersApplyMap = [provider];
+      untypedScanner.applicationProvidersApplyMap = [provider];
 
-      const expectedInstance = {};
-      mockContainer.expects('getModules').callsFake(() => ({
-        get: () => ({
-          providers: { get: () => ({ instance: expectedInstance }) },
-        }),
-      }));
-      const applySpy = sinon.spy();
-      sinon.stub(scanner, 'getApplyProvidersMap').callsFake(() => ({
+      const expectedInstance = { canActivate: () => true };
+      const instanceWrapper = {
+        instance: expectedInstance,
+        isDependencyTreeStatic: () => true,
+        getInstanceByContextId: () => ({ isResolved: true }),
+      } as unknown as InstanceWrapper;
+      vi.spyOn(container, 'getModules').mockImplementation(
+        () =>
+          ({
+            get: () => ({
+              providers: { get: () => instanceWrapper },
+            }),
+          }) as any,
+      );
+
+      const applySpy = vi.fn();
+      vi.spyOn(scanner, 'getApplyProvidersMap').mockImplementation(() => ({
         [provider.type]: applySpy,
       }));
+
+      const insertAttachedEnhancerStub = vi
+        .spyOn(graphInspector, 'insertAttachedEnhancer')
+        .mockImplementation(() => {});
+
       scanner.applyApplicationProviders();
-      expect(applySpy.called).to.be.true;
-      expect(applySpy.calledWith(expectedInstance)).to.be.true;
+
+      expect(applySpy).toHaveBeenCalled();
+      expect(applySpy).toHaveBeenCalledWith(expectedInstance);
+      expect(insertAttachedEnhancerStub).toHaveBeenCalledWith(instanceWrapper);
+    });
+    describe('when a provider depends on a request-scoped provider', () => {
+      class AuthGuard {}
+
+      const mockWrapper = (wrapper: Partial<InstanceWrapper>) => {
+        untypedScanner.applicationProvidersApplyMap = [
+          {
+            moduleKey: 'moduleToken',
+            providerKey: 'providerToken',
+            type: APP_GUARD,
+          },
+        ];
+        vi.spyOn(container, 'getModules').mockImplementation(
+          () =>
+            ({
+              get: () => ({
+                providers: { get: () => wrapper },
+              }),
+            }) as any,
+        );
+        vi.spyOn(graphInspector, 'insertAttachedEnhancer').mockImplementation(
+          () => {},
+        );
+      };
+
+      it('should throw for an alias', () => {
+        mockWrapper({
+          instance: null,
+          isAlias: true,
+          inject: [AuthGuard],
+          isDependencyTreeStatic: () => false,
+        });
+
+        expect(() => scanner.applyApplicationProviders()).toThrow(
+          new RequestScopedGlobalEnhancerException(
+            APP_GUARD,
+            'useExisting: AuthGuard',
+            'useExisting',
+          ),
+        );
+      });
+      it('should throw for a factory', () => {
+        mockWrapper({
+          instance: null,
+          isAlias: false,
+          inject: [AuthGuard],
+          isDependencyTreeStatic: () => false,
+        });
+
+        expect(() => scanner.applyApplicationProviders()).toThrow(
+          new RequestScopedGlobalEnhancerException(
+            APP_GUARD,
+            'useFactory',
+            'useFactory',
+          ),
+        );
+      });
+      it('should throw for a class whose dependency is request-scoped', () => {
+        mockWrapper({
+          instance: Object.create(AuthGuard.prototype),
+          isAlias: false,
+          metatype: AuthGuard,
+          isDependencyTreeStatic: () => false,
+        });
+
+        expect(() => scanner.applyApplicationProviders()).toThrow(
+          new RequestScopedGlobalEnhancerException(
+            APP_GUARD,
+            'useClass: AuthGuard',
+            'useClass',
+          ),
+        );
+      });
+      it('should not throw for a static factory that returns nothing', () => {
+        mockWrapper({
+          instance: null,
+          isAlias: false,
+          isDependencyTreeStatic: () => true,
+          getInstanceByContextId: () => ({
+            instance: null,
+            isResolved: true,
+          }),
+        });
+        const applySpy = vi.fn();
+        vi.spyOn(scanner, 'getApplyProvidersMap').mockImplementation(() => ({
+          [APP_GUARD]: applySpy,
+        }));
+
+        expect(() => scanner.applyApplicationProviders()).not.toThrow();
+        expect(applySpy).toHaveBeenCalledWith(null);
+      });
+    });
+    describe('when a static provider does not give an enhancer', () => {
+      const mockInstance = (instance: unknown, metatype: unknown = null) => {
+        untypedScanner.applicationProvidersApplyMap = [
+          {
+            moduleKey: 'moduleToken',
+            providerKey: 'providerToken',
+            type: APP_GUARD,
+          },
+        ];
+        const wrapper = {
+          instance,
+          metatype,
+          isAlias: false,
+          inject: metatype ? [] : null,
+          isDependencyTreeStatic: () => true,
+          getInstanceByContextId: () => ({ instance, isResolved: true }),
+        };
+        vi.spyOn(container, 'getModules').mockImplementation(
+          () =>
+            ({
+              get: () => ({ providers: { get: () => wrapper } }),
+            }) as any,
+        );
+        vi.spyOn(graphInspector, 'insertAttachedEnhancer').mockImplementation(
+          () => {},
+        );
+      };
+
+      it('should throw for a value that is a class', () => {
+        // e.g., `{ provide: APP_GUARD, useValue: RoleGuard('admin') }`
+        class RoleGuard {
+          canActivate() {
+            return false;
+          }
+        }
+        mockInstance(RoleGuard);
+
+        expect(() => scanner.applyApplicationProviders()).toThrow(
+          InvalidEnhancerException,
+        );
+        expect(() => scanner.applyApplicationProviders()).toThrow(
+          /The guard \(APP_GUARD provider \(useValue\) gives class RoleGuard\)/,
+        );
+      });
+      it('should throw for a factory that returns an object without the method', () => {
+        mockInstance({}, () => ({}));
+
+        expect(() => scanner.applyApplicationProviders()).toThrow(
+          /APP_GUARD provider \(useFactory\) gives an object/,
+        );
+      });
+      it('should only warn for an exception filter, and apply it as before', () => {
+        class HttpExceptionFilter {
+          catch() {}
+        }
+        mockInstance(HttpExceptionFilter);
+        untypedScanner.applicationProvidersApplyMap[0].type = APP_FILTER;
+        const applySpy = vi.fn();
+        vi.spyOn(scanner, 'getApplyProvidersMap').mockImplementation(() => ({
+          [APP_FILTER]: applySpy,
+        }));
+        const warn = vi
+          .spyOn(Logger.prototype, 'warn')
+          .mockImplementation(() => {});
+
+        expect(() => scanner.applyApplicationProviders()).not.toThrow();
+        expect(warn).toHaveBeenCalledOnce();
+        expect(warn.mock.calls[0][0]).toContain(
+          'The exception filter (APP_FILTER provider (useValue) gives class HttpExceptionFilter)',
+        );
+        expect(applySpy).toHaveBeenCalledWith(HttpExceptionFilter);
+      });
+    });
+    describe('when a static provider has never been instantiated', () => {
+      class AuthGuard {}
+
+      it('should throw', () => {
+        untypedScanner.applicationProvidersApplyMap = [
+          {
+            moduleKey: 'moduleToken',
+            providerKey: 'providerToken',
+            type: APP_GUARD,
+          },
+        ];
+        const wrapper = new InstanceWrapper({
+          isAlias: true,
+          metatype: (instance: unknown) => instance,
+          inject: [AuthGuard],
+          isResolved: false,
+        });
+        vi.spyOn(container, 'getModules').mockImplementation(
+          () =>
+            ({
+              get: () => ({
+                providers: { get: () => wrapper },
+              }),
+            }) as any,
+        );
+        vi.spyOn(graphInspector, 'insertAttachedEnhancer').mockImplementation(
+          () => {},
+        );
+
+        expect(() => scanner.applyApplicationProviders()).toThrow(
+          new UninstantiatedGlobalEnhancerException(
+            APP_GUARD,
+            'useExisting: AuthGuard',
+          ),
+        );
+      });
     });
     it('should apply each globally scoped provider', () => {
       const provider = {
@@ -306,21 +932,36 @@ describe('DependenciesScanner', () => {
         type: APP_GUARD,
         scope: Scope.REQUEST,
       };
-      (scanner as any).applicationProvidersApplyMap = [provider];
+      untypedScanner.applicationProvidersApplyMap = [provider];
 
       const expectedInstanceWrapper = new InstanceWrapper();
-      mockContainer.expects('getModules').callsFake(() => ({
-        get: () => ({
-          injectables: { get: () => expectedInstanceWrapper },
+      vi.spyOn(container, 'getModules').mockImplementation(
+        () =>
+          ({
+            get: () => ({
+              injectables: { get: () => expectedInstanceWrapper },
+            }),
+          }) as any,
+      );
+
+      const applySpy = vi.fn();
+      vi.spyOn(scanner, 'getApplyRequestProvidersMap').mockImplementation(
+        () => ({
+          [provider.type]: applySpy,
         }),
-      }));
-      const applySpy = sinon.spy();
-      sinon.stub(scanner, 'getApplyRequestProvidersMap').callsFake(() => ({
-        [provider.type]: applySpy,
-      }));
+      );
+
+      const insertAttachedEnhancerStub = vi
+        .spyOn(graphInspector, 'insertAttachedEnhancer')
+        .mockImplementation(() => {});
+
       scanner.applyApplicationProviders();
-      expect(applySpy.called).to.be.true;
-      expect(applySpy.calledWith(expectedInstanceWrapper)).to.be.true;
+
+      expect(applySpy).toHaveBeenCalled();
+      expect(applySpy).toHaveBeenCalledWith(expectedInstanceWrapper);
+      expect(insertAttachedEnhancerStub).toHaveBeenCalledWith(
+        expectedInstanceWrapper,
+      );
     });
   });
 
@@ -332,132 +973,175 @@ describe('DependenciesScanner', () => {
       scope: Scope.REQUEST,
     };
 
-    it('should add enhancers metadata to every controller', () => {
-      (scanner as any).applicationProvidersApplyMap = [provider];
+    it('should add enhancers metadata to every controller and every entry provider', () => {
+      untypedScanner.applicationProvidersApplyMap = [provider];
 
       const instance = new InstanceWrapper({ name: 'test' });
       const controllers = new Map();
-      const mockController = new InstanceWrapper();
+      const providers = new Map();
 
-      controllers.set('test', mockController);
-      mockContainer.expects('getModules').callsFake(() => ({
-        get: () => ({
-          injectables: { get: () => instance },
-          controllers,
-        }),
-        values() {
-          return [this.get()];
-        },
-      }));
-      const addEnhancerMetadataSpy = sinon.spy(
-        mockController,
+      const fakeController = new InstanceWrapper();
+      const fakeProvider = new InstanceWrapper();
+
+      const providerToken = 'entryProvider';
+      controllers.set('test', fakeController);
+      providers.set(providerToken, fakeProvider);
+
+      vi.spyOn(container, 'getModules').mockImplementation(
+        () =>
+          ({
+            get: () => ({
+              injectables: { get: () => instance },
+              controllers,
+              entryProviders: Array.from(providers.values()),
+            }),
+            values() {
+              return [this.get()];
+            },
+          }) as any,
+      );
+
+      const addEnhancerMetadataControllerSpy = vi.spyOn(
+        fakeController,
+        'addEnhancerMetadata',
+      );
+      const addEnhancerMetadataProviderSpy = vi.spyOn(
+        fakeProvider,
         'addEnhancerMetadata',
       );
       scanner.addScopedEnhancersMetadata();
 
-      expect(addEnhancerMetadataSpy.called).to.be.true;
-      expect(addEnhancerMetadataSpy.calledWith(instance)).to.be.true;
+      expect(addEnhancerMetadataControllerSpy).toHaveBeenCalled();
+      expect(addEnhancerMetadataControllerSpy).toHaveBeenCalledWith(instance);
+      expect(addEnhancerMetadataProviderSpy).toHaveBeenCalled();
+      expect(addEnhancerMetadataProviderSpy).toHaveBeenCalledWith(instance);
     });
   });
 
   describe('getApplyProvidersMap', () => {
     describe(`when token is ${APP_INTERCEPTOR}`, () => {
       it('call "addGlobalInterceptor"', () => {
-        const addSpy = sinon.spy(
-          (scanner as any).applicationConfig,
+        const addSpy = vi.spyOn(
+          untypedScanner.applicationConfig,
           'addGlobalInterceptor',
         );
         scanner.getApplyProvidersMap()[APP_INTERCEPTOR](null);
-        expect(addSpy.called).to.be.true;
+        expect(addSpy).toHaveBeenCalled();
       });
     });
     describe(`when token is ${APP_GUARD}`, () => {
       it('call "addGlobalGuard"', () => {
-        const addSpy = sinon.spy(
-          (scanner as any).applicationConfig,
+        const addSpy = vi.spyOn(
+          untypedScanner.applicationConfig,
           'addGlobalGuard',
         );
         scanner.getApplyProvidersMap()[APP_GUARD](null);
-        expect(addSpy.called).to.be.true;
+        expect(addSpy).toHaveBeenCalled();
       });
     });
     describe(`when token is ${APP_PIPE}`, () => {
       it('call "addGlobalPipe"', () => {
-        const addSpy = sinon.spy(
-          (scanner as any).applicationConfig,
+        const addSpy = vi.spyOn(
+          untypedScanner.applicationConfig,
           'addGlobalPipe',
         );
         scanner.getApplyProvidersMap()[APP_PIPE](null);
-        expect(addSpy.called).to.be.true;
+        expect(addSpy).toHaveBeenCalled();
       });
     });
     describe(`when token is ${APP_FILTER}`, () => {
       it('call "addGlobalFilter"', () => {
-        const addSpy = sinon.spy(
-          (scanner as any).applicationConfig,
+        const addSpy = vi.spyOn(
+          untypedScanner.applicationConfig,
           'addGlobalFilter',
         );
         scanner.getApplyProvidersMap()[APP_FILTER](null);
-        expect(addSpy.called).to.be.true;
+        expect(addSpy).toHaveBeenCalled();
       });
     });
   });
   describe('getApplyRequestProvidersMap', () => {
     describe(`when token is ${APP_INTERCEPTOR}`, () => {
       it('call "addGlobalRequestInterceptor"', () => {
-        const addSpy = sinon.spy(
-          (scanner as any).applicationConfig,
+        const addSpy = vi.spyOn(
+          untypedScanner.applicationConfig,
           'addGlobalRequestInterceptor',
         );
         scanner.getApplyRequestProvidersMap()[APP_INTERCEPTOR](null);
-        expect(addSpy.called).to.be.true;
+        expect(addSpy).toHaveBeenCalled();
       });
     });
     describe(`when token is ${APP_GUARD}`, () => {
       it('call "addGlobalRequestGuard"', () => {
-        const addSpy = sinon.spy(
-          (scanner as any).applicationConfig,
+        const addSpy = vi.spyOn(
+          untypedScanner.applicationConfig,
           'addGlobalRequestGuard',
         );
         scanner.getApplyRequestProvidersMap()[APP_GUARD](null);
-        expect(addSpy.called).to.be.true;
+        expect(addSpy).toHaveBeenCalled();
       });
     });
     describe(`when token is ${APP_PIPE}`, () => {
       it('call "addGlobalRequestPipe"', () => {
-        const addSpy = sinon.spy(
-          (scanner as any).applicationConfig,
+        const addSpy = vi.spyOn(
+          untypedScanner.applicationConfig,
           'addGlobalRequestPipe',
         );
         scanner.getApplyRequestProvidersMap()[APP_PIPE](null);
-        expect(addSpy.called).to.be.true;
+        expect(addSpy).toHaveBeenCalled();
       });
     });
     describe(`when token is ${APP_FILTER}`, () => {
       it('call "addGlobalRequestFilter"', () => {
-        const addSpy = sinon.spy(
-          (scanner as any).applicationConfig,
+        const addSpy = vi.spyOn(
+          untypedScanner.applicationConfig,
           'addGlobalRequestFilter',
         );
         scanner.getApplyRequestProvidersMap()[APP_FILTER](null);
-        expect(addSpy.called).to.be.true;
+        expect(addSpy).toHaveBeenCalled();
       });
     });
   });
   describe('scanForModules', () => {
-    it('should throw an exception when the imports array includes undefined', () => {
+    it('should throw an exception when the imports array includes undefined', async () => {
       try {
-        scanner.scanForModules(UndefinedModule, [UndefinedModule]);
+        await scanner.scanForModules({
+          moduleDefinition: UndefinedModule,
+          scope: [UndefinedModule],
+        });
       } catch (exception) {
-        expect(exception instanceof UndefinedModuleException).to.be.true;
+        expect(exception instanceof UndefinedModuleException).toBe(true);
       }
     });
-    it('should throw an exception when the imports array includes an invalid value', () => {
+    it('should throw an exception when the imports array includes an invalid value', async () => {
       try {
-        scanner.scanForModules(InvalidModule, [InvalidModule]);
+        await scanner.scanForModules({
+          moduleDefinition: InvalidModule,
+          scope: [InvalidModule],
+        });
       } catch (exception) {
-        expect(exception instanceof InvalidModuleException).to.be.true;
+        expect(exception instanceof InvalidModuleException).toBe(true);
       }
     });
+  });
+  describe('scanModulesForDependencies', () => {
+    it.each([
+      ['providers', TestComponent],
+      ['controllers', TestController],
+      ['exports', TestComponent],
+    ] as const)(
+      'should throw an exception naming the index when the %s array includes undefined',
+      async (metadataKey, entry) => {
+        @Module({
+          providers: [TestComponent],
+          [metadataKey]: [entry, undefined],
+        })
+        class ModuleWithUndefinedEntry {}
+
+        await expect(scanner.scan(ModuleWithUndefinedEntry)).rejects.toThrow(
+          `at index [1] of the ModuleWithUndefinedEntry "${metadataKey}" array is undefined.`,
+        );
+      },
+    );
   });
 });

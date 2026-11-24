@@ -1,12 +1,10 @@
-import { BeforeApplicationShutdown } from '@nestjs/common';
-import { isNil } from '@nestjs/common/utils/shared.utils';
+import { Logger } from '@nestjs/common';
+import type { BeforeApplicationShutdown } from '@nestjs/common';
+import { isFunction, isNil } from '@nestjs/common/internal';
 import { iterate } from 'iterare';
-import {
-  getNonTransientInstances,
-  getTransientInstances,
-} from '../injector/helpers/transient-instances';
-import { InstanceWrapper } from '../injector/instance-wrapper';
-import { Module } from '../injector/module';
+import { Module } from '../injector/module.js';
+import { getInstancesGroupedByHierarchyLevel } from './utils/get-instances-grouped-by-hierarchy-level.js';
+import { getSortedHierarchyLevels } from './utils/get-sorted-hierarchy-levels.js';
 
 /**
  * Checks if the given instance has the `beforeApplicationShutdown` function
@@ -16,7 +14,7 @@ import { Module } from '../injector/module';
 function hasBeforeApplicationShutdownHook(
   instance: unknown,
 ): instance is BeforeApplicationShutdown {
-  return !isNil(
+  return isFunction(
     (instance as BeforeApplicationShutdown).beforeApplicationShutdown,
   );
 }
@@ -24,15 +22,12 @@ function hasBeforeApplicationShutdownHook(
 /**
  * Calls the given instances
  */
-function callOperator(
-  instances: InstanceWrapper[],
-  signal?: string,
-): Promise<any>[] {
+function callOperator(instances: unknown[], signal?: string): Promise<any>[] {
   return iterate(instances)
     .filter(instance => !isNil(instance))
     .filter(hasBeforeApplicationShutdownHook)
     .map(async instance =>
-      ((instance as any) as BeforeApplicationShutdown).beforeApplicationShutdown(
+      (instance as any as BeforeApplicationShutdown).beforeApplicationShutdown(
         signal,
       ),
     )
@@ -43,30 +38,46 @@ function callOperator(
  * Calls the `beforeApplicationShutdown` function on the module and its children
  * (providers / controllers).
  *
- * @param module The module which will be initialized
+ * @param moduleRef The module which will be initialized
  * @param signal The signal which caused the shutdown
  */
 export async function callBeforeAppShutdownHook(
-  module: Module,
+  moduleRef: Module,
   signal?: string,
 ): Promise<void> {
-  const providers = module.getNonAliasProviders();
-  const [_, moduleClassHost] = providers.shift();
-  const instances = [...module.controllers, ...providers];
+  const providers = moduleRef.getNonAliasProviders();
+  const [_, moduleClassHost] = providers.shift()!;
+  const groupedInstances = getInstancesGroupedByHierarchyLevel(
+    moduleRef.controllers,
+    moduleRef.injectables,
+    moduleRef.middlewares,
+    providers,
+  );
 
-  const nonTransientInstances = getNonTransientInstances(instances);
-  await Promise.all(callOperator(nonTransientInstances, signal));
-  const transientInstances = getTransientInstances(instances);
-  await Promise.all(callOperator(transientInstances, signal));
-
+  const levels = getSortedHierarchyLevels(groupedInstances, 'DESC');
+  for (const level of levels) {
+    const results = await Promise.allSettled(
+      callOperator(groupedInstances.get(level)!, signal),
+    );
+    results
+      .filter(
+        (result): result is PromiseRejectedResult =>
+          result.status === 'rejected',
+      )
+      .forEach(result =>
+        Logger.error(result.reason, (result.reason as Error)?.stack),
+      );
+  }
   const moduleClassInstance = moduleClassHost.instance;
   if (
     moduleClassInstance &&
     hasBeforeApplicationShutdownHook(moduleClassInstance) &&
     moduleClassHost.isDependencyTreeStatic()
   ) {
-    await (moduleClassInstance as BeforeApplicationShutdown).beforeApplicationShutdown(
-      signal,
-    );
+    try {
+      await moduleClassInstance.beforeApplicationShutdown(signal);
+    } catch (err) {
+      Logger.error(err, (err as Error)?.stack);
+    }
   }
 }

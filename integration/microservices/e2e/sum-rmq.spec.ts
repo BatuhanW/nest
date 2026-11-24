@@ -1,9 +1,8 @@
 import { INestApplication } from '@nestjs/common';
-import { Transport } from '@nestjs/microservices';
+import { MicroserviceOptions, Transport } from '@nestjs/microservices';
 import { Test } from '@nestjs/testing';
-import { expect } from 'chai';
-import * as request from 'supertest';
-import { RMQController } from '../src/rmq/rmq.controller';
+import request from 'supertest';
+import { RMQController } from '../src/rmq/rmq.controller.js';
 
 describe('RabbitMQ transport', () => {
   let server;
@@ -17,16 +16,16 @@ describe('RabbitMQ transport', () => {
     app = module.createNestApplication();
     server = app.getHttpAdapter().getInstance();
 
-    app.connectMicroservice({
+    app.connectMicroservice<MicroserviceOptions>({
       transport: Transport.RMQ,
       options: {
-        urls: [`amqp://0.0.0.0:5672`],
+        urls: [`amqp://localhost:5672`],
         queue: 'test',
-        queueOptions: { durable: false },
+        queueOptions: { durable: true },
         socketOptions: { noDelay: true },
       },
     });
-    await app.startAllMicroservicesAsync();
+    await app.startAllMicroservices();
     await app.init();
   });
 
@@ -77,15 +76,37 @@ describe('RabbitMQ transport', () => {
       .expect(200, '15');
   });
 
-  it(`/POST (event notification)`, done => {
-    request(server)
-      .post('/notify')
+  it(`/POST (multiple-urls)`, () => {
+    return request(server)
+      .post('/multiple-urls')
       .send([1, 2, 3, 4, 5])
-      .end(() => {
-        setTimeout(() => {
-          expect(RMQController.IS_NOTIFIED).to.be.true;
-          done();
-        }, 1000);
+      .expect(200, '15');
+  });
+
+  it(`/POST (event notification)`, () =>
+    new Promise<void>(done => {
+      void request(server)
+        .post('/notify')
+        .send([1, 2, 3, 4, 5])
+        .end(() => {
+          setTimeout(() => {
+            expect(RMQController.IS_NOTIFIED).toBe(true);
+            done();
+          }, 1000);
+        });
+    }));
+
+  it(`/POST (sending options with "RecordBuilder")`, () => {
+    const payload = { items: [1, 2, 3] };
+    return request(server)
+      .post('/record-builder-duplex')
+      .send(payload)
+      .expect(200, {
+        data: payload,
+        headers: {
+          ['x-version']: '1.0.0',
+        },
+        priority: 3,
       });
   });
 

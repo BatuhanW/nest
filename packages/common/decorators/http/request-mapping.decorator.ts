@@ -1,5 +1,5 @@
-import { METHOD_METADATA, PATH_METADATA } from '../../constants';
-import { RequestMethod } from '../../enums/request-method.enum';
+import { METHOD_METADATA, PATH_METADATA } from '../../constants.js';
+import { RequestMethod } from '../../enums/request-method.enum.js';
 
 export interface RequestMappingMetadata {
   path?: string | string[];
@@ -29,14 +29,14 @@ export const RequestMapping = (
   };
 };
 
-const createMappingDecorator = (method: RequestMethod) => (
-  path?: string | string[],
-): MethodDecorator => {
-  return RequestMapping({
-    [PATH_METADATA]: path,
-    [METHOD_METADATA]: method,
-  });
-};
+const createMappingDecorator =
+  (method: RequestMethod) =>
+  (path?: string | string[]): MethodDecorator => {
+    return RequestMapping({
+      [PATH_METADATA]: path,
+      [METHOD_METADATA]: method,
+    });
+  };
 
 /**
  * Route handler (method) Decorator. Routes HTTP POST requests to the specified path.
@@ -109,3 +109,87 @@ export const Head = createMappingDecorator(RequestMethod.HEAD);
  * @publicApi
  */
 export const All = createMappingDecorator(RequestMethod.ALL);
+
+/**
+ * Route handler (method) Decorator. Routes HTTP SEARCH requests to the specified path.
+ *
+ * @see [Routing](https://docs.nestjs.com/controllers#routing)
+ *
+ * @publicApi
+ */
+export const Search = createMappingDecorator(RequestMethod.SEARCH);
+
+/**
+ * Route handler (method) Decorator. Routes HTTP QUERY requests to the specified path.
+ *
+ * **Note**: this is named `QueryMethod` (rather than `Query`) to avoid a name clash
+ * with the `@Query()` parameter decorator used to extract query-string params.
+ *
+ * @see [Routing](https://docs.nestjs.com/controllers#routing)
+ *
+ * @publicApi
+ */
+export const QueryMethod = createMappingDecorator(RequestMethod.QUERY);
+
+/**
+ * Route handler (method) Decorator. Routes Webdav PROPFIND requests to the specified path.
+ *
+ * @see [Routing](https://docs.nestjs.com/controllers#routing)
+ *
+ * @publicApi
+ */
+export const Propfind = createMappingDecorator(RequestMethod.PROPFIND);
+
+/**
+ * Route handler (method) Decorator. Routes Webdav PROPPATCH requests to the specified path.
+ *
+ * @see [Routing](https://docs.nestjs.com/controllers#routing)
+ *
+ * @publicApi
+ */
+export const Proppatch = createMappingDecorator(RequestMethod.PROPPATCH);
+
+/**
+ * Route handler (method) Decorator. Routes Webdav MKCOL requests to the specified path.
+ *
+ * @see [Routing](https://docs.nestjs.com/controllers#routing)
+ *
+ * @publicApi
+ */
+export const Mkcol = createMappingDecorator(RequestMethod.MKCOL);
+
+/**
+ * Route handler (method) Decorator. Routes Webdav COPY requests to the specified path.
+ *
+ * @see [Routing](https://docs.nestjs.com/controllers#routing)
+ *
+ * @publicApi
+ */
+export const Copy = createMappingDecorator(RequestMethod.COPY);
+
+/**
+ * Route handler (method) Decorator. Routes Webdav MOVE requests to the specified path.
+ *
+ * @see [Routing](https://docs.nestjs.com/controllers#routing)
+ *
+ * @publicApi
+ */
+export const Move = createMappingDecorator(RequestMethod.MOVE);
+
+/**
+ * Route handler (method) Decorator. Routes Webdav LOCK requests to the specified path.
+ *
+ * @see [Routing](https://docs.nestjs.com/controllers#routing)
+ *
+ * @publicApi
+ */
+export const Lock = createMappingDecorator(RequestMethod.LOCK);
+
+/**
+ * Route handler (method) Decorator. Routes Webdav UNLOCK requests to the specified path.
+ *
+ * @see [Routing](https://docs.nestjs.com/controllers#routing)
+ *
+ * @publicApi
+ */
+export const Unlock = createMappingDecorator(RequestMethod.UNLOCK);

@@ -1,9 +1,9 @@
 import { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import * as request from 'supertest';
-import { CatsModule } from '../../src/cats/cats.module';
-import { CatsService } from '../../src/cats/cats.service';
-import { CoreModule } from '../../src/core/core.module';
+import request from 'supertest';
+import { CatsModule } from '../../src/cats/cats.module.js';
+import { CatsService } from '../../src/cats/cats.service.js';
+import { CoreModule } from '../../src/core/core.module.js';
 
 describe('Cats', () => {
   const catsService = { findAll: () => ['test'] };

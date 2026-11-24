@@ -1,6 +1,6 @@
-import { ContextType } from '@nestjs/common/interfaces';
-import { ExternalExceptionsHandler } from '../exceptions/external-exceptions-handler';
-import { ExecutionContextHost } from '../helpers/execution-context-host';
+import { ExternalExceptionsHandler } from '../exceptions/external-exceptions-handler.js';
+import { ExecutionContextHost } from '../helpers/execution-context-host.js';
+import type { ContextType } from '@nestjs/common';
 
 export class ExternalErrorProxy {
   public createProxy<TContext extends string = ContextType>(
@@ -13,7 +13,7 @@ export class ExternalErrorProxy {
         return await targetCallback(...args);
       } catch (e) {
         const host = new ExecutionContextHost(args);
-        host.setType<TContext>(type);
+        host.setType<TContext>(type!);
         return exceptionsHandler.next(e, host);
       }
     };

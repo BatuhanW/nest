@@ -1,29 +1,33 @@
-import { Controller } from '@nestjs/common/interfaces/controllers/controller.interface';
-import { isFunction, isUndefined } from '@nestjs/common/utils/shared.utils';
-import { MetadataScanner } from '@nestjs/core/metadata-scanner';
 import {
   CLIENT_CONFIGURATION_METADATA,
   CLIENT_METADATA,
+  PATTERN_EXTRAS_METADATA,
   PATTERN_HANDLER_METADATA,
   PATTERN_METADATA,
   TRANSPORT_METADATA,
-} from './constants';
-import { Transport } from './enums';
-import { PatternHandler } from './enums/pattern-handler.enum';
-import { ClientOptions } from './interfaces/client-metadata.interface';
-import { PatternMetadata } from './interfaces/pattern-metadata.interface';
+} from './constants.js';
+import { Transport } from './enums/index.js';
+import { PatternHandler } from './enums/pattern-handler.enum.js';
+import { ClientOptions, PatternMetadata } from './interfaces/index.js';
+import {
+  type Controller,
+  isFunction,
+  isUndefined,
+} from '@nestjs/common/internal';
+import type { MetadataScanner } from '@nestjs/core';
 
 export interface ClientProperties {
   property: string;
   metadata: ClientOptions;
 }
 
-export interface PatternProperties {
-  pattern: PatternMetadata;
+export interface EventOrMessageListenerDefinition {
+  patterns: PatternMetadata[];
   methodKey: string;
   isEventHandler: boolean;
   targetCallback: (...args: any[]) => any;
   transport?: Transport;
+  extras?: Record<string, any>;
 }
 
 export interface MessageRequestProperties {
@@ -34,35 +38,47 @@ export interface MessageRequestProperties {
 export class ListenerMetadataExplorer {
   constructor(private readonly metadataScanner: MetadataScanner) {}
 
-  public explore(instance: Controller): PatternProperties[] {
+  public explore(instance: Controller): EventOrMessageListenerDefinition[] {
     const instancePrototype = Object.getPrototypeOf(instance);
-    return this.metadataScanner.scanFromPrototype<
-      Controller,
-      PatternProperties
-    >(instance, instancePrototype, method =>
-      this.exploreMethodMetadata(instancePrototype, method),
-    );
+    return this.metadataScanner
+      .getAllMethodNames(instancePrototype)
+      .map(
+        method =>
+          this.exploreMethodMetadata(instance, instancePrototype, method)!,
+      )
+      .filter(metadata => metadata);
   }
 
   public exploreMethodMetadata(
+    instance: Controller,
     instancePrototype: object,
     methodKey: string,
-  ): PatternProperties {
-    const targetCallback = instancePrototype[methodKey];
+  ): EventOrMessageListenerDefinition | undefined {
+    const prototypeCallback = instancePrototype[methodKey];
     const handlerType = Reflect.getMetadata(
       PATTERN_HANDLER_METADATA,
-      targetCallback,
+      prototypeCallback,
     );
     if (isUndefined(handlerType)) {
       return;
     }
-    const pattern = Reflect.getMetadata(PATTERN_METADATA, targetCallback);
-    const transport = Reflect.getMetadata(TRANSPORT_METADATA, targetCallback);
+    const patterns = Reflect.getMetadata(PATTERN_METADATA, prototypeCallback);
+    const transport = Reflect.getMetadata(
+      TRANSPORT_METADATA,
+      prototypeCallback,
+    );
+    const extras = Reflect.getMetadata(
+      PATTERN_EXTRAS_METADATA,
+      prototypeCallback,
+    );
+
+    const targetCallback = instance[methodKey];
     return {
       methodKey,
       targetCallback,
-      pattern,
+      patterns,
       transport,
+      extras,
       isEventHandler: handlerType === PatternHandler.EVENT,
     };
   }
@@ -71,7 +87,7 @@ export class ListenerMetadataExplorer {
     instance: Controller,
   ): IterableIterator<ClientProperties> {
     for (const propertyKey in instance) {
-      if (isFunction(propertyKey)) {
+      if (isFunction(instance[propertyKey])) {
         continue;
       }
       const property = String(propertyKey);

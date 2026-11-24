@@ -1,270 +1,1095 @@
-import { expect } from 'chai';
-import * as sinon from 'sinon';
-import { ClientNats } from '../../client/client-nats';
-import { ERROR_EVENT } from '../../constants';
+import { headers as createHeaders } from '@nats-io/transport-node';
+import { firstValueFrom } from 'rxjs';
+import { ClientNats } from '../../client/client-nats.js';
+import { ReadPacket, WritePacket } from '../../interfaces/index.js';
+import { NatsRecord } from '../../record-builders/index.js';
 
 describe('ClientNats', () => {
-  const client = new ClientNats({});
+  let client: ClientNats;
+  let untypedClient: any;
 
   describe('publish', () => {
+    let msg: ReadPacket;
     const pattern = 'test';
-    const msg = { pattern, data: 'data' };
     const id = 3;
-    const subscriptionId = 10;
 
-    let subscribeSpy: sinon.SinonSpy,
-      publishSpy: sinon.SinonSpy,
-      onSpy: sinon.SinonSpy,
-      removeListenerSpy: sinon.SinonSpy,
-      requestSpy: sinon.SinonSpy,
-      unsubscribeSpy: sinon.SinonSpy,
-      connectSpy: sinon.SinonStub,
-      natsClient,
-      createClient: sinon.SinonStub;
+    let subscribeSpy: ReturnType<typeof vi.fn>,
+      publishSpy: ReturnType<typeof vi.fn>,
+      removeListenerSpy: ReturnType<typeof vi.fn>,
+      unsubscribeSpy: ReturnType<typeof vi.fn>,
+      connectSpy: ReturnType<typeof vi.fn>,
+      natsClient: any,
+      subscription: any,
+      createClient: ReturnType<typeof vi.fn>;
 
-    beforeEach(() => {
-      subscribeSpy = sinon.spy(() => subscriptionId);
-      publishSpy = sinon.spy();
-      onSpy = sinon.spy();
-      removeListenerSpy = sinon.spy();
-      unsubscribeSpy = sinon.spy();
-      requestSpy = sinon.spy(() => subscriptionId);
+    beforeEach(async () => {
+      client = new ClientNats({});
+      untypedClient = client as any;
+
+      // Resolve the nats package (loaded asynchronously in constructor)
+      await client.createClient().catch(() => {});
+
+      msg = { pattern, data: 'data' };
+      unsubscribeSpy = vi.fn();
+      subscription = {
+        unsubscribe: unsubscribeSpy,
+      };
+      subscribeSpy = vi.fn().mockReturnValue(subscription);
+      publishSpy = vi.fn();
+      removeListenerSpy = vi.fn();
 
       natsClient = {
         subscribe: subscribeSpy,
-        on: (type, handler) => (type === 'subscribe' ? handler() : onSpy()),
         removeListener: removeListenerSpy,
-        unsubscribe: unsubscribeSpy,
         addListener: () => ({}),
         publish: publishSpy,
-        request: requestSpy,
       };
-      (client as any).natsClient = natsClient;
+      untypedClient.natsClient = natsClient;
 
-      connectSpy = sinon.stub(client, 'connect').callsFake(async () => {
-        (client as any).natsClient = natsClient;
+      connectSpy = vi.spyOn(client, 'connect').mockImplementation(async () => {
+        untypedClient.natsClient = natsClient;
       });
-      createClient = sinon
-        .stub(client, 'createClient')
-        .callsFake(() => client as any);
+      createClient = vi
+        .spyOn(client, 'createClient')
+        .mockImplementation(async () => untypedClient);
     });
     afterEach(() => {
-      connectSpy.restore();
-      createClient.restore();
+      connectSpy.mockRestore();
+      createClient.mockRestore();
     });
-    it('should publish stringified message to pattern name', async () => {
-      await client['publish'](msg, () => {});
-      expect(requestSpy.getCall(0).args[0]).to.be.eql(pattern);
+    it('should publish stringified message to pattern name', () => {
+      client['publish'](msg, () => {});
+      expect(publishSpy.mock.calls[0][0]).toEqual(pattern);
+    });
+    it('should add random bits to the reply inbox', () => {
+      // createInbox() names the inbox after a counter that grows by a constant
+      // step, so two inboxes would give the next ones away
+      client['publish'](msg, () => {});
+      client['publish'](msg, () => {});
+      const [first, second] = subscribeSpy.mock.calls.map(
+        ([inbox]) => inbox as string,
+      );
+
+      // "_INBOX.<nuid><128 random bits>", in one token as "_INBOX.*" expects
+      expect(first).toMatch(/^_INBOX\.[0-9A-Za-z]{22}[0-9a-f]{32}$/);
+      expect(second.slice(-32)).not.toBe(first.slice(-32));
+      expect(publishSpy.mock.calls.map(([, , opts]) => opts.reply)).toEqual([
+        first,
+        second,
+      ]);
     });
     describe('on error', () => {
-      let assignPacketIdStub: sinon.SinonStub;
+      let serializeStub: ReturnType<typeof vi.fn>;
       beforeEach(() => {
-        assignPacketIdStub = sinon
-          .stub(client, 'assignPacketId' as any)
-          .callsFake(() => {
+        serializeStub = vi
+          .spyOn(untypedClient.serializer, 'serialize')
+          .mockImplementation(() => {
             throw new Error();
           });
       });
       afterEach(() => {
-        assignPacketIdStub.restore();
+        serializeStub.mockRestore();
       });
 
       it('should call callback', () => {
-        const callback = sinon.spy();
+        const callback = vi.fn();
         client['publish'](msg, callback);
 
-        expect(callback.called).to.be.true;
-        expect(callback.getCall(0).args[0].err).to.be.instanceof(Error);
+        expect(callback).toHaveBeenCalled();
+        expect(callback.mock.calls[0][0].err).toBeInstanceOf(Error);
+      });
+    });
+    describe('when the send throws after the reply inbox is subscribed', () => {
+      const sendError = new Error('max_payload size exceeded');
+
+      it('should unsubscribe from the inbox and report the error when publish throws', () => {
+        publishSpy.mockImplementation(() => {
+          throw sendError;
+        });
+        const callback = vi.fn();
+
+        client['publish'](msg, callback);
+
+        expect(unsubscribeSpy).toHaveBeenCalledTimes(1);
+        expect(callback).toHaveBeenCalledWith({ err: sendError });
+        expect(untypedClient.routingMap.size).toBe(0);
+      });
+
+      it('should unsubscribe from the inbox when merging headers throws', () => {
+        const mergeHeadersSpy = vi
+          .spyOn(untypedClient, 'mergeHeaders')
+          .mockImplementation(() => {
+            throw sendError;
+          });
+        const callback = vi.fn();
+
+        client['publish'](msg, callback);
+
+        expect(unsubscribeSpy).toHaveBeenCalledTimes(1);
+        expect(publishSpy).not.toHaveBeenCalled();
+        expect(callback).toHaveBeenCalledWith({ err: sendError });
+        mergeHeadersSpy.mockRestore();
       });
     });
     describe('dispose callback', () => {
-      let assignStub: sinon.SinonStub;
-      let callback: sinon.SinonSpy, subscription;
+      let assignStub: ReturnType<typeof vi.fn>;
+      let callback: ReturnType<typeof vi.fn>, subscription;
 
       beforeEach(async () => {
-        callback = sinon.spy();
-        assignStub = sinon
-          .stub(client, 'assignPacketId' as any)
-          .callsFake(packet => Object.assign(packet, { id }));
+        callback = vi.fn();
+        assignStub = vi
+          .spyOn(client, 'assignPacketId' as any)
+          .mockImplementation(packet =>
+            Object.assign(packet as object, { id }),
+          );
 
-        subscription = await client['publish'](msg, callback);
+        subscription = client['publish'](
+          msg,
+          callback as (packet: WritePacket) => any,
+        );
         subscription();
       });
       afterEach(() => {
-        assignStub.restore();
+        assignStub.mockRestore();
       });
 
       it('should unsubscribe', () => {
-        expect(unsubscribeSpy.calledWith(subscriptionId)).to.be.true;
+        expect(unsubscribeSpy).toHaveBeenCalled();
       });
     });
+
+    describe('headers', () => {
+      it('should not generate headers if none are configured', () => {
+        client['publish'](msg, () => {});
+        expect(natsClient.publish.mock.calls[0][2].headers).toBeUndefined();
+      });
+
+      it('should send packet headers', () => {
+        const requestHeaders = createHeaders();
+        requestHeaders.set('1', '123');
+        msg.data = new NatsRecord('data', requestHeaders);
+
+        client['publish'](msg, () => {});
+        expect(natsClient.publish.mock.calls[0][2].headers.get('1')).toEqual(
+          '123',
+        );
+      });
+      it('should combine packet and static headers', () => {
+        const staticHeaders = { 'client-id': 'some-client-id' };
+        untypedClient.options.headers = staticHeaders;
+
+        const requestHeaders = createHeaders();
+        requestHeaders.set('1', '123');
+        msg.data = new NatsRecord('data', requestHeaders);
+
+        client['publish'](msg, () => {});
+        expect(publishSpy.mock.calls[0][2].headers.get('client-id')).toEqual(
+          'some-client-id',
+        );
+        expect(publishSpy.mock.calls[0][2].headers.get('1')).toEqual('123');
+      });
+
+      it('should prefer packet headers over static headers', () => {
+        const staticHeaders = { 'client-id': 'some-client-id' };
+        untypedClient.options.headers = staticHeaders;
+
+        const requestHeaders = createHeaders();
+        requestHeaders.set('client-id', 'override-client-id');
+        msg.data = new NatsRecord('data', requestHeaders);
+
+        client['publish'](msg, () => {});
+        expect(publishSpy.mock.calls[0][2].headers.get('client-id')).toEqual(
+          'override-client-id',
+        );
+      });
+
+      // "NatsRecordBuilder" takes plain headers, which are not a "MsgHdrs"
+      it('should send the plain headers of a record from publish()', () => {
+        untypedClient.options.headers = { 'client-id': 'some-client-id' };
+        msg.data = new NatsRecord('data', { 'x-version': '1.0.0' });
+
+        client['publish'](msg, () => {});
+
+        const headers = publishSpy.mock.calls[0][2].headers;
+        expect(headers.get('x-version')).toEqual('1.0.0');
+        expect(headers.get('client-id')).toEqual('some-client-id');
+        expect(() => headers.encode()).not.toThrow();
+      });
+
+      it('should keep every value of a multi-valued record header', () => {
+        const recordHeaders = createHeaders();
+        recordHeaders.append('x-tag', 'a');
+        recordHeaders.append('x-tag', 'b');
+        msg.data = new NatsRecord('data', recordHeaders);
+
+        client['publish'](msg, () => {});
+
+        const headers = publishSpy.mock.calls[0][2].headers;
+        expect(headers.values('x-tag')).toEqual(['a', 'b']);
+      });
+
+      it('should send the plain headers of a record from dispatchEvent()', async () => {
+        untypedClient.options.headers = { 'client-id': 'some-client-id' };
+
+        await client['dispatchEvent']({
+          pattern,
+          data: new NatsRecord('data', { 'x-version': '1.0.0' }),
+        });
+
+        const headers = publishSpy.mock.calls[0][2].headers;
+        expect(headers.get('x-version')).toEqual('1.0.0');
+        expect(headers.get('client-id')).toEqual('some-client-id');
+        expect(() => headers.encode()).not.toThrow();
+      });
+    });
+
+    describe('packet metadata', () => {
+      it('should send it as headers, and not in the payload', () => {
+        msg.metadata = { 'x-request-id': 'trace-1', tenant: 'acme' };
+
+        client['publish'](msg, () => {});
+
+        const [, data, { headers }] = publishSpy.mock.calls[0];
+        expect(headers.get('x-request-id')).toEqual('trace-1');
+        expect(headers.get('tenant')).toEqual('acme');
+        expect(JSON.parse(data)).not.toHaveProperty('metadata');
+        expect(JSON.parse(data)).toMatchObject({ pattern, data: 'data' });
+      });
+
+      it('should let the record headers and the static headers win', () => {
+        untypedClient.options.headers = { tenant: 'from-options' };
+        const recordHeaders = createHeaders();
+        recordHeaders.set('x-request-id', 'from-record');
+        msg.data = new NatsRecord('data', recordHeaders);
+        msg.metadata = {
+          'x-request-id': 'trace-1',
+          tenant: 'acme',
+          locale: 'pl',
+        };
+
+        client['publish'](msg, () => {});
+
+        const headers = publishSpy.mock.calls[0][2].headers;
+        expect(headers.values('x-request-id')).toEqual(['from-record']);
+        expect(headers.values('tenant')).toEqual(['from-options']);
+        expect(headers.get('locale')).toEqual('pl');
+      });
+
+      it('should not generate headers for empty metadata', () => {
+        msg.metadata = {};
+
+        client['publish'](msg, () => {});
+
+        expect(publishSpy.mock.calls[0][2].headers).toBeUndefined();
+      });
+
+      it('should leave it off a message to a server without header support', () => {
+        // Every NATS server since 2.2 announces "headers: true"
+        natsClient.info = { headers: false };
+        msg.metadata = { 'x-request-id': 'trace-1' };
+
+        client['publish'](msg, () => {});
+
+        expect(publishSpy.mock.calls[0][2].headers).toBeUndefined();
+      });
+
+      it('should fail the request over a value nats.js cannot send', () => {
+        const callback = vi.fn();
+        msg.metadata = { 'x-request-id': 'trace\r\n1' };
+
+        client['publish'](msg, callback);
+
+        expect(publishSpy).not.toHaveBeenCalled();
+        expect(callback).toHaveBeenCalledWith({ err: expect.any(Error) });
+      });
+    });
+
+    it('should release the inbox when a reply cannot be deserialized', async () => {
+      const error = new SyntaxError('Unexpected token');
+      const undecodable = {
+        data: 'not json',
+        json: () => {
+          throw error;
+        },
+      };
+      const rejection = firstValueFrom(client.send(pattern, 'data'));
+      await vi.waitFor(() => expect(subscribeSpy).toHaveBeenCalled());
+
+      await subscribeSpy.mock.calls[0][1].callback(null, undecodable);
+
+      await expect(rejection).rejects.toBe(error);
+      expect(unsubscribeSpy).toHaveBeenCalledTimes(1);
+      expect(untypedClient.routingMap.size).toBe(0);
+    });
   });
+
   describe('createSubscriptionHandler', () => {
     const pattern = 'test';
     const msg = { pattern, data: 'data', id: '1' };
-    let callback: sinon.SinonSpy, subscription;
     const responseMessage = {
       response: 'test',
       id: '1',
     };
+    const natsMessage = {
+      data: JSON.stringify(responseMessage),
+      json: () => responseMessage,
+    };
+
+    let callback: ReturnType<typeof vi.fn>, subscription;
 
     describe('not completed', () => {
       beforeEach(async () => {
-        callback = sinon.spy();
+        callback = vi.fn();
 
-        subscription = client.createSubscriptionHandler(msg, callback);
-        subscription(responseMessage);
+        subscription = client.createSubscriptionHandler(
+          msg,
+          callback as (packet: WritePacket) => any,
+        );
+        await subscription(undefined, natsMessage);
       });
       it('should call callback with expected arguments', () => {
-        expect(
-          callback.calledWith({
-            err: undefined,
-            response: responseMessage.response,
-          }),
-        ).to.be.true;
+        expect(callback).toHaveBeenCalledWith({
+          err: undefined,
+          response: responseMessage.response,
+        });
       });
     });
     describe('disposed and "id" is correct', () => {
       beforeEach(async () => {
-        callback = sinon.spy();
-        subscription = client.createSubscriptionHandler(msg, callback);
-        subscription({
-          ...responseMessage,
-          isDisposed: true,
+        callback = vi.fn();
+        subscription = client.createSubscriptionHandler(
+          msg,
+          callback as (packet: WritePacket) => any,
+        );
+        subscription(undefined, {
+          data: JSON.stringify({
+            ...responseMessage,
+            isDisposed: true,
+          }),
+          json: function () {
+            return JSON.parse(this.data);
+          },
         });
       });
 
       it('should call callback with dispose param', () => {
-        expect(callback.called).to.be.true;
-        expect(
-          callback.calledWith({
-            isDisposed: true,
-            response: responseMessage.response,
-            err: undefined,
-          }),
-        ).to.be.true;
+        expect(callback).toHaveBeenCalledWith({
+          isDisposed: true,
+          response: responseMessage.response,
+          err: undefined,
+        });
       });
     });
     describe('disposed and "id" is incorrect', () => {
       beforeEach(async () => {
-        callback = sinon.spy();
+        callback = vi.fn();
         subscription = client.createSubscriptionHandler(
           {
             ...msg,
             id: '2',
           },
-          callback,
+          callback as (packet: WritePacket) => any,
         );
-        subscription(responseMessage);
+        subscription(undefined, {
+          data: JSON.stringify({
+            ...responseMessage,
+            isDisposed: true,
+          }),
+          json: function () {
+            return JSON.parse(this.data);
+          },
+        });
       });
 
       it('should not call callback', () => {
-        expect(callback.called).to.be.false;
+        expect(callback).not.toHaveBeenCalled();
+      });
+    });
+    describe('reply that cannot be deserialized', () => {
+      const error = new SyntaxError('Unexpected token');
+      const createHandler = () => {
+        client = new ClientNats({});
+        untypedClient = client as any;
+        callback = vi.fn();
+        return client.createSubscriptionHandler(
+          msg,
+          callback as (packet: WritePacket) => any,
+        );
+      };
+
+      it('should fail the request when the deserializer throws', async () => {
+        const handler = createHandler();
+        const undecodable = {
+          data: 'not json',
+          json: () => {
+            throw error;
+          },
+        };
+
+        await expect(handler(null, undecodable)).resolves.toBeUndefined();
+
+        expect(callback).toHaveBeenCalledTimes(1);
+        expect(callback).toHaveBeenCalledWith({ err: error, isDisposed: true });
+      });
+
+      it('should fail the request when the deserializer rejects', async () => {
+        const handler = createHandler();
+        vi.spyOn(untypedClient.deserializer, 'deserialize').mockRejectedValue(
+          error,
+        );
+
+        await expect(handler(null, natsMessage)).resolves.toBeUndefined();
+
+        expect(callback).toHaveBeenCalledTimes(1);
+        expect(callback).toHaveBeenCalledWith({ err: error, isDisposed: true });
+      });
+
+      it('should not report a failing callback as an undecodable reply', async () => {
+        const handler = createHandler();
+        const callbackError = new Error('callback failed');
+        callback.mockImplementation(() => {
+          throw callbackError;
+        });
+
+        await expect(handler(null, natsMessage)).rejects.toBe(callbackError);
+
+        expect(callback).toHaveBeenCalledTimes(1);
       });
     });
   });
   describe('close', () => {
-    let natsClose: sinon.SinonSpy;
-    let natsClient;
+    let natsClose: ReturnType<typeof vi.fn>;
+    let natsClient: any;
+
     beforeEach(() => {
-      natsClose = sinon.spy();
+      natsClose = vi.fn();
       natsClient = { close: natsClose };
-      (client as any).natsClient = natsClient;
+      untypedClient.natsClient = natsClient;
     });
-    it('should close "natsClient" when it is not null', () => {
-      client.close();
-      expect(natsClose.called).to.be.true;
+    it('should close "natsClient" when it is not null', async () => {
+      await client.close();
+      expect(natsClose).toHaveBeenCalled();
+    });
+
+    describe('pending requests', () => {
+      let unsubscribeSpy: ReturnType<typeof vi.fn>;
+
+      beforeEach(() => {
+        client = new ClientNats({});
+        untypedClient = client as any;
+        unsubscribeSpy = vi.fn();
+        natsClose = vi.fn();
+        natsClient = {
+          close: natsClose,
+          subscribe: vi.fn().mockReturnValue({ unsubscribe: unsubscribeSpy }),
+          publish: vi.fn(),
+        };
+        untypedClient.natsClient = natsClient;
+      });
+
+      const publish = (callback: (packet: WritePacket) => any) =>
+        untypedClient.publish({ pattern: 'pattern', data: 'data' }, callback);
+
+      it('should fail pending requests with a connection closed error', async () => {
+        const callback = vi.fn();
+        publish(callback);
+
+        await client.close();
+
+        expect(untypedClient.routingMap.size).toBe(0);
+        expect(callback).toHaveBeenCalledWith({
+          err: expect.objectContaining({ message: 'Connection closed' }),
+        });
+      });
+
+      it('should not call back a request whose teardown already ran', async () => {
+        const callback = vi.fn();
+        const teardown = publish(callback);
+
+        teardown();
+        await client.close();
+
+        expect(callback).not.toHaveBeenCalled();
+        expect(untypedClient.routingMap.size).toBe(0);
+      });
+
+      it('should leave nothing pending behind on a repeated close', async () => {
+        const callback = vi.fn();
+        publish(callback);
+
+        await client.close();
+        await client.close();
+
+        expect(callback).toHaveBeenCalledTimes(1);
+        expect(untypedClient.routingMap.size).toBe(0);
+      });
+
+      it('should fail pending requests even when closing the client rejects', async () => {
+        untypedClient.natsClient.close = vi
+          .fn()
+          .mockRejectedValue(new Error('Client closing error'));
+        const callback = vi.fn();
+        publish(callback);
+
+        await expect(client.close()).rejects.toThrow('Client closing error');
+
+        expect(callback).toHaveBeenCalledWith({
+          err: expect.objectContaining({ message: 'Connection closed' }),
+        });
+        expect(untypedClient.natsClient).toBeNull();
+        expect(untypedClient.connectionPromise).toBeNull();
+      });
+
+      it('should fail every pending request and close the client when a callback throws', async () => {
+        vi.spyOn(untypedClient.logger, 'error').mockImplementation(() => {});
+        const throwingCallback = vi.fn().mockImplementation(() => {
+          throw new Error('Callback error');
+        });
+        const callback = vi.fn();
+        publish(throwingCallback);
+        publish(callback);
+
+        await client.close();
+
+        expect(throwingCallback).toHaveBeenCalledTimes(1);
+        expect(callback).toHaveBeenCalledWith({
+          err: expect.objectContaining({ message: 'Connection closed' }),
+        });
+        expect(untypedClient.routingMap.size).toBe(0);
+        expect(natsClose).toHaveBeenCalled();
+      });
     });
   });
   describe('connect', () => {
-    let createClientSpy: sinon.SinonSpy;
-    let handleErrorsSpy: sinon.SinonSpy;
-    let connect$Spy: sinon.SinonSpy;
-
-    const natsClient = {
-      addListener: sinon.spy(),
-      on: (ev, fn) => (ev === 'connect' ? fn() : null),
-      removeListener: sinon.spy(),
-      off: sinon.spy(),
-    };
+    let createClientSpy: ReturnType<typeof vi.fn>;
+    let handleStatusUpdatesSpy: ReturnType<typeof vi.fn>;
 
     beforeEach(async () => {
-      createClientSpy = sinon
-        .stub(client, 'createClient')
-        .callsFake(() => natsClient as any);
-      handleErrorsSpy = sinon.spy(client, 'handleError');
-      connect$Spy = sinon.spy(client, 'connect$' as any);
+      createClientSpy = vi
+        .spyOn(client, 'createClient')
+        .mockImplementation(() => Promise.resolve({}));
+      handleStatusUpdatesSpy = vi.spyOn(client, 'handleStatusUpdates');
 
       await client.connect();
     });
     afterEach(() => {
-      createClientSpy.restore();
-      handleErrorsSpy.restore();
-      connect$Spy.restore();
+      createClientSpy.mockRestore();
+      handleStatusUpdatesSpy.mockRestore();
     });
     describe('when is not connected', () => {
       beforeEach(async () => {
         client['natsClient'] = null;
+        client['connectionPromise'] = null;
         await client.connect();
       });
-      it('should call "handleError" once', async () => {
-        expect(handleErrorsSpy.called).to.be.true;
+      it('should call "handleStatusUpdatesSpy" once', async () => {
+        expect(handleStatusUpdatesSpy).toHaveBeenCalled();
       });
       it('should call "createClient" once', async () => {
-        expect(createClientSpy.called).to.be.true;
-      });
-      it('should call "connect$" once', async () => {
-        expect(connect$Spy.called).to.be.true;
+        expect(createClientSpy).toHaveBeenCalled();
       });
     });
     describe('when is connected', () => {
       beforeEach(() => {
         client['natsClient'] = { test: true } as any;
+        client['connection'] = Promise.resolve(true);
       });
       it('should not call "createClient"', () => {
-        expect(createClientSpy.called).to.be.false;
+        expect(createClientSpy).not.toHaveBeenCalled();
       });
-      it('should not call "handleError"', () => {
-        expect(handleErrorsSpy.called).to.be.false;
+      it('should not call "handleStatusUpdatesSpy"', () => {
+        expect(handleStatusUpdatesSpy).not.toHaveBeenCalled();
       });
-      it('should not call "connect$"', () => {
-        expect(connect$Spy.called).to.be.false;
+    });
+    describe('when a stale attempt fails', () => {
+      it('should keep a newer connection when a stale attempt fails', async () => {
+        client = new ClientNats({});
+        untypedClient = client as any;
+        let rejectFirstAttempt!: (err: Error) => void;
+        const firstAttempt = new Promise<never>((_, reject) => {
+          rejectFirstAttempt = reject;
+        });
+        const mockNatsClient = {
+          status: vi.fn().mockReturnValue({
+            // the connection stays alive: next() never resolves
+            [Symbol.asyncIterator]() {
+              return {
+                next: () => new Promise(() => {}),
+                [Symbol.asyncIterator]() {
+                  return this;
+                },
+              };
+            },
+          }),
+          close: vi.fn().mockResolvedValue(undefined),
+        };
+
+        const createClientSpy = vi
+          .spyOn(client, 'createClient')
+          .mockImplementationOnce(() => firstAttempt)
+          .mockImplementation(() => Promise.resolve(mockNatsClient));
+
+        const firstConnect = client.connect();
+        // Let the first attempt cache its promise before the close().
+        await new Promise(process.nextTick);
+        await client.close();
+        const liveClient = await client.connect();
+        const cachedPromise = untypedClient.connectionPromise;
+
+        rejectFirstAttempt(new Error('connection refused'));
+        await expect(firstConnect).rejects.toThrow('connection refused');
+
+        // A rejected attempt must not clear the newer attempt's cached
+        // promise, close() followed by connect() would otherwise orphan the
+        // newer live client on the next connect().
+        expect(untypedClient.connectionPromise).toBe(cachedPromise);
+        expect(untypedClient.natsClient).toBe(liveClient);
+
+        expect(await client.connect()).toBe(liveClient);
+        expect(createClientSpy).toHaveBeenCalledTimes(2);
+
+        await client.close();
+      });
+    });
+    describe('when a stale attempt succeeds', () => {
+      const createMockNatsClient = () => ({
+        status: vi.fn().mockReturnValue({
+          // the connection stays alive: next() never resolves
+          [Symbol.asyncIterator]() {
+            return {
+              next: () => new Promise(() => {}),
+              [Symbol.asyncIterator]() {
+                return this;
+              },
+            };
+          },
+        }),
+        close: vi.fn().mockResolvedValue(undefined),
+      });
+      let resolveFirstAttempt: (natsClient: any) => void;
+      let staleNatsClient: ReturnType<typeof createMockNatsClient>;
+      let liveNatsClient: ReturnType<typeof createMockNatsClient>;
+
+      beforeEach(() => {
+        client = new ClientNats({});
+        untypedClient = client as any;
+        staleNatsClient = createMockNatsClient();
+        liveNatsClient = createMockNatsClient();
+        const firstAttempt = new Promise<any>(resolve => {
+          resolveFirstAttempt = resolve;
+        });
+        vi.spyOn(client, 'createClient')
+          .mockImplementationOnce(() => firstAttempt)
+          .mockImplementation(() => Promise.resolve(liveNatsClient as any));
+      });
+
+      it('should close the stale connection and keep the newer one', async () => {
+        const firstConnect = client.connect();
+        // Let the first attempt cache its promise before the close().
+        await new Promise(process.nextTick);
+        await client.close();
+        const liveClient = await client.connect();
+
+        resolveFirstAttempt(staleNatsClient);
+        expect(await firstConnect).toBe(liveClient);
+
+        expect(staleNatsClient.close).toHaveBeenCalled();
+        expect(liveNatsClient.close).not.toHaveBeenCalled();
+        expect(untypedClient.natsClient).toBe(liveClient);
+        expect(staleNatsClient.status).not.toHaveBeenCalled();
+
+        await client.close();
+        expect(liveNatsClient.close).toHaveBeenCalled();
+      });
+      it('should close the stale connection when the client was closed', async () => {
+        const firstConnect = client.connect();
+        // Let the first attempt cache its promise before the close().
+        await new Promise(process.nextTick);
+        await client.close();
+
+        resolveFirstAttempt(staleNatsClient);
+        await expect(firstConnect).rejects.toThrow('Connection closed');
+
+        expect(staleNatsClient.close).toHaveBeenCalled();
+        expect(staleNatsClient.status).not.toHaveBeenCalled();
+        expect(untypedClient.natsClient).toBeNull();
+        expect(untypedClient.connectionPromise).toBeNull();
       });
     });
   });
-  describe('handleError', () => {
-    it('should bind error event handler', () => {
-      const callback = sinon.stub().callsFake((_, fn) => fn({ code: 'test' }));
-      const emitter = {
-        addListener: callback,
+  describe('handleStatusUpdates', () => {
+    it('should retrieve "status()" async iterator', () => {
+      const clientMock = {
+        status: vi.fn().mockReturnValue({
+          async *[Symbol.asyncIterator]() {
+            // empty iterator
+          },
+        }),
       };
-      client.handleError(emitter as any);
-      expect(callback.getCall(0).args[0]).to.be.eql(ERROR_EVENT);
+      void client.handleStatusUpdates(clientMock as any);
+      expect(clientMock.status).toHaveBeenCalled();
+    });
+
+    it('should log "disconnect" and "error" statuses as "errors"', async () => {
+      const logErrorSpy = vi.spyOn(untypedClient.logger, 'error');
+      const clientMock = {
+        status: vi.fn().mockReturnValue({
+          async *[Symbol.asyncIterator]() {
+            yield { type: 'disconnect' };
+            yield { type: 'error', error: 'Test error' };
+          },
+        }),
+      };
+      untypedClient.natsClient = clientMock;
+      await client.handleStatusUpdates(clientMock as any);
+      expect(logErrorSpy).toHaveBeenCalledTimes(2);
+      expect(logErrorSpy).toHaveBeenNthCalledWith(
+        1,
+        'NatsError: type: "disconnect".',
+      );
+      expect(logErrorSpy).toHaveBeenNthCalledWith(
+        2,
+        'NatsError: type: "error", error: "Test error".',
+      );
+    });
+    it('should log other statuses as "logs"', async () => {
+      const logSpy = vi.spyOn(untypedClient.logger, 'log');
+      const clientMock = {
+        status: vi.fn().mockReturnValue({
+          async *[Symbol.asyncIterator]() {
+            yield { type: 'non-disconnect', data: 'localhost' };
+            yield { type: 'warn', data: {} };
+          },
+        }),
+      };
+      untypedClient.natsClient = clientMock;
+      await client.handleStatusUpdates(clientMock as any);
+      expect(logSpy).toHaveBeenCalledTimes(2);
+      expect(logSpy).toHaveBeenCalledWith(
+        'NatsStatus: type: "non-disconnect", data: "localhost".',
+      );
+      expect(logSpy).toHaveBeenCalledWith(
+        'NatsStatus: type: "warn", data: "{}".',
+      );
+    });
+    it('should log a throwing listener and keep handling statuses', async () => {
+      const error = new Error('listener failed');
+      const logErrorSpy = vi.spyOn(untypedClient.logger, 'error');
+      const reconnectListener = vi.fn();
+      client.on('disconnect', () => {
+        throw error;
+      });
+      client.on('reconnect', reconnectListener);
+      const clientMock = {
+        status: vi.fn().mockReturnValue({
+          async *[Symbol.asyncIterator]() {
+            yield { type: 'disconnect', server: 'localhost' };
+            yield { type: 'reconnect', server: 'localhost' };
+          },
+        }),
+      };
+      untypedClient.natsClient = clientMock;
+      await client.handleStatusUpdates(clientMock as any);
+      expect(logErrorSpy).toHaveBeenCalledWith(error);
+      expect(reconnectListener).toHaveBeenCalledWith('localhost');
+    });
+  });
+  describe('when the status iterator fails', () => {
+    it('should log the error instead of rejecting', async () => {
+      const client = new ClientNats({});
+      const error = new Error('status failed');
+      const logErrorSpy = vi.spyOn((client as any).logger, 'error');
+      vi.spyOn(client, 'createClient').mockResolvedValue({
+        status: () => ({
+          [Symbol.asyncIterator]: () => ({ next: () => Promise.reject(error) }),
+        }),
+      } as any);
+
+      await client.connect();
+      await vi.waitFor(() => expect(logErrorSpy).toHaveBeenCalledWith(error));
+    });
+  });
+  describe('when the client gives up', () => {
+    let client: ClientNats;
+    let untypedClient: any;
+
+    beforeEach(() => {
+      client = new ClientNats({});
+      untypedClient = client as any;
+    });
+
+    it('should start a new connection when the status iterator completes', async () => {
+      let releaseIterator: () => void;
+      const iteratorReachedEnd = new Promise<void>(resolve => {
+        releaseIterator = resolve;
+      });
+
+      const firstClient = {
+        status: () => ({
+          async *[Symbol.asyncIterator]() {
+            yield { type: 'disconnect' };
+            await iteratorReachedEnd;
+          },
+        }),
+        close: vi.fn(),
+      };
+      const secondClient = {
+        status: () => ({
+          async *[Symbol.asyncIterator]() {
+            // stays connected
+          },
+        }),
+        close: vi.fn(),
+      };
+      const createClientSpy = vi
+        .spyOn(client, 'createClient')
+        .mockResolvedValueOnce(firstClient as any)
+        .mockResolvedValueOnce(secondClient as any);
+
+      await client.connect();
+      await vi.waitFor(async () => {
+        expect(untypedClient.connectionPromise).toBeTruthy();
+        await expect(untypedClient.connectionPromise).rejects.toBe(
+          'Error: Connection lost. Trying to reconnect...',
+        );
+      });
+
+      await expect(client.connect()).rejects.toBe(
+        'Error: Connection lost. Trying to reconnect...',
+      );
+
+      releaseIterator!();
+      await vi.waitFor(() =>
+        expect(untypedClient.connectionPromise).toBeNull(),
+      );
+      expect(untypedClient.natsClient).toBeNull();
+
+      await client.connect();
+      expect(createClientSpy).toHaveBeenCalledTimes(2);
+      createClientSpy.mockRestore();
+    });
+
+    it('should report the client as disconnected when the status iterator completes', async () => {
+      const statuses: string[] = [];
+      client.status.subscribe(status => statuses.push(status));
+      vi.spyOn(client, 'createClient').mockResolvedValueOnce({
+        status: () => ({
+          async *[Symbol.asyncIterator]() {
+            yield { type: 'disconnect' };
+            yield { type: 'reconnecting' };
+          },
+        }),
+        close: vi.fn(),
+      } as any);
+
+      await client.connect();
+      await vi.waitFor(() => expect(untypedClient.natsClient).toBeNull());
+
+      expect(statuses).toEqual([
+        'connected',
+        'disconnected',
+        'reconnecting',
+        'disconnected',
+      ]);
+    });
+
+    it('should not report a client that close() closed as disconnected', async () => {
+      const statuses: string[] = [];
+      client.status.subscribe(status => statuses.push(status));
+      let closeIterator: () => void;
+      const closed = new Promise<void>(resolve => {
+        closeIterator = resolve;
+      });
+      const handleStatusUpdatesSpy = vi.spyOn(client, 'handleStatusUpdates');
+      vi.spyOn(client, 'createClient').mockResolvedValueOnce({
+        status: () => ({
+          async *[Symbol.asyncIterator]() {
+            await closed;
+            yield { type: 'close' };
+          },
+        }),
+        // nats resolves close() once the status iterator has completed
+        close: vi.fn(() => {
+          closeIterator();
+          return handleStatusUpdatesSpy.mock.results[0].value;
+        }),
+      } as any);
+
+      await client.connect();
+      await client.close();
+
+      expect(statuses).toEqual(['connected']);
+    });
+
+    describe('with a pending request', () => {
+      const secondClient = {
+        status: () => ({
+          async *[Symbol.asyncIterator]() {
+            // stays connected
+          },
+        }),
+        close: vi.fn(),
+      };
+      let releaseIterator: () => void;
+      let createClientSpy: ReturnType<typeof vi.fn>;
+
+      beforeEach(async () => {
+        const iteratorReachedEnd = new Promise<void>(resolve => {
+          releaseIterator = resolve;
+        });
+        const natsClient = {
+          status: () => ({
+            async *[Symbol.asyncIterator]() {
+              yield { type: 'disconnect' };
+              await iteratorReachedEnd;
+            },
+          }),
+          subscribe: vi.fn().mockReturnValue({ unsubscribe: vi.fn() }),
+          publish: vi.fn(),
+          close: vi.fn(),
+        };
+        createClientSpy = vi
+          .spyOn(client, 'createClient')
+          .mockResolvedValueOnce(natsClient as any)
+          .mockResolvedValueOnce(secondClient as any);
+        await client.connect();
+      });
+      afterEach(() => {
+        createClientSpy.mockRestore();
+      });
+
+      it('should fail pending requests when the status iterator completes', async () => {
+        const callback = vi.fn();
+        untypedClient.publish({ pattern: 'pattern', data: 'data' }, callback);
+
+        releaseIterator();
+        await vi.waitFor(() => expect(untypedClient.natsClient).toBeNull());
+
+        expect(callback).toHaveBeenCalledWith({
+          err: expect.objectContaining({ message: 'Connection closed' }),
+        });
+        expect(untypedClient.routingMap.size).toBe(0);
+      });
+
+      it('should start a new connection when a failed request retries from its callback', async () => {
+        let retry: Promise<any> | undefined;
+        untypedClient.publish({ pattern: 'pattern', data: 'data' }, () => {
+          retry = client.connect();
+        });
+
+        releaseIterator();
+        await vi.waitFor(() => expect(retry).toBeDefined());
+
+        await expect(retry).resolves.toBe(secondClient);
+        expect(createClientSpy).toHaveBeenCalledTimes(2);
+      });
     });
   });
   describe('dispatchEvent', () => {
-    const msg = { pattern: 'pattern', data: 'data' };
-    let publishStub: sinon.SinonStub, natsClient;
+    let msg: ReadPacket;
+    let subscribeStub: ReturnType<typeof vi.fn>, natsClient: any;
 
-    beforeEach(() => {
-      publishStub = sinon.stub();
+    beforeEach(async () => {
+      client = new ClientNats({});
+      untypedClient = client as any;
+
+      // Resolve the nats package (loaded asynchronously in constructor)
+      await client.createClient().catch(() => {});
+
+      msg = { pattern: 'pattern', data: 'data' };
+      subscribeStub = vi
+        .fn()
+        .mockImplementation((channel, options) => options.callback());
       natsClient = {
-        publish: publishStub,
+        publish: vi.fn(),
+        subscribe: subscribeStub,
       };
-      (client as any).natsClient = natsClient;
+      untypedClient.natsClient = natsClient;
     });
 
     it('should publish packet', async () => {
-      publishStub.callsFake((a, b, c) => c());
       await client['dispatchEvent'](msg);
 
-      expect(publishStub.called).to.be.true;
+      expect(natsClient.publish).toHaveBeenCalled();
     });
+
     it('should throw error', async () => {
-      publishStub.callsFake((a, b, c) => c(new Error()));
-      client['dispatchEvent'](msg).catch(err =>
-        expect(err).to.be.instanceOf(Error),
+      subscribeStub.mockImplementation((channel, options) =>
+        options.callback(new Error()),
       );
+      await client['dispatchEvent'](msg).catch(err =>
+        expect(err).toBeInstanceOf(Error),
+      );
+    });
+
+    describe('headers', () => {
+      it('should not generate headers if none are configured', async () => {
+        await client['dispatchEvent'](msg);
+        expect(natsClient.publish.mock.calls[0][2].headers).toBeUndefined();
+      });
+
+      it('should send packet headers', async () => {
+        const requestHeaders = createHeaders();
+        requestHeaders.set('1', '123');
+        msg.data = new NatsRecord('data', requestHeaders);
+
+        await client['dispatchEvent'](msg);
+        expect(natsClient.publish.mock.calls[0][2].headers.get('1')).toEqual(
+          '123',
+        );
+      });
+
+      it('should combine packet and static headers', async () => {
+        const staticHeaders = { 'client-id': 'some-client-id' };
+        untypedClient.options.headers = staticHeaders;
+
+        const requestHeaders = createHeaders();
+        requestHeaders.set('1', '123');
+        msg.data = new NatsRecord('data', requestHeaders);
+
+        await client['dispatchEvent'](msg);
+        expect(
+          natsClient.publish.mock.calls[0][2].headers.get('client-id'),
+        ).toEqual('some-client-id');
+        expect(natsClient.publish.mock.calls[0][2].headers.get('1')).toEqual(
+          '123',
+        );
+      });
+
+      it('should prefer packet headers over static headers', async () => {
+        const staticHeaders = { 'client-id': 'some-client-id' };
+        untypedClient.options.headers = staticHeaders;
+
+        const requestHeaders = createHeaders();
+        requestHeaders.set('client-id', 'override-client-id');
+        msg.data = new NatsRecord('data', requestHeaders);
+
+        await client['dispatchEvent'](msg);
+        expect(
+          natsClient.publish.mock.calls[0][2].headers.get('client-id'),
+        ).toEqual('override-client-id');
+      });
+
+      it('should send the packet metadata as headers, and not in the payload', async () => {
+        msg.metadata = { 'x-request-id': 'trace-1' };
+
+        await client['dispatchEvent'](msg);
+
+        const [, data, { headers }] = natsClient.publish.mock.calls[0];
+        expect(headers.get('x-request-id')).toEqual('trace-1');
+        expect(JSON.parse(data)).toEqual({ pattern: 'pattern', data: 'data' });
+      });
+
+      it('should prefer the record headers over the packet metadata', async () => {
+        msg.data = new NatsRecord('data', { 'x-request-id': 'from-record' });
+        msg.metadata = { 'x-request-id': 'trace-1' };
+
+        await client['dispatchEvent'](msg);
+
+        expect(
+          natsClient.publish.mock.calls[0][2].headers.values('x-request-id'),
+        ).toEqual(['from-record']);
+      });
     });
   });
 });

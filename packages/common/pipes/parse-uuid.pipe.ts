@@ -1,24 +1,89 @@
-import { Optional } from '../decorators';
-import { ArgumentMetadata, HttpStatus, Injectable } from '../index';
-import { PipeTransform } from '../interfaces/features/pipe-transform.interface';
+import { Injectable } from '../decorators/core/injectable.decorator.js';
+import { Optional } from '../decorators/core/optional.decorator.js';
+import { HttpStatus } from '../enums/http-status.enum.js';
+import {
+  ArgumentMetadata,
+  PipeTransform,
+} from '../interfaces/features/pipe-transform.interface.js';
 import {
   ErrorHttpStatusCode,
   HttpErrorByCode,
-} from '../utils/http-error-by-code.util';
-import { isUUID } from '../utils/is-uuid';
+} from '../utils/http-error-by-code.util.js';
+import { isNil, isString } from '../utils/shared.utils.js';
 
+/**
+ * @publicApi
+ */
+export type UUIDVersion =
+  | '1'
+  | '2'
+  | '3'
+  | '4'
+  | '5'
+  | '6'
+  | '7'
+  | '8'
+  | 1
+  | 2
+  | 3
+  | 4
+  | 5
+  | 6
+  | 7
+  | 8
+  | 'all';
+
+/**
+ * @publicApi
+ */
 export interface ParseUUIDPipeOptions {
-  version?: '3' | '4' | '5';
+  /**
+   * UUID version to validate
+   */
+  version?: UUIDVersion;
+  /**
+   * The HTTP status code to be used in the response when the validation fails.
+   */
   errorHttpStatusCode?: ErrorHttpStatusCode;
+  /**
+   * A factory function that returns an exception object to be thrown
+   * if validation fails.
+   * @param error Error message
+   * @returns The exception object
+   */
   exceptionFactory?: (errors: string) => any;
+  /**
+   * If true, the pipe will return null or undefined if the value is not provided
+   * @default false
+   */
+  optional?: boolean;
 }
 
+/**
+ * Defines the built-in ParseUUID Pipe
+ *
+ * @see [Built-in Pipes](https://docs.nestjs.com/pipes#built-in-pipes)
+ *
+ * @publicApi
+ */
 @Injectable()
-export class ParseUUIDPipe implements PipeTransform<string> {
-  private readonly version: '3' | '4' | '5';
+export class ParseUUIDPipe implements PipeTransform {
+  protected static uuidRegExps: Record<UUIDVersion, RegExp> = {
+    1: /^[0-9A-F]{8}-[0-9A-F]{4}-1[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}$/i,
+    2: /^[0-9A-F]{8}-[0-9A-F]{4}-2[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}$/i,
+    3: /^[0-9A-F]{8}-[0-9A-F]{4}-3[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}$/i,
+    4: /^[0-9A-F]{8}-[0-9A-F]{4}-4[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}$/i,
+    5: /^[0-9A-F]{8}-[0-9A-F]{4}-5[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}$/i,
+    6: /^[0-9A-F]{8}-[0-9A-F]{4}-6[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}$/i,
+    7: /^[0-9A-F]{8}-[0-9A-F]{4}-7[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}$/i,
+    8: /^[0-9A-F]{8}-[0-9A-F]{4}-8[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}$/i,
+    // Versions 1-8 with the RFC variant, or the Nil and Max UUIDs (RFC 9562, sections 5.9, 5.10)
+    all: /^(?:[0-9A-F]{8}-[0-9A-F]{4}-[1-8][0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}|00000000-0000-0000-0000-000000000000|FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF)$/i,
+  };
+  private readonly version: ParseUUIDPipeOptions['version'];
   protected exceptionFactory: (errors: string) => any;
 
-  constructor(@Optional() options?: ParseUUIDPipeOptions) {
+  constructor(@Optional() protected readonly options?: ParseUUIDPipeOptions) {
     options = options || {};
     const {
       exceptionFactory,
@@ -31,14 +96,29 @@ export class ParseUUIDPipe implements PipeTransform<string> {
       exceptionFactory ||
       (error => new HttpErrorByCode[errorHttpStatusCode](error));
   }
-  async transform(value: string, metadata: ArgumentMetadata): Promise<string> {
-    if (!isUUID(value, this.version)) {
+
+  async transform(
+    value: unknown,
+    metadata: ArgumentMetadata,
+  ): Promise<string | undefined | null> {
+    if (isNil(value) && this.options?.optional) {
+      return value;
+    }
+    if (!this.isUUID(value, this.version)) {
       throw this.exceptionFactory(
-        `Validation failed (uuid ${
-          this.version ? 'v' + this.version : ''
+        `Validation failed (uuid${
+          this.version && this.version !== 'all' ? ` v ${this.version}` : ''
         } is expected)`,
       );
     }
-    return value;
+    return value as string;
+  }
+
+  protected isUUID(str: unknown, version: UUIDVersion = 'all') {
+    if (!isString(str)) {
+      throw this.exceptionFactory('The value passed as UUID is not a string');
+    }
+    const pattern = ParseUUIDPipe.uuidRegExps[version];
+    return pattern?.test(str);
   }
 }

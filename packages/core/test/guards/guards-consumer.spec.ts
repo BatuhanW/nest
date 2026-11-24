@@ -1,7 +1,7 @@
-import * as sinon from 'sinon';
-import { expect } from 'chai';
-import { GuardsConsumer } from '../../guards/guards-consumer';
-import { Observable, of } from 'rxjs';
+import { of } from 'rxjs';
+import { registerClassRef } from '../../helpers/class-ref-registry.js';
+import { GuardsConsumer } from '../../guards/guards-consumer.js';
+import { AsyncLocalStorage } from 'async_hooks';
 
 describe('GuardsConsumer', () => {
   let consumer: GuardsConsumer;
@@ -17,9 +17,9 @@ describe('GuardsConsumer', () => {
           [],
           [],
           { constructor: null },
-          null,
+          null!,
         );
-        expect(canActivate).to.be.true;
+        expect(canActivate).toBe(true);
       });
     });
     describe('when guards array is not empty', () => {
@@ -29,9 +29,9 @@ describe('GuardsConsumer', () => {
             [...guards, { canActivate: () => false }],
             [],
             { constructor: null },
-            null,
+            null!,
           );
-          expect(canActivate).to.be.false;
+          expect(canActivate).toBe(false);
         });
       });
       describe('when each guard returns true', () => {
@@ -40,22 +40,109 @@ describe('GuardsConsumer', () => {
             guards,
             [],
             { constructor: null },
-            null,
+            null!,
           );
-          expect(canActivate).to.be.true;
+          expect(canActivate).toBe(true);
+        });
+      });
+      describe('when a guard returns an Observable from another copy of rxjs', () => {
+        it('should use the value it emits', async () => {
+          // Not an instance of the "Observable" class imported here
+          const source$ = of(false);
+          const foreign$ = {
+            lift: source$.lift.bind(source$),
+            subscribe: source$.subscribe.bind(source$),
+          };
+          const canActivate = await consumer.tryActivate(
+            [...guards, { canActivate: () => foreign$ }],
+            [],
+            { constructor: null },
+            null!,
+          );
+          expect(canActivate).toBe(false);
+        });
+      });
+      describe('when a guard returns a Promise of an Observable', () => {
+        it('should use the value the Observable emits', async () => {
+          const canActivate = await consumer.tryActivate(
+            [...guards, { canActivate: async () => of(false) }],
+            [],
+            { constructor: null },
+            null!,
+          );
+          expect(canActivate).toBe(false);
+        });
+      });
+      describe('when sync guards initialize AsyncLocalStorages', () => {
+        it('should keep local storages accessible', async () => {
+          const storage1 = new AsyncLocalStorage<number>();
+          const storage2 = new AsyncLocalStorage<number>();
+          const canActivate = await consumer.tryActivate(
+            [
+              {
+                canActivate: () => {
+                  storage1.enterWith(1);
+                  return true;
+                },
+              },
+              {
+                canActivate: () => {
+                  storage2.enterWith(2);
+                  return true;
+                },
+              },
+            ],
+            [],
+            { constructor: null },
+            null!,
+          );
+          expect(canActivate).toBe(true);
+          expect(storage1.getStore()).toBe(1);
+          expect(storage2.getStore()).toBe(2);
         });
       });
     });
   });
   describe('pickResult', () => {
     describe('when result is Observable', () => {
-      it('should returns result', async () => {
-        expect(await consumer.pickResult(of(true))).to.be.true;
+      it('should return result', async () => {
+        expect(await consumer.pickResult(of(true))).toBe(true);
       });
     });
     describe('when result is Promise', () => {
       it('should await promise', async () => {
-        expect(await consumer.pickResult(Promise.resolve(true))).to.be.true;
+        expect(await consumer.pickResult(Promise.resolve(true))).toBe(true);
+      });
+    });
+  });
+  describe('createContext', () => {
+    it('should return execution context object', () => {
+      const instance = { constructor: {} };
+      const callback = () => null;
+      const context = consumer.createContext([], instance, callback);
+
+      expect(context.getClass()).toEqual(instance.constructor);
+      expect(context.getHandler()).toEqual(callback);
+    });
+    describe('when a mixin helper overwrote the "constructor" of the host prototype', () => {
+      class Mixin {
+        public mixedIn() {}
+      }
+      class Host {
+        public own() {}
+      }
+      // What the TypeScript handbook's `applyMixins()` does
+      Object.defineProperties(
+        Host.prototype,
+        Object.getOwnPropertyDescriptors(Mixin.prototype),
+      );
+      registerClassRef(Host);
+
+      it('should return the registered class, not the overwritten "constructor"', () => {
+        const context = consumer.createContext([], new Host(), () => null);
+
+        expect(Host.prototype.constructor).toBe(Mixin);
+        expect(context.getClass()).toBe(Host);
       });
     });
   });

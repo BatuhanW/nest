@@ -1,117 +1,1234 @@
-import { expect } from 'chai';
-import * as sinon from 'sinon';
-import { NO_MESSAGE_HANDLER } from '../../constants';
-import { BaseRpcContext } from '../../ctx-host/base-rpc.context';
-import { ServerRMQ } from '../../server/server-rmq';
+import { EventEmitter } from 'events';
+import { of } from 'rxjs';
+import {
+  CONSUMER_CANCELLED_RMQ_MESSAGE,
+  NO_MESSAGE_HANDLER,
+  RMQ_DEFAULT_MAX_MESSAGE_SIZE,
+  RMQ_DEFAULT_QUEUE,
+} from '../../constants.js';
+import { RmqContext } from '../../ctx-host/index.js';
+import { InvalidPacketIdException } from '../../errors/invalid-packet-id.exception.js';
+import { MaxPacketLengthExceededException } from '../../errors/max-packet-length-exceeded.exception.js';
+import { RmqRecordBuilder } from '../../record-builders/index.js';
+import { ServerRMQ } from '../../server/server-rmq.js';
+import { objectToMap } from './utils/object-to-map.js';
 
 describe('ServerRMQ', () => {
   let server: ServerRMQ;
-
-  const objectToMap = obj =>
-    new Map(Object.keys(obj).map(key => [key, obj[key]]) as any);
+  let untypedServer: any;
 
   beforeEach(() => {
     server = new ServerRMQ({});
+    untypedServer = server as any;
   });
+
   describe('listen', () => {
-    let createClient: sinon.SinonStub;
-    let onStub: sinon.SinonStub;
-    let createChannelStub: sinon.SinonStub;
-    let setupChannelStub: sinon.SinonStub;
+    let createClient: ReturnType<typeof vi.fn>;
+    let onStub: ReturnType<typeof vi.fn>;
+    let createChannelStub: ReturnType<typeof vi.fn>;
+    let setupChannelStub: ReturnType<typeof vi.fn>;
     let client: any;
+    let callbackSpy: ReturnType<typeof vi.fn>;
 
     beforeEach(() => {
-      onStub = sinon
-        .stub()
-        .callsFake((event, callback) => event === 'connect' && callback());
-      createChannelStub = sinon.stub().callsFake(({ setup }) => setup());
-      setupChannelStub = sinon
-        .stub(server, 'setupChannel')
-        .callsFake(() => ({} as any));
+      onStub = vi
+        .fn()
+        .mockImplementation(
+          (event, callback) => event === 'connect' && callback(),
+        );
+      createChannelStub = vi.fn().mockImplementation(({ setup }) => {
+        void setup();
+        return new EventEmitter();
+      });
+      setupChannelStub = vi
+        .spyOn(server, 'setupChannel')
+        .mockImplementation(() => ({}) as any);
 
       client = {
         on: onStub,
+        once: onStub,
         createChannel: createChannelStub,
       };
-      createClient = sinon.stub(server, 'createClient').callsFake(() => client);
-
-      server.listen(null);
+      createClient = vi
+        .spyOn(server, 'createClient')
+        .mockImplementation(() => client);
+      callbackSpy = vi.fn();
     });
     afterEach(() => {
-      setupChannelStub.restore();
+      setupChannelStub.mockRestore();
     });
-    it('should call "createClient"', () => {
-      expect(createClient.called).to.be.true;
+    it('should call "createClient"', async () => {
+      await server.listen(callbackSpy);
+      expect(createClient).toHaveBeenCalled();
     });
-    it('should bind "connect" event to handler', () => {
-      expect(onStub.getCall(0).args[0]).to.be.equal('connect');
+    it('should bind "connect" event to handler', async () => {
+      await server.listen(callbackSpy);
+      expect(onStub.mock.calls[0][0]).toBe('connect');
     });
-    it('should bind "disconnect" event to handler', () => {
-      expect(onStub.getCall(1).args[0]).to.be.equal('disconnect');
+    it('should bind "disconnected" event to handler', async () => {
+      await server.listen(callbackSpy);
+      expect(onStub.mock.calls[2][0]).toBe('disconnect');
+    });
+    it('should bind "connectFailed" event to handler', async () => {
+      await server.listen(callbackSpy);
+      expect(onStub.mock.calls.map(call => call[0])).toContain('connectFailed');
+    });
+    it('should call the callback once when channel setup runs again', async () => {
+      setupChannelStub.mockImplementation(async (_channel, setupCallback) => {
+        setupCallback();
+        setupCallback();
+      });
+      createChannelStub.mockImplementation(({ setup }) => {
+        void setup({});
+        void setup({});
+        return new EventEmitter();
+      });
+
+      await server.listen(callbackSpy);
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(callbackSpy).toHaveBeenCalledOnce();
+    });
+    describe('when the channel setup fails', () => {
+      const setupError = new Error('PRECONDITION_FAILED');
+      let channel: EventEmitter;
+      const listenCallback = vi.fn<(err?: unknown) => void>();
+      let logError: ReturnType<typeof vi.spyOn>;
+
+      beforeEach(() => {
+        listenCallback.mockClear();
+        logError = vi
+          .spyOn(server['logger'], 'error')
+          .mockImplementation(() => {});
+        channel = new EventEmitter();
+        createChannelStub.mockReturnValue(channel);
+      });
+
+      it('should close the server, then call the callback once with the setup error', async () => {
+        const close = vi.spyOn(server, 'close').mockResolvedValue();
+        await server.listen(listenCallback);
+        channel.emit('error', setupError);
+        channel.emit('error', setupError);
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(close).toHaveBeenCalledOnce();
+        expect(listenCallback).toHaveBeenCalledOnce();
+        expect(listenCallback).toHaveBeenCalledWith(setupError);
+      });
+
+      it('should log the setup error', async () => {
+        await server.listen(listenCallback);
+        channel.emit('error', setupError);
+
+        expect(logError).toHaveBeenCalledWith(setupError);
+      });
+
+      it('should log a later setup error without calling the callback again', async () => {
+        setupChannelStub.mockImplementation(async (_channel, setupCallback) =>
+          setupCallback(),
+        );
+        createChannelStub.mockImplementation(({ setup }) => {
+          void setup({});
+          return channel;
+        });
+        await server.listen(listenCallback);
+        await new Promise(resolve => setImmediate(resolve));
+
+        const close = vi.spyOn(server, 'close').mockResolvedValue();
+
+        expect(() => channel.emit('error', setupError)).not.toThrow();
+        await new Promise(resolve => setImmediate(resolve));
+        expect(logError).toHaveBeenCalledWith(setupError);
+        expect(close).not.toHaveBeenCalled();
+        expect(listenCallback).toHaveBeenCalledOnce();
+        expect(listenCallback).toHaveBeenCalledWith();
+      });
+    });
+    describe('when the connection attempts run out', () => {
+      const connectionError = new Error('ECONNREFUSED');
+      let listenCallback: ReturnType<typeof vi.fn<(err?: unknown) => void>>;
+
+      beforeEach(() => {
+        client = Object.assign(new EventEmitter(), {
+          createChannel: createChannelStub,
+        });
+        vi.spyOn(server, 'close').mockResolvedValue();
+        vi.spyOn(server['logger'], 'error').mockImplementation(() => {});
+        listenCallback = vi.fn<(err?: unknown) => void>();
+      });
+      it('should call the callback once with the connection error', async () => {
+        untypedServer.options = { maxConnectionAttempts: 1 };
+
+        await server.listen(listenCallback);
+        client.emit('connectFailed', { err: connectionError });
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(listenCallback).toHaveBeenCalledOnce();
+        expect(listenCallback).toHaveBeenCalledWith(connectionError);
+      });
+      it('should still call the callback when closing fails', async () => {
+        const closeError = new Error('close failed');
+        untypedServer.options = { maxConnectionAttempts: 1 };
+        vi.spyOn(server, 'close').mockRejectedValue(closeError);
+        const logError = vi.spyOn(server['logger'], 'error');
+
+        await server.listen(listenCallback);
+        client.emit('connectFailed', { err: connectionError });
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(logError).toHaveBeenCalledWith(closeError);
+        expect(listenCallback).toHaveBeenCalledExactlyOnceWith(connectionError);
+      });
+      it('should call the callback once the last of several attempts fails', async () => {
+        untypedServer.options = { maxConnectionAttempts: 3 };
+
+        await server.listen(listenCallback);
+        client.emit('connectFailed', { err: new Error('first attempt') });
+        client.emit('connectFailed', { err: new Error('second attempt') });
+        await new Promise(resolve => setImmediate(resolve));
+        expect(listenCallback).not.toHaveBeenCalled();
+
+        client.emit('connectFailed', { err: connectionError });
+        await new Promise(resolve => setImmediate(resolve));
+        expect(listenCallback).toHaveBeenCalledExactlyOnceWith(connectionError);
+      });
+      it('should count the attempts of a later listen() from zero', async () => {
+        untypedServer.options = { maxConnectionAttempts: 2 };
+        await server.listen(listenCallback);
+        client.emit('connectFailed', { err: new Error('first attempt') });
+        client.emit('connectFailed', { err: connectionError });
+        await new Promise(resolve => setImmediate(resolve));
+        expect(listenCallback).toHaveBeenCalledExactlyOnceWith(connectionError);
+
+        client = Object.assign(new EventEmitter(), {
+          createChannel: createChannelStub,
+        });
+        const secondListenCallback = vi.fn<(err?: unknown) => void>();
+        await server.listen(secondListenCallback);
+        client.emit('connectFailed', { err: new Error('first attempt') });
+        await new Promise(resolve => setImmediate(resolve));
+        expect(secondListenCallback).not.toHaveBeenCalled();
+
+        client.emit('connectFailed', { err: connectionError });
+        await new Promise(resolve => setImmediate(resolve));
+        expect(secondListenCallback).toHaveBeenCalledExactlyOnceWith(
+          connectionError,
+        );
+      });
+    });
+    describe('when listening again after "close"', () => {
+      let channel: EventEmitter;
+      let secondListenCallback: ReturnType<
+        typeof vi.fn<(err?: unknown) => void>
+      >;
+
+      beforeEach(() => {
+        createClient.mockImplementation(async () => {
+          client = Object.assign(new EventEmitter(), {
+            close: vi.fn().mockResolvedValue(undefined),
+            createChannel: createChannelStub,
+          });
+          return client;
+        });
+        createChannelStub.mockImplementation(({ setup }) => {
+          channel = Object.assign(new EventEmitter(), {
+            close: vi.fn().mockResolvedValue(undefined),
+          });
+          void setup({});
+          return channel;
+        });
+        setupChannelStub.mockImplementation(async (_channel, setupCallback) =>
+          setupCallback(),
+        );
+        vi.spyOn(server['logger'], 'error').mockImplementation(() => {});
+        secondListenCallback = vi.fn<(err?: unknown) => void>();
+      });
+      it('should set a channel up again and call the callback', async () => {
+        await server.listen(callbackSpy);
+        client.emit('connect');
+        await server.close();
+
+        await server.listen(secondListenCallback);
+        client.emit('connect');
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(createChannelStub).toHaveBeenCalledTimes(2);
+        expect(secondListenCallback).toHaveBeenCalledExactlyOnceWith();
+      });
+      it('should consume again', async () => {
+        setupChannelStub.mockRestore();
+        const rawChannel = {
+          assertQueue: vi.fn(() => ({ queue: 'test' })),
+          prefetch: vi.fn(),
+          consume: vi.fn(() => ({ consumerTag: 'amq.ctag-test' })),
+        };
+        createChannelStub.mockImplementation(({ setup }) => {
+          channel = Object.assign(new EventEmitter(), {
+            close: vi.fn().mockResolvedValue(undefined),
+          });
+          void setup(rawChannel);
+          return channel;
+        });
+        await server.listen(callbackSpy);
+        client.emit('connect');
+        await new Promise(resolve => setImmediate(resolve));
+        await server.close();
+
+        await server.listen(secondListenCallback);
+        client.emit('connect');
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(rawChannel.consume).toHaveBeenCalledTimes(2);
+        expect(secondListenCallback).toHaveBeenCalledExactlyOnceWith();
+      });
+      it('should call the callback after a listen whose channel setup failed', async () => {
+        const setupError = new Error('NOT_FOUND');
+        setupChannelStub.mockImplementationOnce(async () => {});
+        await server.listen(callbackSpy);
+        client.emit('connect');
+        channel.emit('error', setupError);
+        await new Promise(resolve => setImmediate(resolve));
+        expect(callbackSpy).toHaveBeenCalledExactlyOnceWith(setupError);
+
+        await server.listen(secondListenCallback);
+        client.emit('connect');
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(secondListenCallback).toHaveBeenCalledExactlyOnceWith();
+      });
+      it('should count the connection attempts again', async () => {
+        const connectionError = new Error('ECONNREFUSED');
+        untypedServer.options = { maxConnectionAttempts: 1 };
+        await server.listen(callbackSpy);
+        client.emit('connect');
+        await server.close();
+
+        await server.listen(secondListenCallback);
+        client.emit('connectFailed', { err: connectionError });
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(secondListenCallback).toHaveBeenCalledExactlyOnceWith(
+          connectionError,
+        );
+      });
+    });
+    it('should close the new connection when closed while creating it', async () => {
+      let resolveClient!: (value: any) => void;
+      const pendingClient = {
+        close: vi.fn().mockResolvedValue(undefined),
+        on: vi.fn(),
+        once: vi.fn(),
+      };
+      createClient.mockImplementation(
+        () =>
+          new Promise(resolve => {
+            resolveClient = resolve;
+          }),
+      );
+
+      const listenPromise = server.listen(callbackSpy);
+      await server.close();
+      resolveClient(pendingClient);
+      await listenPromise;
+
+      expect(pendingClient.close).toHaveBeenCalledOnce();
+      expect(pendingClient.once).not.toHaveBeenCalled();
+      expect(pendingClient.on).not.toHaveBeenCalled();
+      expect(untypedServer.server).toBeNull();
+      expect(callbackSpy).toHaveBeenCalledExactlyOnceWith(
+        new Error('Connection closed'),
+      );
+    });
+    describe('when "start" throws an exception', () => {
+      it('should call callback with a thrown error as an argument', async () => {
+        const error = new Error('random error');
+
+        vi.spyOn(server, 'start').mockImplementation(() => {
+          throw error;
+        });
+        await server.listen(callbackSpy);
+        expect(callbackSpy).toHaveBeenCalledWith(error);
+      });
     });
   });
   describe('close', () => {
-    const rmqServer = { close: sinon.spy() };
-    const rmqChannel = { close: sinon.spy() };
+    const rmqServer = { close: vi.fn() };
+    const rmqChannel = { close: vi.fn() };
 
     beforeEach(() => {
-      (server as any).server = rmqServer;
-      (server as any).channel = rmqChannel;
+      untypedServer.server = rmqServer;
+      untypedServer.channel = rmqChannel;
     });
-    it('should close server', () => {
-      server.close();
-      expect(rmqServer.close.called).to.be.true;
+    it('should close server', async () => {
+      await server.close();
+      expect(rmqServer.close).toHaveBeenCalled();
     });
-    it('should close channel', () => {
-      server.close();
-      expect(rmqChannel.close.called).to.be.true;
+    it('should close channel', async () => {
+      await server.close();
+      expect(rmqChannel.close).toHaveBeenCalled();
+    });
+    it('should close the channel before the connection', async () => {
+      let closeChannel!: () => void;
+      untypedServer.channel = {
+        close: vi.fn(
+          () => new Promise<void>(resolve => (closeChannel = resolve)),
+        ),
+      };
+      const connection = { close: vi.fn() };
+      untypedServer.server = connection;
+
+      const closing = server.close();
+      await new Promise(resolve => setImmediate(resolve));
+      expect(connection.close).not.toHaveBeenCalled();
+
+      closeChannel();
+      await closing;
+      expect(connection.close).toHaveBeenCalledOnce();
+    });
+    it('should close the connection when closing the channel fails', async () => {
+      const channelError = new Error('channel close failed');
+      untypedServer.channel = {
+        close: vi.fn().mockRejectedValue(channelError),
+      };
+      const connection = { close: vi.fn() };
+      untypedServer.server = connection;
+
+      await expect(server.close()).rejects.toBe(channelError);
+      expect(connection.close).toHaveBeenCalledOnce();
+    });
+    it('should log the connection close error when both closes fail', async () => {
+      const channelError = new Error('channel close failed');
+      const connectionError = new Error('connection close failed');
+      untypedServer.channel = {
+        close: vi.fn().mockRejectedValue(channelError),
+      };
+      untypedServer.server = {
+        close: vi.fn().mockRejectedValue(connectionError),
+      };
+      const logError = vi
+        .spyOn(server['logger'], 'error')
+        .mockImplementation(() => {});
+
+      await expect(server.close()).rejects.toBe(channelError);
+      expect(logError).toHaveBeenCalledWith(connectionError);
+    });
+    it('should not cancel the consumer nor wait without "gracefulShutdown"', async () => {
+      const consumerChannel = { cancel: vi.fn() };
+      untypedServer.consumer = {
+        channel: consumerChannel,
+        consumerTag: 'amq.ctag-test',
+      };
+      const waitSpy = vi.spyOn(untypedServer, 'waitForHandlersInFlight');
+
+      await server.close();
+
+      expect(consumerChannel.cancel).not.toHaveBeenCalled();
+      expect(waitSpy).not.toHaveBeenCalled();
+    });
+    it('should not set the channel up, and so consume, once it is closing', async () => {
+      const channel = {
+        assertQueue: vi.fn(() => ({ queue: 'test' })),
+        prefetch: vi.fn(),
+        consume: vi.fn(() => ({ consumerTag: 'amq.ctag-test' })),
+      };
+      const callback = vi.fn();
+
+      await server.close();
+      // The channel wrapper runs the setup again on every reconnection
+      await server.setupChannel(channel, callback);
+
+      expect(channel.assertQueue).not.toHaveBeenCalled();
+      expect(channel.consume).not.toHaveBeenCalled();
+      expect(callback).not.toHaveBeenCalled();
+    });
+
+    describe('with "gracefulShutdown"', () => {
+      function createGracefulServer(options: Record<string, unknown> = {}) {
+        const gracefulServer = new ServerRMQ({
+          gracefulShutdown: true,
+          ...options,
+        });
+        const consumerChannel = {
+          cancel: vi.fn().mockResolvedValue(undefined),
+        };
+        const channel = { close: vi.fn() };
+        const connection = { close: vi.fn() };
+        Object.assign(gracefulServer, {
+          server: connection,
+          channel,
+          consumer: { channel: consumerChannel, consumerTag: 'amq.ctag-test' },
+        });
+        const waitSpy = vi
+          .spyOn(gracefulServer as any, 'waitForHandlersInFlight')
+          .mockResolvedValue(undefined);
+        return {
+          gracefulServer,
+          consumerChannel,
+          channel,
+          connection,
+          waitSpy,
+        };
+      }
+
+      it('should cancel the consumer, wait for the handlers in flight, then close', async () => {
+        const {
+          gracefulServer,
+          consumerChannel,
+          channel,
+          connection,
+          waitSpy,
+        } = createGracefulServer();
+
+        await gracefulServer.close();
+
+        expect(consumerChannel.cancel).toHaveBeenCalledExactlyOnceWith(
+          'amq.ctag-test',
+        );
+        const [cancelled] = consumerChannel.cancel.mock.invocationCallOrder;
+        const [waited] = waitSpy.mock.invocationCallOrder;
+        const [channelClosed] = channel.close.mock.invocationCallOrder;
+        const [connectionClosed] = connection.close.mock.invocationCallOrder;
+        expect(cancelled).toBeLessThan(waited);
+        expect(waited).toBeLessThan(channelClosed);
+        expect(channelClosed).toBeLessThan(connectionClosed);
+      });
+
+      it('should keep the channel and the connection open while handlers are in flight, so that they can acknowledge and reply', async () => {
+        const { gracefulServer, channel, connection, waitSpy } =
+          createGracefulServer();
+        let finish!: () => void;
+        waitSpy.mockReturnValue(new Promise<void>(res => (finish = res)));
+
+        const closing = gracefulServer.close();
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(channel.close).not.toHaveBeenCalled();
+        expect(connection.close).not.toHaveBeenCalled();
+
+        finish();
+        await closing;
+
+        expect(channel.close).toHaveBeenCalledOnce();
+        expect(connection.close).toHaveBeenCalledOnce();
+      });
+
+      it('should not set the channel up again when the connection is restored while it waits', async () => {
+        const { gracefulServer, waitSpy } = createGracefulServer();
+        let finish!: () => void;
+        waitSpy.mockReturnValue(new Promise<void>(res => (finish = res)));
+        const restoredChannel = {
+          assertQueue: vi.fn(() => ({ queue: 'test' })),
+          prefetch: vi.fn(),
+          consume: vi.fn(() => ({ consumerTag: 'amq.ctag-restored' })),
+        };
+
+        const closing = gracefulServer.close();
+        await new Promise(resolve => setImmediate(resolve));
+        await gracefulServer.setupChannel(restoredChannel, vi.fn());
+
+        expect(restoredChannel.consume).not.toHaveBeenCalled();
+
+        finish();
+        await closing;
+      });
+
+      it('should wait for "gracePeriod" at most', async () => {
+        const { gracefulServer, waitSpy } = createGracefulServer({
+          gracePeriod: 500,
+        });
+
+        await gracefulServer.close();
+
+        expect(waitSpy).toHaveBeenCalledExactlyOnceWith(500);
+      });
+
+      it('should still close when the consumer cannot be cancelled', async () => {
+        const {
+          gracefulServer,
+          consumerChannel,
+          channel,
+          connection,
+          waitSpy,
+        } = createGracefulServer();
+        consumerChannel.cancel.mockRejectedValue(new Error('Channel closed'));
+
+        await expect(gracefulServer.close()).resolves.toBeUndefined();
+
+        expect(waitSpy).toHaveBeenCalledOnce();
+        expect(channel.close).toHaveBeenCalledOnce();
+        expect(connection.close).toHaveBeenCalledOnce();
+      });
+
+      it('should still close when the consumer channel throws instead of rejecting', async () => {
+        const { gracefulServer, consumerChannel, channel, connection } =
+          createGracefulServer();
+        // amqplib throws on a channel that is already closed
+        consumerChannel.cancel.mockImplementation(() => {
+          throw new Error('Channel closed');
+        });
+
+        await expect(gracefulServer.close()).resolves.toBeUndefined();
+
+        expect(channel.close).toHaveBeenCalledOnce();
+        expect(connection.close).toHaveBeenCalledOnce();
+      });
+
+      it('should not wait when the server never consumed, as nothing can be in flight', async () => {
+        const { gracefulServer, channel, connection, waitSpy } =
+          createGracefulServer();
+        Object.assign(gracefulServer, { consumer: null });
+
+        await expect(gracefulServer.close()).resolves.toBeUndefined();
+
+        expect(waitSpy).not.toHaveBeenCalled();
+        expect(channel.close).toHaveBeenCalledOnce();
+        expect(connection.close).toHaveBeenCalledOnce();
+      });
+
+      it('should not wait again when it is closed a second time', async () => {
+        const { gracefulServer, consumerChannel, waitSpy } =
+          createGracefulServer();
+
+        await gracefulServer.close();
+        await gracefulServer.close();
+
+        expect(consumerChannel.cancel).toHaveBeenCalledOnce();
+        expect(waitSpy).toHaveBeenCalledOnce();
+      });
+
+      it('should let a close() that overlaps the first one wait as well, instead of closing under it', async () => {
+        const { gracefulServer, channel, waitSpy } = createGracefulServer();
+        let finish!: () => void;
+        waitSpy.mockReturnValue(new Promise<void>(res => (finish = res)));
+
+        const first = gracefulServer.close();
+        const second = gracefulServer.close();
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(channel.close).not.toHaveBeenCalled();
+
+        finish();
+        await Promise.all([first, second]);
+      });
+
+      it('should not close the connection under the channel that an overlapping close() is closing', async () => {
+        const { gracefulServer, channel, connection, waitSpy } =
+          createGracefulServer();
+        let finish!: () => void;
+        waitSpy.mockReturnValue(new Promise<void>(res => (finish = res)));
+        let channelClosed!: () => void;
+        channel.close.mockReturnValue(
+          new Promise<void>(res => (channelClosed = res)),
+        );
+
+        const first = gracefulServer.close();
+        const second = gracefulServer.close();
+        finish();
+        await new Promise(resolve => setImmediate(resolve));
+
+        // amqplib settles the channel close on the broker's reply, which
+        // never arrives once the connection is closed
+        expect(channel.close).toHaveBeenCalledOnce();
+        expect(connection.close).not.toHaveBeenCalled();
+
+        channelClosed();
+        await Promise.all([first, second]);
+
+        expect(connection.close).toHaveBeenCalledOnce();
+      });
+
+      it('should wait for the handlers only once the broker has cancelled the consumer', async () => {
+        const { gracefulServer, consumerChannel, waitSpy } =
+          createGracefulServer();
+        let cancelled!: () => void;
+        consumerChannel.cancel.mockReturnValue(
+          new Promise<void>(res => (cancelled = res)),
+        );
+
+        const closing = gracefulServer.close();
+        await new Promise(resolve => setImmediate(resolve));
+
+        // Until then, the broker still delivers messages to the server
+        expect(waitSpy).not.toHaveBeenCalled();
+
+        cancelled();
+        await closing;
+
+        expect(waitSpy).toHaveBeenCalledOnce();
+      });
+
+      it('should close a server that never listened', async () => {
+        const neverListened = new ServerRMQ({ gracefulShutdown: true });
+
+        await expect(neverListened.close()).resolves.toBeUndefined();
+      });
     });
   });
 
   describe('handleMessage', () => {
-    const createMessage = payload => ({
+    const createRawMessage = (content: string) => ({
       content: {
-        toString: () => JSON.stringify(payload),
+        toString: () => content,
       },
       properties: { correlationId: 1 },
     });
+    const createMessage = payload => createRawMessage(JSON.stringify(payload));
+    // "JSON.parse" copes with this depth but "JSON.stringify" throws a RangeError
+    const createDeeplyNestedJson = (depth: number) =>
+      '{"nested":'.repeat(depth) + '{}' + '}'.repeat(depth);
     const pattern = 'test';
     const msg = createMessage({
       pattern,
       data: 'tests',
       id: '3',
     });
-    let sendMessageStub: sinon.SinonStub;
+    const channel = {
+      nack: vi.fn(),
+    };
+
+    let sendMessageStub: ReturnType<typeof vi.fn>;
 
     beforeEach(() => {
-      sendMessageStub = sinon.stub(server, 'sendMessage').callsFake(() => ({}));
+      sendMessageStub = vi
+        .spyOn(server, 'sendMessage')
+        .mockResolvedValue(undefined);
+      untypedServer.channel = channel;
     });
-    it('should call "handleEvent" if identifier is not present', () => {
-      const handleEventSpy = sinon.spy(server, 'handleEvent');
-      server.handleMessage(createMessage({ pattern: '', data: '' }), '');
-      expect(handleEventSpy.called).to.be.true;
+    afterEach(() => {
+      channel.nack.mockReset();
+    });
+    it('should call "handleEvent" if identifier is not present', async () => {
+      const handleEventSpy = vi.spyOn(server, 'handleEvent');
+      await server.handleMessage(createMessage({ pattern: '', data: '' }), '');
+      expect(handleEventSpy).toHaveBeenCalled();
+    });
+    it('should expose the message headers as packet metadata on the context', async () => {
+      const handleEventSpy = vi
+        .spyOn(server, 'handleEvent')
+        .mockResolvedValue(undefined);
+      const message = {
+        ...createMessage({ pattern, data: 'tests' }),
+        properties: { headers: { 'x-request-id': 'trace-1', 'x-count': 1 } },
+      };
+
+      await server.handleMessage(message, channel);
+
+      const context: RmqContext = handleEventSpy.mock.calls[0][2];
+      expect(context.getMetadata()).toEqual({ 'x-request-id': 'trace-1' });
+    });
+    it('should send NO_MESSAGE_HANDLER error if pattern is too deeply nested to be serialized', async () => {
+      const deeplyNestedMsg = createRawMessage(
+        `{"pattern":${createDeeplyNestedJson(100_000)},"data":"tests","id":"3"}`,
+      );
+      await server.handleMessage(deeplyNestedMsg, '');
+      expect(sendMessageStub).toHaveBeenCalledWith(
+        {
+          id: '3',
+          err: NO_MESSAGE_HANDLER,
+          status: 'error',
+        },
+        undefined,
+        1,
+        expect.any(RmqContext),
+      );
     });
     it('should send NO_MESSAGE_HANDLER error if key does not exists in handlers object', async () => {
       await server.handleMessage(msg, '');
-      expect(
-        sendMessageStub.calledWith({
+      expect(sendMessageStub).toHaveBeenCalledWith(
+        {
           id: '3',
           status: 'error',
           err: NO_MESSAGE_HANDLER,
-        }),
-      ).to.be.true;
+        },
+        undefined,
+        1,
+        expect.any(RmqContext),
+      );
+    });
+    it('should reject with the publish error if the NO_MESSAGE_HANDLER reply cannot be sent', async () => {
+      const error = new Error('Channel closed');
+      sendMessageStub.mockRejectedValueOnce(error);
+      await expect(server.handleMessage(msg, '')).rejects.toBe(error);
     });
     it('should call handler if exists in handlers object', async () => {
-      const handler = sinon.spy();
-      (server as any).messageHandlers = objectToMap({
+      const handler = vi.fn();
+      untypedServer.messageHandlers = objectToMap({
         [pattern]: handler as any,
       });
       await server.handleMessage(msg, '');
-      expect(handler.calledOnce).to.be.true;
+      expect(handler).toHaveBeenCalledOnce();
+    });
+    it('should still reply with an event handler, but warn once that this is deprecated', async () => {
+      const handler = Object.assign(async () => 'stored', {
+        isEventHandler: true,
+      });
+      untypedServer.messageHandlers = objectToMap({ [pattern]: handler });
+      const warnSpy = vi
+        .spyOn(untypedServer.logger, 'warn')
+        .mockImplementation(() => {});
+
+      await server.handleMessage(msg, '');
+      await server.handleMessage(msg, '');
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(sendMessageStub).toHaveBeenCalledTimes(2);
+      expect(sendMessageStub).toHaveBeenCalledWith(
+        { response: 'stored', isDisposed: true },
+        undefined,
+        1,
+        expect.any(RmqContext),
+      );
+      expect(warnSpy).toHaveBeenCalledOnce();
+      expect(warnSpy.mock.calls[0][0]).toMatch(
+        /^DEPRECATED! .* Pattern: test$/,
+      );
+    });
+    it('should not throw if the message is an invalid json', async () => {
+      const invalidMsg = {
+        content: {
+          toString: () => 'd',
+        },
+        properties: { correlationId: 1 },
+      };
+      const handler = vi.fn();
+      untypedServer.messageHandlers = objectToMap({
+        [pattern]: handler as any,
+      });
+
+      return server.handleMessage(invalidMsg, '').catch(() => {
+        throw new Error('Was not supposed to throw an error');
+      });
+    });
+    it('should negative acknowledge if message does not exists in handlers object and noAck option is false', async () => {
+      untypedServer.noAck = false;
+      await server.handleMessage(msg, '');
+      expect(channel.nack).toHaveBeenCalledWith(msg, false, false);
+      expect(sendMessageStub).toHaveBeenCalledWith(
+        {
+          id: '3',
+          status: 'error',
+          err: NO_MESSAGE_HANDLER,
+        },
+        undefined,
+        1,
+        expect.any(RmqContext),
+      );
+    });
+    it('should not negative acknowledge if key does not exists in handlers object and noAck option is true', async () => {
+      await server.handleMessage(msg, '');
+      expect(channel.nack).not.toHaveBeenCalled();
+      expect(sendMessageStub).toHaveBeenCalledWith(
+        {
+          id: '3',
+          status: 'error',
+          err: NO_MESSAGE_HANDLER,
+        },
+        undefined,
+        1,
+        expect.any(RmqContext),
+      );
+    });
+
+    describe('when "wildcards" is enabled', () => {
+      const delivery = (
+        fields: { exchange: string; routingKey: string },
+        payload: Record<string, any>,
+      ) => ({ ...createMessage(payload), fields });
+
+      let publicHandler: ReturnType<typeof vi.fn>;
+      let adminHandler: ReturnType<typeof vi.fn>;
+      let createHandler: ReturnType<typeof vi.fn>;
+      let publicEventHandler: ReturnType<typeof vi.fn>;
+      let adminEventHandler: ReturnType<typeof vi.fn>;
+      let warnSpy: ReturnType<typeof vi.spyOn>;
+
+      const useServer = (options: Record<string, any> = {}) => {
+        server = new ServerRMQ({
+          queue: 'accounts',
+          wildcards: true,
+          ...options,
+        });
+        untypedServer = server as any;
+        untypedServer.channel = channel;
+        sendMessageStub = vi
+          .spyOn(server, 'sendMessage')
+          .mockResolvedValue(undefined);
+        warnSpy = vi
+          .spyOn(untypedServer.logger, 'warn')
+          .mockImplementation(() => {});
+
+        publicHandler = vi.fn().mockResolvedValue('public');
+        adminHandler = vi.fn().mockResolvedValue('admin');
+        createHandler = vi.fn().mockResolvedValue('created');
+        publicEventHandler = vi.fn();
+        adminEventHandler = vi.fn();
+        server.addHandler('public.*', publicHandler as any);
+        server.addHandler('admin.purge', adminHandler as any);
+        server.addHandler(
+          { role: 'user', cmd: 'create' },
+          createHandler as any,
+        );
+        server.addHandler('public.*.created', publicEventHandler as any, true);
+        server.addHandler('admin.purged', adminEventHandler as any, true);
+        untypedServer.initializeWildcardHandlersIfExist();
+      };
+
+      beforeEach(() => useServer());
+
+      const expectDropped = () => {
+        expect(warnSpy).toHaveBeenCalledOnce();
+        expect(adminHandler).not.toHaveBeenCalled();
+        expect(adminEventHandler).not.toHaveBeenCalled();
+        expect(publicHandler).not.toHaveBeenCalled();
+        expect(sendMessageStub).not.toHaveBeenCalled();
+      };
+
+      it('should drop a request whose pattern names another handler than its routing key', async () => {
+        await server.handleMessage(
+          delivery(
+            { exchange: 'accounts', routingKey: 'public.info' },
+            { pattern: 'admin.purge', data: 'account-4', id: '3' },
+          ),
+          channel,
+        );
+
+        expectDropped();
+      });
+
+      it('should drop an event whose pattern names another handler than its routing key', async () => {
+        await server.handleMessage(
+          delivery(
+            { exchange: 'accounts', routingKey: 'public.account.created' },
+            { pattern: 'admin.purged', data: 'account-4' },
+          ),
+          channel,
+        );
+
+        expectDropped();
+        expect(publicEventHandler).not.toHaveBeenCalled();
+      });
+
+      it('should negative acknowledge it without requeue when noAck option is false', async () => {
+        useServer({ noAck: false });
+        const message = delivery(
+          { exchange: 'accounts', routingKey: 'public.info' },
+          { pattern: 'admin.purge', data: 'account-4', id: '3' },
+        );
+
+        await server.handleMessage(message, channel);
+
+        expectDropped();
+        expect(channel.nack).toHaveBeenCalledWith(message, false, false);
+      });
+
+      it('should not read the routing key as json', async () => {
+        server.addHandler('#', vi.fn() as any);
+        untypedServer.wildcardHandlers.clear();
+        untypedServer.initializeWildcardHandlersIfExist();
+
+        await server.handleMessage(
+          delivery(
+            { exchange: 'accounts', routingKey: '"admin.purge"' },
+            { pattern: 'admin.purge', data: 'account-4', id: '3' },
+          ),
+          channel,
+        );
+
+        expectDropped();
+      });
+
+      it.each([
+        ['an exact pattern', 'admin.purge', 'admin.purge', () => adminHandler],
+        [
+          'a wildcard pattern',
+          'public.info',
+          'public.info',
+          () => publicHandler,
+        ],
+        [
+          'an object pattern, by its normalized form',
+          '{"cmd":"create","role":"user"}',
+          { role: 'user', cmd: 'create' },
+          () => createHandler,
+        ],
+      ])(
+        'should run the handler of %s, as ClientRMQ publishes it',
+        async (_, routingKey, pattern, getHandler) => {
+          await server.handleMessage(
+            delivery(
+              { exchange: 'accounts', routingKey },
+              { pattern, data: 'data', id: '3' },
+            ),
+            channel,
+          );
+
+          expect(warnSpy).not.toHaveBeenCalled();
+          expect(getHandler()).toHaveBeenCalledOnce();
+        },
+      );
+
+      it.each([
+        ['to the queue itself', { exchange: '', routingKey: 'accounts' }, {}],
+        [
+          'through another exchange',
+          { exchange: 'retries', routingKey: 'public.info' },
+          {},
+        ],
+        [
+          'through the binding of the "routingKey" option',
+          { exchange: 'accounts', routingKey: 'legacy.orders' },
+          { routingKey: 'legacy.#' },
+        ],
+        [
+          'through a fanout exchange',
+          { exchange: 'accounts', routingKey: 'public.info' },
+          { exchangeType: 'fanout' },
+        ],
+      ])(
+        'should pick the handler by the pattern of a message published %s',
+        async (_, fields, options) => {
+          useServer(options);
+
+          await server.handleMessage(
+            delivery(fields, { pattern: 'admin.purge', data: 'data', id: '3' }),
+            channel,
+          );
+
+          expect(warnSpy).not.toHaveBeenCalled();
+          expect(adminHandler).toHaveBeenCalledOnce();
+        },
+      );
+
+      it('should still answer a request no handler matches', async () => {
+        await server.handleMessage(
+          delivery(
+            { exchange: 'accounts', routingKey: 'orders.info' },
+            { pattern: 'orders.info', data: 'data', id: '3' },
+          ),
+          channel,
+        );
+
+        expect(warnSpy).not.toHaveBeenCalled();
+        expect(sendMessageStub).toHaveBeenCalledWith(
+          { id: '3', status: 'error', err: NO_MESSAGE_HANDLER },
+          undefined,
+          1,
+          expect.any(RmqContext),
+        );
+      });
+    });
+
+    describe('when the id of a request is neither a number nor a short string', () => {
+      // The NO_MESSAGE_HANDLER reply carries a copy of the id
+      const withId = (id: unknown) => createMessage({ pattern, data: '', id });
+
+      it.each([
+        ['a long string', 'a'.repeat(257)],
+        ['an array', [[['3']]]],
+        ['an object', { nested: {} }],
+      ])(
+        'should not answer a request for an unknown pattern whose id is %s',
+        async (_, id) => {
+          await expect(server.handleMessage(withId(id), '')).rejects.toThrow(
+            InvalidPacketIdException,
+          );
+          expect(sendMessageStub).not.toHaveBeenCalled();
+        },
+      );
+
+      it('should still negative acknowledge it when noAck option is false', async () => {
+        untypedServer.noAck = false;
+        const message = withId('a'.repeat(257));
+
+        await expect(server.handleMessage(message, '')).rejects.toThrow(
+          InvalidPacketIdException,
+        );
+        expect(channel.nack).toHaveBeenCalledWith(message, false, false);
+        expect(sendMessageStub).not.toHaveBeenCalled();
+      });
+
+      it('should answer a request for an unknown pattern whose id is at the limit', async () => {
+        await server.handleMessage(withId('a'.repeat(256)), '');
+
+        expect(sendMessageStub).toHaveBeenCalledWith(
+          { id: 'a'.repeat(256), status: 'error', err: NO_MESSAGE_HANDLER },
+          undefined,
+          1,
+          expect.any(RmqContext),
+        );
+      });
+
+      it('should still run the handler of a known pattern, whose replies do not carry the id', async () => {
+        const handler = vi.fn().mockResolvedValue('result');
+        untypedServer.messageHandlers = objectToMap({ [pattern]: handler });
+
+        await server.handleMessage(withId('a'.repeat(257)), '');
+
+        expect(handler).toHaveBeenCalledOnce();
+      });
+    });
+
+    describe('when the body exceeds "maxMessageSize"', () => {
+      // The size of '{"pattern":"test","data":"123","id":"3"}'
+      const maxMessageSize = 40;
+      const oversizedContent = () =>
+        Buffer.from(JSON.stringify({ pattern, data: '123', id: '3' }) + ' ');
+      const errorMessage = new MaxPacketLengthExceededException(
+        maxMessageSize + 1,
+      ).message;
+
+      let handler: ReturnType<typeof vi.fn>;
+      let loggerErrorSpy: ReturnType<typeof vi.spyOn>;
+
+      beforeEach(() => {
+        server = new ServerRMQ({ maxMessageSize });
+        untypedServer = server as any;
+        untypedServer.channel = channel;
+        sendMessageStub = vi
+          .spyOn(server, 'sendMessage')
+          .mockResolvedValue(undefined);
+        loggerErrorSpy = vi
+          .spyOn(untypedServer.logger, 'error')
+          .mockImplementation(() => {});
+        handler = vi.fn().mockResolvedValue(undefined);
+        untypedServer.messageHandlers = objectToMap({ [pattern]: handler });
+      });
+
+      it('should log and skip the message without decoding it', async () => {
+        const content = oversizedContent();
+        expect(content.length).toBe(maxMessageSize + 1);
+        const toStringSpy = vi.spyOn(content, 'toString');
+
+        await server.handleMessage({ content, properties: {} }, channel);
+
+        expect(toStringSpy).not.toHaveBeenCalled();
+        expect(handler).not.toHaveBeenCalled();
+        expect(loggerErrorSpy).toHaveBeenCalledExactlyOnceWith(
+          expect.stringContaining(errorMessage),
+        );
+        expect(channel.nack).not.toHaveBeenCalled();
+        expect(sendMessageStub).not.toHaveBeenCalled();
+      });
+
+      it('should negative acknowledge it without requeue when noAck option is false', async () => {
+        untypedServer.noAck = false;
+        const message = { content: oversizedContent(), properties: {} };
+
+        await server.handleMessage(message, channel);
+
+        expect(channel.nack).toHaveBeenCalledWith(message, false, false);
+        expect(handler).not.toHaveBeenCalled();
+      });
+
+      it('should answer a request that names a reply queue with an error', async () => {
+        await server.handleMessage(
+          {
+            content: oversizedContent(),
+            properties: { replyTo: 'reply-queue', correlationId: 'abc' },
+          },
+          channel,
+        );
+
+        expect(handler).not.toHaveBeenCalled();
+        expect(sendMessageStub).toHaveBeenCalledExactlyOnceWith(
+          { id: 'abc', err: errorMessage, status: 'error' },
+          'reply-queue',
+          'abc',
+          expect.any(RmqContext),
+        );
+      });
+
+      it('should handle a message of exactly "maxMessageSize" bytes', async () => {
+        const content = Buffer.from(
+          JSON.stringify({ pattern, data: '123', id: '3' }),
+        );
+        expect(content.length).toBe(maxMessageSize);
+
+        await server.handleMessage({ content, properties: {} }, channel);
+
+        expect(handler).toHaveBeenCalledWith('123', expect.any(RmqContext));
+        expect(loggerErrorSpy).not.toHaveBeenCalled();
+      });
+
+      it('should default to 16 MiB', () => {
+        expect(RMQ_DEFAULT_MAX_MESSAGE_SIZE).toBe(16 * 1024 * 1024);
+        expect(new ServerRMQ({})['maxMessageSize']).toBe(
+          RMQ_DEFAULT_MAX_MESSAGE_SIZE,
+        );
+      });
+
+      it.each([
+        ['NaN', NaN],
+        ['a string', '16mb'],
+      ])('should use the default for %s', (_, maxMessageSize) => {
+        expect(
+          new ServerRMQ({ maxMessageSize: maxMessageSize as number })[
+            'maxMessageSize'
+          ],
+        ).toBe(RMQ_DEFAULT_MAX_MESSAGE_SIZE);
+      });
+
+      it('should keep Infinity', () => {
+        expect(
+          new ServerRMQ({ maxMessageSize: Infinity })['maxMessageSize'],
+        ).toBe(Infinity);
+      });
+    });
+  });
+
+  describe('processing end hook', () => {
+    const pattern = 'test';
+    const message = {
+      content: {
+        toString: () => JSON.stringify({ pattern, data: 'tests', id: '3' }),
+      },
+      properties: { correlationId: 1 },
+    };
+    let sendMessageSpy: ReturnType<typeof vi.fn>;
+    let endHook: ReturnType<typeof vi.fn>;
+
+    const bindHandler = (handler: () => unknown) => {
+      sendMessageSpy = vi
+        .spyOn(server, 'sendMessage')
+        .mockImplementation(() => ({}) as any) as any;
+      untypedServer.channel = { nack: vi.fn() };
+      endHook = vi.fn();
+      untypedServer.onProcessingStartHook = (
+        _transportId: unknown,
+        _ctx: unknown,
+        fn: () => Promise<void>,
+      ) => fn();
+      untypedServer.onProcessingEndHook = endHook;
+      untypedServer.messageHandlers = objectToMap({
+        [pattern]: (async () => handler()) as any,
+      });
+    };
+    const flush = () => new Promise(resolve => setImmediate(resolve));
+
+    it('should run the hook once when the response stream emits several values', async () => {
+      bindHandler(() => of('first', 'second', 'third'));
+
+      await server.handleMessage(message, '');
+      await flush();
+
+      expect(sendMessageSpy).toHaveBeenCalledTimes(3);
+      expect(endHook).toHaveBeenCalledOnce();
+    });
+    it('should run the hook when the handler rejects', async () => {
+      bindHandler(() => {
+        throw new Error('handler failed');
+      });
+
+      await expect(server.handleMessage(message, '')).rejects.toThrow(
+        'handler failed',
+      );
+
+      expect(endHook).toHaveBeenCalledOnce();
     });
   });
   describe('setupChannel', () => {
     const queue = 'test';
+    const exchange = 'test.exchange';
     const queueOptions = {};
     const isGlobalPrefetchCount = true;
     const prefetchCount = 10;
@@ -119,43 +1236,227 @@ describe('ServerRMQ', () => {
     let channel: any = {};
 
     beforeEach(() => {
-      (server as any)['queue'] = queue;
-      (server as any)['queueOptions'] = queueOptions;
-      (server as any)['isGlobalPrefetchCount'] = isGlobalPrefetchCount;
-      (server as any)['prefetchCount'] = prefetchCount;
+      untypedServer['queue'] = queue;
+      untypedServer['queueOptions'] = queueOptions;
+      untypedServer['options'] = {
+        isGlobalPrefetchCount,
+        prefetchCount,
+      };
 
       channel = {
-        assertQueue: sinon.spy(() => ({})),
-        prefetch: sinon.spy(),
-        consume: sinon.spy(),
+        assertQueue: vi.fn(() => ({ queue })),
+        prefetch: vi.fn(),
+        consume: vi.fn(() => ({ consumerTag: 'amq.ctag-test' })),
+        assertExchange: vi.fn(() => ({})),
+        bindQueue: vi.fn(),
       };
     });
-    it('should call "assertQueue" with queue and queue options', async () => {
-      await server.setupChannel(channel, () => null);
-      expect(channel.assertQueue.calledWith(queue, queueOptions)).to.be.true;
+    it('should fail the setup instead of calling back when "consume" rejects', async () => {
+      const consumeError = new Error('NOT_FOUND');
+      channel.consume = vi.fn().mockRejectedValue(consumeError);
+      const callback = vi.fn();
+
+      await expect(server.setupChannel(channel, callback)).rejects.toBe(
+        consumeError,
+      );
+      expect(callback).not.toHaveBeenCalled();
     });
+    it('should call "assertQueue" with queue and queue options when noAssert is false', async () => {
+      server['noAssert' as any] = false;
+
+      await server.setupChannel(channel, () => null);
+      expect(channel.assertQueue).toHaveBeenCalledWith(queue, queueOptions);
+    });
+    it('should call "assertQueue" with queue and queue options when queue is default queue', async () => {
+      server['queue' as any] = RMQ_DEFAULT_QUEUE;
+
+      await server.setupChannel(channel, () => null);
+      expect(channel.assertQueue).toHaveBeenCalledWith(
+        RMQ_DEFAULT_QUEUE,
+        queueOptions,
+      );
+    });
+    it('should not call "assertQueue" when noAssert is true', async () => {
+      server['options' as any] = {
+        ...(server as any)['options'],
+        noAssert: true,
+      };
+
+      await server.setupChannel(channel, () => null);
+      expect(channel.assertQueue).not.toHaveBeenCalled();
+    });
+    it('should call "bindQueue" with exchangeType is fanout', async () => {
+      const namedQueue = 'exclusive-queue-name';
+      channel.assertQueue = vi.fn(() => ({ queue: namedQueue }));
+      server['queue' as any] = RMQ_DEFAULT_QUEUE;
+      server['options' as any] = {
+        ...(server as any)['options'],
+        exchangeType: 'fanout',
+        exchange: exchange,
+      };
+      await server.setupChannel(channel, () => null);
+      expect(channel.bindQueue).toHaveBeenCalledWith(namedQueue, exchange, '');
+    });
+    it('should bind the queue to an exchange named after it when exchangeType is fanout and no exchange is set', async () => {
+      // the client publishes to an exchange named after the queue in this case
+      server['options' as any] = {
+        ...(server as any)['options'],
+        queue,
+        exchangeType: 'fanout',
+      };
+      await server.setupChannel(channel, () => null);
+      expect(channel.assertExchange).toHaveBeenCalledWith(
+        queue,
+        'fanout',
+        expect.any(Object),
+      );
+      expect(channel.bindQueue).toHaveBeenCalledWith(queue, queue, '');
+    });
+    it.each([
+      ['neither an exchange nor a queue is set', {}],
+      ['the exchange is set to undefined', { queue, exchange: undefined }],
+      ['the exchange is set to an empty string', { queue, exchange: '' }],
+    ])(
+      'should not assert an exchange when exchangeType is fanout and %s',
+      async (_, options) => {
+        server['options' as any] = {
+          ...(server as any)['options'],
+          ...options,
+          exchangeType: 'fanout',
+        };
+        await server.setupChannel(channel, () => null);
+        expect(channel.assertExchange).not.toHaveBeenCalled();
+        expect(channel.bindQueue).not.toHaveBeenCalled();
+      },
+    );
     it('should call "prefetch" with prefetchCount and "isGlobalPrefetchCount"', async () => {
       await server.setupChannel(channel, () => null);
-      expect(channel.prefetch.calledWith(prefetchCount, isGlobalPrefetchCount))
-        .to.be.true;
+      expect(channel.prefetch).toHaveBeenCalledWith(
+        prefetchCount,
+        isGlobalPrefetchCount,
+      );
     });
     it('should call "consumeChannel" method', async () => {
       await server.setupChannel(channel, () => null);
-      expect(channel.consume.called).to.be.true;
+      expect(channel.consume).toHaveBeenCalled();
+    });
+    it('should route "handleMessage" rejections to "handleError" instead of leaving them unhandled', async () => {
+      const error = new Error('unexpected');
+      vi.spyOn(server, 'handleMessage').mockRejectedValue(error);
+      const handleErrorSpy = vi
+        .spyOn(untypedServer, 'handleError')
+        .mockImplementation(() => undefined);
+
+      await server.setupChannel(channel, () => null);
+      const [, onMessage] = channel.consume.mock.calls[0];
+      await onMessage({});
+
+      expect(handleErrorSpy).toHaveBeenCalledWith(error);
+    });
+    it('should set the channel up and consume again when the broker cancels the consumer', async () => {
+      const loggerErrorSpy = vi
+        .spyOn(untypedServer.logger, 'error')
+        .mockImplementation(() => {});
+      const callback = vi.fn();
+      await server.setupChannel(channel, callback);
+      const [, onMessage] = channel.consume.mock.calls[0];
+
+      // amqplib calls the consumer with "null" once the broker has cancelled
+      // it, e.g. because its queue was deleted
+      await onMessage(null);
+
+      expect(channel.assertQueue).toHaveBeenCalledTimes(2);
+      expect(channel.consume).toHaveBeenCalledTimes(2);
+      expect(channel.consume.mock.calls[1][0]).toBe(queue);
+      expect(loggerErrorSpy).toHaveBeenCalledWith(
+        CONSUMER_CANCELLED_RMQ_MESSAGE,
+      );
+      expect(callback).toHaveBeenCalledOnce();
     });
     it('should call "resolve" function', async () => {
-      const resolve = sinon.spy();
+      const resolve = vi.fn();
       await server.setupChannel(channel, resolve);
-      expect(resolve.called).to.be.true;
+      expect(resolve).toHaveBeenCalled();
+    });
+    describe('and the server is closed with "gracefulShutdown"', () => {
+      beforeEach(() => {
+        untypedServer['options'].gracefulShutdown = true;
+        vi.spyOn(untypedServer, 'waitForHandlersInFlight').mockResolvedValue(
+          undefined,
+        );
+        channel.cancel = vi.fn().mockResolvedValue(undefined);
+      });
+
+      it('should not consume when it starts closing while the channel is set up', async () => {
+        let assertQueue!: () => void;
+        channel.assertQueue = vi.fn(
+          () => new Promise(res => (assertQueue = () => res({ queue }))),
+        );
+
+        // As the channel wrapper does on a reconnection
+        const settingUp = server.setupChannel(channel, () => null);
+        const closing = server.close();
+        assertQueue();
+        await settingUp;
+        await closing;
+
+        expect(channel.consume).not.toHaveBeenCalled();
+      });
+
+      it('should cancel the consumer under the tag the broker replied with', async () => {
+        await server.setupChannel(channel, () => null);
+
+        await server.close();
+
+        expect(channel.cancel).toHaveBeenCalledExactlyOnceWith('amq.ctag-test');
+      });
+
+      it('should cancel the consumer of the channel set up last, after a reconnection', async () => {
+        const restoredChannel = {
+          ...channel,
+          consume: vi.fn(() => ({ consumerTag: 'amq.ctag-restored' })),
+          cancel: vi.fn().mockResolvedValue(undefined),
+        };
+        await server.setupChannel(channel, () => null);
+        await server.setupChannel(restoredChannel, () => null);
+
+        await server.close();
+
+        expect(channel.cancel).not.toHaveBeenCalled();
+        expect(restoredChannel.cancel).toHaveBeenCalledExactlyOnceWith(
+          'amq.ctag-restored',
+        );
+      });
+
+      it('should not consume again when the broker cancels the consumer while it closes', async () => {
+        vi.spyOn(untypedServer.logger, 'error').mockImplementation(() => {});
+        let finish!: () => void;
+        untypedServer.waitForHandlersInFlight.mockReturnValue(
+          new Promise<void>(res => (finish = res)),
+        );
+        await server.setupChannel(channel, () => null);
+        const [, onMessage] = channel.consume.mock.calls[0];
+
+        const closing = server.close();
+        await new Promise(resolve => setImmediate(resolve));
+        await onMessage(null);
+
+        expect(channel.consume).toHaveBeenCalledOnce();
+
+        finish();
+        await closing;
+      });
     });
   });
 
   describe('sendMessage', () => {
+    const context = new RmqContext([] as any);
+
     let channel: any;
 
     beforeEach(() => {
       channel = {
-        sendToQueue: sinon.spy(),
+        sendToQueue: vi.fn(),
       };
       server['channel'] = channel;
     });
@@ -165,14 +1466,125 @@ describe('ServerRMQ', () => {
       const replyTo = 'test';
       const correlationId = '0';
 
-      server.sendMessage(message, replyTo, correlationId);
-      expect(
-        channel.sendToQueue.calledWith(
+      server.sendMessage(message, replyTo, correlationId, context);
+      expect(channel.sendToQueue).toHaveBeenCalledWith(
+        replyTo,
+        Buffer.from(JSON.stringify(message)),
+        { correlationId },
+      );
+    });
+    it('should reject if the reply cannot be published', async () => {
+      const error = new Error('Channel closed');
+      channel.sendToQueue.mockRejectedValueOnce(error);
+      await expect(
+        server.sendMessage({ test: true }, 'test', '0', context),
+      ).rejects.toBe(error);
+    });
+    describe('when "replyTo" or "correlationId" is too long for AMQP', () => {
+      // amqplib decodes 86 bytes of invalid UTF-8 as 86 replacement
+      // characters, which take 258 bytes to encode again
+      const tooLong = '�'.repeat(86);
+      let loggerErrorSpy: ReturnType<typeof vi.spyOn>;
+
+      beforeEach(() => {
+        loggerErrorSpy = vi
+          .spyOn(untypedServer.logger, 'error')
+          .mockImplementation(() => {});
+      });
+
+      it('should drop the reply and log an error', async () => {
+        await server.sendMessage({ test: true }, tooLong, '0', context);
+        await server.sendMessage({ test: true }, 'test', tooLong, context);
+
+        expect(channel.sendToQueue).not.toHaveBeenCalled();
+        expect(loggerErrorSpy).toHaveBeenCalledTimes(2);
+      });
+      it('should publish values of up to 255 bytes', () => {
+        const longest = 'a'.repeat(255);
+
+        server.sendMessage({ test: true }, longest, longest, context);
+
+        expect(channel.sendToQueue).toHaveBeenCalledWith(
+          longest,
+          expect.any(Buffer),
+          { correlationId: longest },
+        );
+      });
+      it('should publish a reply without "replyTo" as before', () => {
+        server.sendMessage({ test: true }, undefined, '0', context);
+
+        expect(channel.sendToQueue).toHaveBeenCalledWith(
+          undefined,
+          expect.any(Buffer),
+          { correlationId: '0' },
+        );
+      });
+    });
+    describe('when the response is a record', () => {
+      const replyTo = 'test';
+      const correlationId = '0';
+
+      it('should publish the record data as "response" with the record options', () => {
+        const options = { priority: 5, headers: { key: 'value' } };
+        const record = new RmqRecordBuilder({ value: 'test' })
+          .setOptions(options)
+          .build();
+
+        server.sendMessage(
+          { response: record, isDisposed: true },
           replyTo,
-          Buffer.from(JSON.stringify(message)),
-          { correlationId },
-        ),
-      ).to.be.true;
+          correlationId,
+          context,
+        );
+
+        expect(channel.sendToQueue).toHaveBeenCalledWith(
+          replyTo,
+          Buffer.from(
+            JSON.stringify({ response: { value: 'test' }, isDisposed: true }),
+          ),
+          { ...options, correlationId },
+        );
+        expect(record.options).toBe(options);
+      });
+      it('should publish the record sent through "send" unwrapped, with its options, once disposed', async () => {
+        const flush = () => new Promise(resolve => setImmediate(resolve));
+        const options = { priority: 5, headers: { key: 'value' } };
+        const record = new RmqRecordBuilder({ value: 'test' })
+          .setOptions(options)
+          .build();
+
+        server.send(of(record), data =>
+          server.sendMessage(data, replyTo, correlationId, context),
+        );
+        await flush();
+
+        expect(channel.sendToQueue).toHaveBeenCalledExactlyOnceWith(
+          replyTo,
+          Buffer.from(
+            JSON.stringify({ response: { value: 'test' }, isDisposed: true }),
+          ),
+          { ...options, correlationId },
+        );
+      });
+      it('should keep the correlation id of the request when the options set another one', () => {
+        const options = { priority: 5, correlationId: 'other' };
+        const record = new RmqRecordBuilder({ value: 'test' })
+          .setOptions(options)
+          .build();
+
+        server.sendMessage(
+          { response: record },
+          replyTo,
+          correlationId,
+          context,
+        );
+
+        expect(channel.sendToQueue).toHaveBeenCalledWith(
+          replyTo,
+          expect.any(Buffer),
+          { priority: 5, correlationId },
+        );
+      });
     });
   });
 
@@ -180,18 +1592,255 @@ describe('ServerRMQ', () => {
     const channel = 'test';
     const data = 'test';
 
-    it('should call handler with expected arguments', () => {
-      const handler = sinon.spy();
-      (server as any).messageHandlers = objectToMap({
+    it('should call handler with expected arguments', async () => {
+      const handler = vi.fn();
+      untypedServer.messageHandlers = objectToMap({
         [channel]: handler,
       });
 
-      server.handleEvent(
+      await server.handleEvent(
         channel,
         { pattern: '', data },
-        new BaseRpcContext([]),
+        new RmqContext([{}, {}, '']),
       );
-      expect(handler.calledWith(data)).to.be.true;
+      expect(handler).toHaveBeenCalledWith(data, expect.any(RmqContext));
+    });
+
+    it('should negative acknowledge without retrying if key does not exists in handlers object and noAck option is false', async () => {
+      const nack = vi.fn();
+      const message = { pattern: 'no-exists', data };
+      untypedServer.channel = {
+        nack,
+      };
+      untypedServer.noAck = false;
+      await server.handleEvent(
+        channel,
+        message,
+        new RmqContext([message, '', '']),
+      );
+
+      expect(nack).toHaveBeenCalledWith(message, false, false);
+    });
+
+    it('should not negative acknowledge if key does not exists in handlers object but noAck option is true', async () => {
+      const nack = vi.fn();
+      const message = { pattern: 'no-exists', data };
+      untypedServer.channel = {
+        nack,
+      };
+      untypedServer.noAck = true;
+      await server.handleEvent(
+        channel,
+        message,
+        new RmqContext([message, '', '']),
+      );
+
+      expect(nack).not.toHaveBeenCalledWith(message, false, false);
+    });
+  });
+
+  describe('getHandlerByPattern', () => {
+    it('should find the handler of a string pattern that reads as json', () => {
+      const handler = vi.fn();
+      server.addHandler('1.0', handler);
+
+      expect(server.getHandlerByPattern('1.0')).toBe(handler);
+    });
+
+    it('should match a pattern longer than a routing key against exact handlers only', () => {
+      server = new ServerRMQ({ wildcards: true });
+      const longPattern = `users.${'a'.repeat(250)}`;
+      const wildcardHandler = vi.fn();
+      const exactHandler = vi.fn();
+      server.addHandler('users.#', wildcardHandler);
+      (server as any).initializeWildcardHandlersIfExist();
+
+      expect(server.getHandlerByPattern(longPattern)).toBeNull();
+
+      server.addHandler(longPattern, exactHandler);
+      expect(server.getHandlerByPattern(longPattern)).toBe(exactHandler);
+    });
+  });
+
+  describe('matchRmqPattern', () => {
+    let matchRmqPattern: (pattern: string, routingKey: string) => boolean;
+
+    beforeEach(() => {
+      matchRmqPattern = untypedServer.matchRmqPattern.bind(untypedServer);
+    });
+
+    describe('exact matches', () => {
+      it('should match identical patterns', () => {
+        expect(matchRmqPattern('user.created', 'user.created')).toBe(true);
+        expect(matchRmqPattern('order.updated', 'order.updated')).toBe(true);
+      });
+
+      it('should not match different patterns', () => {
+        expect(matchRmqPattern('user.created', 'user.updated')).toBe(false);
+        expect(matchRmqPattern('order.created', 'user.created')).toBe(false);
+      });
+
+      it('should handle patterns with $ character (original issue)', () => {
+        expect(
+          matchRmqPattern('$internal.plugin.status', '$internal.plugin.status'),
+        ).toBe(true);
+        expect(
+          matchRmqPattern(
+            '$internal.plugin.0.status',
+            '$internal.plugin.0.status',
+          ),
+        ).toBe(true);
+        expect(
+          matchRmqPattern('user.$special.event', 'user.$special.event'),
+        ).toBe(true);
+      });
+    });
+
+    describe('single wildcard (*)', () => {
+      it('should match single segments', () => {
+        expect(matchRmqPattern('user.*', 'user.created')).toBe(true);
+        expect(matchRmqPattern('user.*', 'user.updated')).toBe(true);
+        expect(matchRmqPattern('*.created', 'user.created')).toBe(true);
+        expect(matchRmqPattern('*.created', 'order.created')).toBe(true);
+      });
+
+      it('should not match when segment counts differ', () => {
+        expect(matchRmqPattern('user.*', 'user.profile.created')).toBe(false);
+        expect(matchRmqPattern('*.created', 'user.profile.created')).toBe(
+          false,
+        );
+      });
+
+      it('should handle patterns with $ and *', () => {
+        expect(
+          matchRmqPattern(
+            '$internal.plugin.*.status',
+            '$internal.plugin.0.status',
+          ),
+        ).toBe(true);
+        expect(
+          matchRmqPattern(
+            '$internal.plugin.*.status',
+            '$internal.plugin.1.status',
+          ),
+        ).toBe(true);
+        expect(
+          matchRmqPattern('$internal.*.status', '$internal.plugin.status'),
+        ).toBe(true);
+      });
+
+      it('should handle multiple * wildcards', () => {
+        expect(matchRmqPattern('*.*.created', 'user.profile.created')).toBe(
+          true,
+        );
+        expect(matchRmqPattern('*.*.created', 'order.item.created')).toBe(true);
+        expect(matchRmqPattern('*.*.created', 'user.created')).toBe(false);
+      });
+    });
+
+    describe('catch all wildcard (#)', () => {
+      it('should match when # is at the end', () => {
+        expect(matchRmqPattern('user.#', 'user.created')).toBe(true);
+        expect(matchRmqPattern('user.#', 'user.profile.created')).toBe(true);
+        expect(matchRmqPattern('user.#', 'user.profile.details.updated')).toBe(
+          true,
+        );
+      });
+
+      it('should handle patterns with $ and #', () => {
+        expect(matchRmqPattern('$internal.#', '$internal.plugin.status')).toBe(
+          true,
+        );
+        expect(
+          matchRmqPattern('$internal.#', '$internal.plugin.0.status'),
+        ).toBe(true);
+        expect(
+          matchRmqPattern('$internal.plugin.#', '$internal.plugin.0.status'),
+        ).toBe(true);
+      });
+
+      it('should handle # at the beginning', () => {
+        expect(matchRmqPattern('#', 'user.created')).toBe(true);
+        expect(matchRmqPattern('#', 'user.profile.created')).toBe(true);
+        expect(matchRmqPattern('#', 'created')).toBe(true);
+      });
+
+      it('should match when # is followed by other segments', () => {
+        expect(matchRmqPattern('#.error', 'app.error')).toBe(true);
+        expect(matchRmqPattern('#.error', 'app.db.error')).toBe(true);
+        expect(matchRmqPattern('#.error', 'error')).toBe(true);
+        expect(matchRmqPattern('#.error', 'app.warn')).toBe(false);
+        expect(matchRmqPattern('#.error', 'error.app')).toBe(false);
+      });
+
+      it('should match when # is in the middle', () => {
+        expect(matchRmqPattern('app.#.error', 'app.error')).toBe(true);
+        expect(matchRmqPattern('app.#.error', 'app.db.error')).toBe(true);
+        expect(matchRmqPattern('app.#.error', 'app.db.pool.error')).toBe(true);
+        expect(matchRmqPattern('app.#.error', 'app.db.warn')).toBe(false);
+        expect(matchRmqPattern('app.#.error', 'web.db.error')).toBe(false);
+      });
+
+      it('should combine # with *', () => {
+        expect(matchRmqPattern('*.#.error', 'app.error')).toBe(true);
+        expect(matchRmqPattern('*.#.error', 'a.b.c.error')).toBe(true);
+        expect(matchRmqPattern('*.#.error', 'error')).toBe(false);
+        expect(matchRmqPattern('#.*.error', 'app.db.error')).toBe(true);
+        expect(matchRmqPattern('#.*.error', 'error')).toBe(false);
+      });
+    });
+
+    describe('edge cases', () => {
+      it('should handle empty routing key', () => {
+        expect(matchRmqPattern('user.created', '')).toBe(false);
+        expect(matchRmqPattern('*', '')).toBe(false);
+        expect(matchRmqPattern('#', '')).toBe(true);
+        expect(matchRmqPattern('#.#', '')).toBe(true);
+        expect(matchRmqPattern('#.#.#', '')).toBe(true);
+        expect(matchRmqPattern('a.#', '')).toBe(false);
+        expect(matchRmqPattern('#.*', '')).toBe(false);
+      });
+
+      it('should handle single segments', () => {
+        expect(matchRmqPattern('user', 'user')).toBe(true);
+        expect(matchRmqPattern('*', 'user')).toBe(true);
+        expect(matchRmqPattern('#', 'user')).toBe(true);
+      });
+
+      it('should treat empty segments as words', () => {
+        // the broker binds and routes these, so the matcher must accept them
+        expect(matchRmqPattern('a.*', 'a.')).toBe(true);
+        expect(matchRmqPattern('*.*', '.a')).toBe(true);
+        // "#" cannot stand in for a missing word
+        expect(matchRmqPattern('a..#', 'a')).toBe(false);
+      });
+
+      it('should not match a key longer than a routing key may be', () => {
+        // A routing key has at most 255 bytes, so the broker routes none longer
+        expect(matchRmqPattern('#', 'a'.repeat(255))).toBe(true);
+        expect(matchRmqPattern('#', 'a'.repeat(256))).toBe(false);
+        expect(matchRmqPattern('#', '.'.repeat(255))).toBe(true);
+        expect(matchRmqPattern('#', '.'.repeat(256))).toBe(false);
+        expect(matchRmqPattern('users.#', `users.${'a'.repeat(250)}`)).toBe(
+          false,
+        );
+        expect(matchRmqPattern('users.#', `users.${'a'.repeat(249)}`)).toBe(
+          true,
+        );
+      });
+
+      it('should handle complex $ patterns that previously failed', () => {
+        expect(
+          matchRmqPattern(
+            '$exchange.*.routing.#',
+            '$exchange.topic.routing.key.test',
+          ),
+        ).toBe(true);
+        expect(matchRmqPattern('$sys.#', '$sys.broker.clients')).toBe(true);
+        expect(
+          matchRmqPattern('$SYS.#', '$SYS.broker.load.messages.received'),
+        ).toBe(true);
+      });
     });
   });
 });

@@ -1,7 +1,7 @@
 import { Controller, Get, Header, HostParam, Param } from '@nestjs/common';
 import { Observable, of } from 'rxjs';
-import { HostService } from './host.service';
-import { UserByIdPipe } from './users/user-by-id.pipe';
+import { HostService } from './host.service.js';
+import { UserByIdPipe } from './users/user-by-id.pipe.js';
 
 @Controller({
   path: 'host',
@@ -18,7 +18,7 @@ export class HostController {
 
   @Get('async')
   async asyncGreeting(@HostParam('tenant') tenant: string): Promise<string> {
-    return `${await this.hostService.greeting()} tenant=${tenant}`;
+    return `${this.hostService.greeting()} tenant=${tenant}`;
   }
 
   @Get('stream')

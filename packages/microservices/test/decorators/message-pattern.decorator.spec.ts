@@ -1,22 +1,164 @@
-import { expect } from 'chai';
-import { PATTERN_METADATA } from '../../constants';
+import {
+  PATTERN_EXTRAS_METADATA,
+  PATTERN_METADATA,
+  TRANSPORT_METADATA,
+} from '../../constants.js';
 import {
   GrpcMethod,
   GrpcMethodStreamingType,
   GrpcStreamCall,
   GrpcStreamMethod,
   MessagePattern,
-} from '../../decorators/message-pattern.decorator';
+} from '../../decorators/message-pattern.decorator.js';
+import { Transport } from '../../enums/transport.enum.js';
 
 describe('@MessagePattern', () => {
   const pattern = { role: 'test' };
+  const extras = { param: 'value' };
   class TestComponent {
-    @MessagePattern(pattern)
+    @MessagePattern(pattern, undefined, extras)
     public static test() {}
   }
   it(`should enhance method with ${PATTERN_METADATA} metadata`, () => {
-    const metadata = Reflect.getMetadata(PATTERN_METADATA, TestComponent.test);
-    expect(metadata).to.be.eql(pattern);
+    const [metadata] = Reflect.getMetadata(
+      PATTERN_METADATA,
+      TestComponent.test,
+    );
+    expect(metadata).toEqual(pattern);
+  });
+  it(`should enhance method with ${PATTERN_EXTRAS_METADATA} metadata`, () => {
+    const metadata = Reflect.getMetadata(
+      PATTERN_EXTRAS_METADATA,
+      TestComponent.test,
+    );
+    expect(metadata).toEqual(extras);
+  });
+
+  describe('decorator overloads', () => {
+    const additionalExtras = { foo: 'bar' };
+
+    class TestComponent1 {
+      @MessagePattern(pattern)
+      public static test() {}
+    }
+    class TestComponent2 {
+      @MessagePattern(pattern, Transport.TCP)
+      public static test() {}
+    }
+    class TestComponent3 {
+      @MessagePattern(pattern, extras)
+      public static test() {}
+    }
+    class TestComponent4 {
+      @MessagePattern(pattern, Transport.TCP, extras)
+      public static test() {}
+    }
+    class TestComponent5 {
+      @MessagePattern(pattern, Transport.TCP, extras)
+      @((
+        (): MethodDecorator => (_target, _key, descriptor) =>
+          Reflect.defineMetadata(
+            PATTERN_EXTRAS_METADATA,
+            additionalExtras,
+            descriptor.value!,
+          )
+      )())
+      public static test() {}
+    }
+
+    it(`should enhance method with ${PATTERN_METADATA} metadata`, () => {
+      const [metadataArg] = Reflect.getMetadata(
+        PATTERN_METADATA,
+        TestComponent1.test,
+      );
+      const transportArg = Reflect.getMetadata(
+        TRANSPORT_METADATA,
+        TestComponent1.test,
+      );
+      const extrasArg = Reflect.getMetadata(
+        PATTERN_EXTRAS_METADATA,
+        TestComponent1.test,
+      );
+      expect(metadataArg).toEqual(pattern);
+      expect(transportArg).toBeUndefined();
+      expect(extrasArg).toEqual({});
+    });
+
+    it(`should enhance method with ${PATTERN_METADATA}, ${TRANSPORT_METADATA} metadata`, () => {
+      const [metadataArg] = Reflect.getMetadata(
+        PATTERN_METADATA,
+        TestComponent2.test,
+      );
+      const transportArg = Reflect.getMetadata(
+        TRANSPORT_METADATA,
+        TestComponent2.test,
+      );
+      const extrasArg = Reflect.getMetadata(
+        PATTERN_EXTRAS_METADATA,
+        TestComponent2.test,
+      );
+      expect(metadataArg).toEqual(pattern);
+      expect(transportArg).toEqual(Transport.TCP);
+      expect(extrasArg).toEqual({});
+    });
+
+    it(`should enhance method with ${PATTERN_METADATA}, ${PATTERN_EXTRAS_METADATA} metadata`, () => {
+      const [metadataArg] = Reflect.getMetadata(
+        PATTERN_METADATA,
+        TestComponent3.test,
+      );
+      const transportArg = Reflect.getMetadata(
+        TRANSPORT_METADATA,
+        TestComponent3.test,
+      );
+      const extrasArg = Reflect.getMetadata(
+        PATTERN_EXTRAS_METADATA,
+        TestComponent3.test,
+      );
+      expect(metadataArg).toEqual(pattern);
+      expect(transportArg).toBeUndefined();
+      expect(extrasArg).toEqual(extras);
+    });
+
+    it(`should enhance method with ${PATTERN_METADATA}, ${TRANSPORT_METADATA} and \
+${PATTERN_EXTRAS_METADATA} metadata`, () => {
+      const [metadataArg] = Reflect.getMetadata(
+        PATTERN_METADATA,
+        TestComponent4.test,
+      );
+      const transportArg = Reflect.getMetadata(
+        TRANSPORT_METADATA,
+        TestComponent4.test,
+      );
+      const extrasArg = Reflect.getMetadata(
+        PATTERN_EXTRAS_METADATA,
+        TestComponent4.test,
+      );
+      expect(metadataArg).toEqual(pattern);
+      expect(transportArg).toEqual(Transport.TCP);
+      expect(extrasArg).toEqual(extras);
+    });
+
+    it(`should merge with existing ${PATTERN_EXTRAS_METADATA} metadata`, () => {
+      const [metadataArg] = Reflect.getMetadata(
+        PATTERN_METADATA,
+        TestComponent5.test,
+      );
+      const transportArg = Reflect.getMetadata(
+        TRANSPORT_METADATA,
+        TestComponent5.test,
+      );
+      const extrasArg = Reflect.getMetadata(
+        PATTERN_EXTRAS_METADATA,
+        TestComponent5.test,
+      );
+      expect(metadataArg).toEqual(pattern);
+      expect(transportArg).toEqual(Transport.TCP);
+      expect(extrasArg).toEqual({
+        ...additionalExtras,
+        ...extras,
+      });
+    });
   });
 });
 
@@ -34,8 +176,8 @@ describe('@GrpcMethod', () => {
 
   it('should derive method and service name', () => {
     const svc = new TestService();
-    const metadata = Reflect.getMetadata(PATTERN_METADATA, svc.test);
-    expect(metadata).to.be.eql({
+    const [metadata] = Reflect.getMetadata(PATTERN_METADATA, svc.test);
+    expect(metadata).toEqual({
       service: TestService.name,
       rpc: 'Test',
       streaming: GrpcMethodStreamingType.NO_STREAMING,
@@ -44,8 +186,8 @@ describe('@GrpcMethod', () => {
 
   it('should derive method', () => {
     const svc = new TestService();
-    const metadata = Reflect.getMetadata(PATTERN_METADATA, svc.test2);
-    expect(metadata).to.be.eql({
+    const [metadata] = Reflect.getMetadata(PATTERN_METADATA, svc.test2);
+    expect(metadata).toEqual({
       service: 'TestService2',
       rpc: 'Test2',
       streaming: GrpcMethodStreamingType.NO_STREAMING,
@@ -54,8 +196,8 @@ describe('@GrpcMethod', () => {
 
   it('should override both method and service', () => {
     const svc = new TestService();
-    const metadata = Reflect.getMetadata(PATTERN_METADATA, svc.test3);
-    expect(metadata).to.be.eql({
+    const [metadata] = Reflect.getMetadata(PATTERN_METADATA, svc.test3);
+    expect(metadata).toEqual({
       service: 'TestService2',
       rpc: 'Test2',
       streaming: GrpcMethodStreamingType.NO_STREAMING,
@@ -77,8 +219,8 @@ describe('@GrpcStreamMethod', () => {
 
   it('should derive method and service name', () => {
     const svc = new TestService();
-    const metadata = Reflect.getMetadata(PATTERN_METADATA, svc.test);
-    expect(metadata).to.be.eql({
+    const [metadata] = Reflect.getMetadata(PATTERN_METADATA, svc.test);
+    expect(metadata).toEqual({
       service: TestService.name,
       rpc: 'Test',
       streaming: GrpcMethodStreamingType.RX_STREAMING,
@@ -87,8 +229,8 @@ describe('@GrpcStreamMethod', () => {
 
   it('should derive method', () => {
     const svc = new TestService();
-    const metadata = Reflect.getMetadata(PATTERN_METADATA, svc.test2);
-    expect(metadata).to.be.eql({
+    const [metadata] = Reflect.getMetadata(PATTERN_METADATA, svc.test2);
+    expect(metadata).toEqual({
       service: 'TestService2',
       rpc: 'Test2',
       streaming: GrpcMethodStreamingType.RX_STREAMING,
@@ -97,12 +239,24 @@ describe('@GrpcStreamMethod', () => {
 
   it('should override both method and service', () => {
     const svc = new TestService();
-    const metadata = Reflect.getMetadata(PATTERN_METADATA, svc.test3);
-    expect(metadata).to.be.eql({
+    const [metadata] = Reflect.getMetadata(PATTERN_METADATA, svc.test3);
+    expect(metadata).toEqual({
       service: 'TestService2',
       rpc: 'Test2',
       streaming: GrpcMethodStreamingType.RX_STREAMING,
     });
+  });
+
+  it('should return Observable directly (not wrapped in Promise) when called method directly', () => {
+    class TestService {
+      @GrpcStreamMethod()
+      test(data$: any) {
+        return data$;
+      }
+    }
+    const service = new TestService();
+    const result = service.test({});
+    expect(result).not.toHaveProperty('then');
   });
 });
 
@@ -120,8 +274,8 @@ describe('@GrpcStreamCall', () => {
 
   it('should derive method and service name', () => {
     const svc = new TestService();
-    const metadata = Reflect.getMetadata(PATTERN_METADATA, svc.test);
-    expect(metadata).to.be.eql({
+    const [metadata] = Reflect.getMetadata(PATTERN_METADATA, svc.test);
+    expect(metadata).toEqual({
       service: TestService.name,
       rpc: 'Test',
       streaming: GrpcMethodStreamingType.PT_STREAMING,
@@ -130,8 +284,8 @@ describe('@GrpcStreamCall', () => {
 
   it('should derive method', () => {
     const svc = new TestService();
-    const metadata = Reflect.getMetadata(PATTERN_METADATA, svc.test2);
-    expect(metadata).to.be.eql({
+    const [metadata] = Reflect.getMetadata(PATTERN_METADATA, svc.test2);
+    expect(metadata).toEqual({
       service: 'TestService2',
       rpc: 'Test2',
       streaming: GrpcMethodStreamingType.PT_STREAMING,
@@ -140,8 +294,8 @@ describe('@GrpcStreamCall', () => {
 
   it('should override both method and service', () => {
     const svc = new TestService();
-    const metadata = Reflect.getMetadata(PATTERN_METADATA, svc.test3);
-    expect(metadata).to.be.eql({
+    const [metadata] = Reflect.getMetadata(PATTERN_METADATA, svc.test3);
+    expect(metadata).toEqual({
       service: 'TestService2',
       rpc: 'Test2',
       streaming: GrpcMethodStreamingType.PT_STREAMING,

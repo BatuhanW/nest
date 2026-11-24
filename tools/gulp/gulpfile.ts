@@ -1,5 +1,4 @@
-import './tasks/copy-misc';
-import './tasks/clean';
-import './tasks/packages';
-import './tasks/move';
-import './tasks/samples';
+import './tasks/clean.js';
+import './tasks/copy-misc.js';
+import './tasks/move.js';
+import './tasks/samples.js';

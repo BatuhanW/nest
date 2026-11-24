@@ -1,9 +1,28 @@
 {
   "name": "@nestjs/microservices",
-  "version": "7.6.11",
-  "description": "Nest - modern, fast, powerful node.js web framework (@microservices)",
+  "version": "12.6.0",
+  "description": "Microservices for NestJS: message and event handlers over Kafka, RabbitMQ, NATS, Redis, MQTT, gRPC or TCP.",
+  "keywords": [
+    "nestjs",
+    "nest",
+    "microservices",
+    "kafka",
+    "rabbitmq",
+    "nats",
+    "redis",
+    "mqtt",
+    "grpc"
+  ],
   "author": "Kamil Mysliwiec",
   "license": "MIT",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json",
+    "./*.js": "./*.js",
+    "./*": "./*.js"
+  },
   "homepage": "https://nestjs.com",
   "funding": {
     "type": "opencollective",
@@ -11,43 +30,46 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/nestjs/nest"
+    "url": "https://github.com/nestjs/nest.git",
+    "directory": "packages/microservices"
   },
   "publishConfig": {
     "access": "public"
   },
   "dependencies": {
     "iterare": "1.2.1",
-    "json-socket": "0.3.0",
-    "tslib": "2.1.0"
+    "tslib": "2.9.1"
   },
   "devDependencies": {
-    "@nestjs/common": "7.6.11",
-    "@nestjs/core": "7.6.11"
+    "@nestjs/common": "12.6.0",
+    "@nestjs/core": "12.6.0"
   },
   "peerDependencies": {
-    "@nestjs/common": "^7.0.0",
-    "@nestjs/core": "^7.0.0",
-    "@nestjs/websockets": "^7.0.0",
+    "@grpc/grpc-js": "*",
+    "@nats-io/transport-node": "*",
+    "@nestjs/common": "^12.0.0",
+    "@nestjs/core": "^12.0.0",
+    "@nestjs/websockets": "^12.0.0",
     "amqp-connection-manager": "*",
     "amqplib": "*",
     "cache-manager": "*",
-    "grpc": "*",
+    "ioredis": "*",
     "kafkajs": "*",
     "mqtt": "*",
-    "nats": "*",
-    "redis": "*",
-    "reflect-metadata": "^0.1.12",
-    "rxjs": "^6.0.0"
+    "reflect-metadata": "^0.1.12 || ^0.2.0",
+    "rxjs": "^7.1.0"
   },
   "peerDependenciesMeta": {
+    "@grpc/grpc-js": {
+      "optional": true
+    },
+    "@nats-io/transport-node": {
+      "optional": true
+    },
     "@nestjs/websockets": {
       "optional": true
     },
     "cache-manager": {
-      "optional": true
-    },
-    "grpc": {
       "optional": true
     },
     "kafkajs": {
@@ -56,10 +78,7 @@
     "mqtt": {
       "optional": true
     },
-    "nats": {
-      "optional": true
-    },
-    "redis": {
+    "ioredis": {
       "optional": true
     },
     "amqplib": {
@@ -68,5 +87,6 @@
     "amqp-connection-manager": {
       "optional": true
     }
-  }
+  },
+  "gitHead": "ab3fb3d5ca7d51d078835e44a8db1b354f8b651b"
 }

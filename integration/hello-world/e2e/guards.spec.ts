@@ -5,8 +5,9 @@ import {
 } from '@nestjs/common';
 import { APP_GUARD } from '@nestjs/core';
 import { Test } from '@nestjs/testing';
-import * as request from 'supertest';
-import { ApplicationModule } from '../src/app.module';
+import request from 'supertest';
+import { AppModule } from '../src/app.module.js';
+import { listenOnLoopback } from '../../_support/listen-on-loopback.js';
 
 @Injectable()
 export class AuthGuard {
@@ -20,7 +21,7 @@ export class AuthGuard {
 
 function createTestModule(guard) {
   return Test.createTestingModule({
-    imports: [ApplicationModule],
+    imports: [AppModule],
     providers: [
       {
         provide: APP_GUARD,
@@ -33,10 +34,31 @@ function createTestModule(guard) {
 describe('Guards', () => {
   let app: INestApplication;
 
+  afterEach(async () => {
+    await app.close();
+  });
+
   it(`should prevent access (unauthorized)`, async () => {
     app = (await createTestModule(new AuthGuard())).createNestApplication();
 
-    await app.init();
-    return request(app.getHttpServer()).get('/hello').expect(401);
+    await listenOnLoopback(app);
+    return request(app.getHttpServer())
+      .get('/hello')
+      .expect(401)
+      .expect(({ body }) => {
+        expect(body.message).toBe('Unauthorized');
+        expect(body.statusCode).toBe(401);
+      });
+  });
+
+  it(`should allow access when guard returns true`, async () => {
+    const allowGuard = { canActivate: () => true };
+    app = (await createTestModule(allowGuard)).createNestApplication();
+
+    await listenOnLoopback(app);
+    return request(app.getHttpServer())
+      .get('/hello')
+      .expect(200)
+      .expect('Hello world!');
   });
 });

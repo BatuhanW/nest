@@ -1,6 +1,5 @@
-import { expect } from 'chai';
-import { KafkaResponseDeserializer } from '../../deserializers/kafka-response.deserializer';
-import { KafkaHeaders } from '../../enums/kafka-headers.enum';
+import { KafkaResponseDeserializer } from '../../deserializers/kafka-response.deserializer.js';
+import { KafkaHeaders } from '../../enums/kafka-headers.enum.js';
 
 describe('KafkaResponseDeserializer', () => {
   const id = '10';
@@ -19,14 +18,14 @@ describe('KafkaResponseDeserializer', () => {
             [KafkaHeaders.NEST_ERR]: err,
           },
         });
-        expect(packet.id).to.be.equal(id);
-        expect(packet.err).to.be.equal(err);
-        expect(packet.isDisposed).to.be.true;
-        expect(packet.response).to.be.undefined;
+        expect(packet.id).toBe(id);
+        expect(packet.err).toBe(err);
+        expect(packet.isDisposed).toBe(true);
+        expect(packet.response).toBeUndefined();
       });
     });
     describe('when is disposed header is present', () => {
-      it('should return an objet with "isDisposed"', () => {
+      it('should return an object with "isDisposed"', () => {
         const value = 'test';
         const packet = instance.deserialize({
           headers: {
@@ -35,10 +34,26 @@ describe('KafkaResponseDeserializer', () => {
           },
           value,
         });
-        expect(packet.id).to.be.equal(id);
-        expect(packet.err).to.be.undefined;
-        expect(packet.isDisposed).to.be.true;
-        expect(packet.response).to.be.eql(value);
+        expect(packet.id).toBe(id);
+        expect(packet.err).toBeUndefined();
+        expect(packet.isDisposed).toBe(true);
+        expect(packet.response).toEqual(value);
+      });
+    });
+    describe('when is disposed and no response headers are present', () => {
+      it('should return an object with "isDisposed" and without "response"', () => {
+        const packet = instance.deserialize({
+          headers: {
+            [KafkaHeaders.CORRELATION_ID]: id,
+            [KafkaHeaders.NEST_IS_DISPOSED]: true,
+            [KafkaHeaders.NEST_NO_RESPONSE]: true,
+          },
+          value: null,
+        });
+        expect(packet.id).toBe(id);
+        expect(packet.err).toBeUndefined();
+        expect(packet.isDisposed).toBe(true);
+        expect(packet.response).toBeUndefined();
       });
     });
   });

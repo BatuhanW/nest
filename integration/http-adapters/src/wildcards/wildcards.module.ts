@@ -1,0 +1,148 @@
+import {
+  Controller,
+  Get,
+  MiddlewareConsumer,
+  Module,
+  NestModule,
+  Param,
+} from '@nestjs/common';
+import { RouterModule } from '@nestjs/core';
+import { markMiddleware } from '../adapters.js';
+
+@Controller('admin')
+export class AdminController {
+  @Get()
+  index() {
+    return 'admin index';
+  }
+
+  // The legacy form, converted to "{*path}"
+  @Get('*')
+  catchAll() {
+    return 'admin catch-all';
+  }
+}
+
+@Controller('named')
+export class NamedWildcardController {
+  @Get('{*path}')
+  catchAll(@Param('path') path: string[] | undefined) {
+    return { path: path ?? null };
+  }
+}
+
+@Controller('optional')
+export class OptionalParamController {
+  @Get('{:id}')
+  byId(@Param('id') id: string | undefined) {
+    return { id: id ?? null };
+  }
+}
+
+@Controller()
+export class ShapesController {
+  @Get('docs{/}')
+  docs() {
+    return 'docs';
+  }
+
+  @Get('files{.json}')
+  files() {
+    return 'files';
+  }
+
+  @Get('users{/:id}/posts')
+  posts(@Param() params: Record<string, string>) {
+    return params;
+  }
+
+  @Get('wild/*splat')
+  splat(@Param('splat') splat: string[]) {
+    return splat;
+  }
+}
+
+@Module({
+  controllers: [
+    AdminController,
+    NamedWildcardController,
+    OptionalParamController,
+    ShapesController,
+  ],
+})
+export class WildcardsModule implements NestModule {
+  configure(consumer: MiddlewareConsumer) {
+    consumer
+      .apply(markMiddleware)
+      .forRoutes(
+        AdminController,
+        NamedWildcardController,
+        OptionalParamController,
+      );
+  }
+}
+
+@Controller()
+export class RootCatchAllController {
+  @Get('*')
+  catchAll() {
+    return 'catch-all';
+  }
+}
+
+@Module({ controllers: [RootCatchAllController] })
+export class RootCatchAllModule {}
+
+// Served at "/" and "/<locale>": nothing comes before the optional group
+@Controller('{/:locale}')
+export class LocaleController {
+  @Get()
+  index(@Param('locale') locale: string | undefined) {
+    return { locale: locale ?? null };
+  }
+}
+
+@Module({ controllers: [LocaleController] })
+export class RootOptionalGroupModule implements NestModule {
+  configure(consumer: MiddlewareConsumer) {
+    consumer.apply(markMiddleware).forRoutes(LocaleController);
+  }
+}
+
+@Controller('cats')
+export class OptionalGroupCatsController {
+  @Get()
+  index(@Param('lang') lang: string | undefined) {
+    return { lang: lang ?? null };
+  }
+}
+
+@Module({ controllers: [OptionalGroupCatsController] })
+export class OptionalGroupCatsModule {}
+
+@Controller('dogs')
+export class OptionalGroupDogsController {
+  @Get()
+  index(@Param('lang') lang: string | undefined) {
+    return { lang: lang ?? null };
+  }
+}
+
+@Module({ controllers: [OptionalGroupDogsController] })
+export class OptionalGroupDogsModule {}
+
+// The optional group is the path of a RouterModule route, not of a controller
+@Module({
+  imports: [
+    OptionalGroupCatsModule,
+    OptionalGroupDogsModule,
+    RouterModule.register([
+      { path: '{/:lang}', module: OptionalGroupCatsModule },
+      {
+        path: 'v1',
+        children: [{ path: '{/:lang}', module: OptionalGroupDogsModule }],
+      },
+    ]),
+  ],
+})
+export class RouterModuleOptionalGroupModule {}

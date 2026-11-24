@@ -1,8 +1,9 @@
-import { CanActivate } from '@nestjs/common';
-import { ContextType, Controller } from '@nestjs/common/interfaces';
-import { isEmpty } from '@nestjs/common/utils/shared.utils';
-import { Observable } from 'rxjs';
-import { ExecutionContextHost } from '../helpers/execution-context-host';
+import type { CanActivate } from '@nestjs/common';
+import { isObservable, lastValueFrom, Observable } from 'rxjs';
+import { getClassRef } from '../helpers/class-ref-registry.js';
+import { ExecutionContextHost } from '../helpers/execution-context-host.js';
+import type { ContextType, Type } from '@nestjs/common';
+import { type Controller, isEmptyArray } from '@nestjs/common/internal';
 
 export class GuardsConsumer {
   public async tryActivate<TContext extends string = ContextType>(
@@ -12,14 +13,20 @@ export class GuardsConsumer {
     callback: (...args: unknown[]) => unknown,
     type?: TContext,
   ): Promise<boolean> {
-    if (!guards || isEmpty(guards)) {
+    if (!guards || isEmptyArray(guards)) {
       return true;
     }
     const context = this.createContext(args, instance, callback);
-    context.setType<TContext>(type);
+    context.setType<TContext>(type!);
 
     for (const guard of guards) {
       const result = guard.canActivate(context);
+      if (typeof result === 'boolean') {
+        if (!result) {
+          return false;
+        }
+        continue;
+      }
       if (await this.pickResult(result)) {
         continue;
       }
@@ -35,7 +42,7 @@ export class GuardsConsumer {
   ): ExecutionContextHost {
     return new ExecutionContextHost(
       args,
-      instance.constructor as any,
+      getClassRef(instance) as Type<unknown>,
       callback,
     );
   }
@@ -43,9 +50,12 @@ export class GuardsConsumer {
   public async pickResult(
     result: boolean | Promise<boolean> | Observable<boolean>,
   ): Promise<boolean> {
-    if (result instanceof Observable) {
-      return result.toPromise();
+    // "isObservable()" also recognises Observables created by another copy
+    // of rxjs, which are not instances of the "Observable" class imported here
+    const value = await result;
+    if (isObservable(value)) {
+      return lastValueFrom(value);
     }
-    return result;
+    return value;
   }
 }

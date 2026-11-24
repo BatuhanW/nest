@@ -1,15 +1,23 @@
-import { RequestMethod, Type } from '@nestjs/common';
-import { expect } from 'chai';
-import * as pathToRegexp from 'path-to-regexp';
-import * as sinon from 'sinon';
+import {
+  RequestMethod,
+  UseFilters,
+  VERSION_NEUTRAL,
+  VersioningOptions,
+  VersioningType,
+} from '@nestjs/common';
+import { EXCEPTION_FILTERS_METADATA } from '@nestjs/common/constants.js';
+import { addLeadingSlash } from '@nestjs/common/utils/shared.utils.js';
+import { pathToRegexp } from 'path-to-regexp';
 import {
   assignToken,
   filterMiddleware,
-  isClass,
-  isRouteExcluded,
+  isMiddlewareClass,
+  isMiddlewareRouteExcluded,
   mapToClass,
-} from '../../middleware/utils';
-import { NoopHttpAdapter } from '../utils/noop-adapter.spec';
+  mapToExcludeRoute,
+  stripEndSlashes,
+} from '../../middleware/utils.js';
+import { NoopHttpAdapter } from '../utils/noop-adapter.js';
 
 describe('middleware utils', () => {
   const noopAdapter = new NoopHttpAdapter({});
@@ -17,13 +25,181 @@ describe('middleware utils', () => {
   class Test {}
   function fnMiddleware(req, res, next) {}
 
+  describe('mapToExcludeRoute', () => {
+    it('should return exclude route metadata', () => {
+      const stringRoute = 'foo';
+      const routeInfo = {
+        path: 'bar',
+        method: RequestMethod.GET,
+      };
+      expect(mapToExcludeRoute([stringRoute, routeInfo])).toEqual([
+        {
+          path: stringRoute,
+          requestMethod: RequestMethod.ALL,
+          pathRegex: pathToRegexp(addLeadingSlash(stringRoute)).regexp,
+        },
+        {
+          path: routeInfo.path,
+          requestMethod: routeInfo.method,
+          pathRegex: pathToRegexp(addLeadingSlash(routeInfo.path)).regexp,
+        },
+      ]);
+    });
+    it('should match the route a path with a trailing slash is served at', () => {
+      const [route] = mapToExcludeRoute(['health/']);
+      expect(route.pathRegex.test('/health')).toBe(true);
+      expect(route.pathRegex.test('/health/')).toBe(true);
+      expect(route.pathRegex.test('/healthz')).toBe(false);
+    });
+    describe('when route matching options are given', () => {
+      const matches = (
+        path: string,
+        options: {
+          caseSensitive: boolean;
+          ignoreTrailingSlash: boolean;
+          caseSensitiveParamSuffix?: boolean;
+        },
+        url: string,
+      ) => mapToExcludeRoute([path], options)[0].pathRegex.test(url);
+
+      it('should match paths case-sensitively when the router does', () => {
+        const options = { caseSensitive: true, ignoreTrailingSlash: true };
+        expect(matches('users/login', options, '/users/login')).toBe(true);
+        expect(matches('users/login', options, '/users/LOGIN')).toBe(false);
+      });
+      it('should match paths case-insensitively when the router does', () => {
+        const options = { caseSensitive: false, ignoreTrailingSlash: true };
+        expect(matches('users/login', options, '/users/LOGIN')).toBe(true);
+      });
+      it('should match a trailing slash only when the router ignores it', () => {
+        expect(
+          matches(
+            'users/login',
+            { caseSensitive: false, ignoreTrailingSlash: false },
+            '/users/login/',
+          ),
+        ).toBe(false);
+        expect(
+          matches(
+            'users/login',
+            { caseSensitive: false, ignoreTrailingSlash: true },
+            '/users/login/',
+          ),
+        ).toBe(true);
+      });
+      it('should match an excluded path written with a trailing slash like its route', () => {
+        const strict = { caseSensitive: true, ignoreTrailingSlash: false };
+        expect(matches('users/login/', strict, '/users/login')).toBe(true);
+        expect(matches('users/login/', strict, '/users/login/')).toBe(false);
+
+        const loose = { caseSensitive: true, ignoreTrailingSlash: true };
+        expect(matches('users/login/', loose, '/users/login')).toBe(true);
+        expect(matches('users/login/', loose, '/users/login/')).toBe(true);
+        expect(matches('users/login/', loose, '/users/login//')).toBe(false);
+      });
+      it('should match the text after a parameter as written when a case-insensitive router does', () => {
+        const options = {
+          caseSensitive: false,
+          ignoreTrailingSlash: false,
+          caseSensitiveParamSuffix: true,
+        };
+        expect(matches('reports/:id.png', options, '/reports/7.png')).toBe(
+          true,
+        );
+        expect(matches('reports/:id.png', options, '/reports/7.PNG')).toBe(
+          false,
+        );
+        expect(matches('docs/:slug-preview', options, '/docs/a-PREVIEW')).toBe(
+          false,
+        );
+        expect(matches('sitemap-:n.xml', options, '/sitemap-1.XML')).toBe(
+          false,
+        );
+        expect(matches('files/:name{.:ext}z', options, '/files/a.bZ')).toBe(
+          false,
+        );
+        expect(matches('files/:name{.:ext}z', options, '/files/az')).toBe(true);
+        // Matched as written as a whole, so a case variant of the static
+        // part runs the middleware too
+        expect(matches('reports/:id.png', options, '/REPORTS/7.png')).toBe(
+          false,
+        );
+      });
+      it('should keep matching the other paths case-insensitively', () => {
+        const options = {
+          caseSensitive: false,
+          ignoreTrailingSlash: false,
+          caseSensitiveParamSuffix: true,
+        };
+        expect(matches('users/login', options, '/users/LOGIN')).toBe(true);
+        expect(matches('users/:id/avatar', options, '/USERS/1/Avatar')).toBe(
+          true,
+        );
+        expect(matches('user-:id', options, '/USER-1')).toBe(true);
+        expect(matches('files/{*path}', options, '/FILES/a.PNG')).toBe(true);
+        expect(
+          matches(
+            'reports/:id.png',
+            { ...options, caseSensitiveParamSuffix: false },
+            '/reports/7.PNG',
+          ),
+        ).toBe(true);
+      });
+      it('should keep matching the root path', () => {
+        const strict = { caseSensitive: true, ignoreTrailingSlash: false };
+        expect(matches('/', strict, '/')).toBe(true);
+        expect(matches('/', strict, '/users')).toBe(false);
+      });
+    });
+  });
   describe('filterMiddleware', () => {
     let middleware: any[];
     beforeEach(() => {
       middleware = [Test, fnMiddleware, undefined, null];
     });
-    it('should returns filtered middleware', () => {
-      expect(filterMiddleware(middleware, [], noopAdapter)).to.have.length(2);
+    it('should return filtered middleware', () => {
+      expect(filterMiddleware(middleware, [], noopAdapter)).toHaveLength(2);
+    });
+    const expectSkippedOnlyForExactMatches = (adapter: NoopHttpAdapter) => {
+      vi.spyOn(adapter, 'getRequestMethod').mockReturnValue('GET');
+      const getRequestUrl = vi.spyOn(adapter, 'getRequestUrl');
+      const fn = vi.fn();
+      const next = vi.fn();
+      const [Middleware] = filterMiddleware(
+        [fn],
+        [{ path: 'users/login', method: RequestMethod.GET }],
+        adapter,
+      );
+      const instance = new Middleware();
+
+      getRequestUrl.mockReturnValue('/users/login?redirect=1');
+      instance.use({}, {}, next);
+      expect(next).toHaveBeenCalledOnce();
+      expect(fn).not.toHaveBeenCalled();
+
+      for (const url of ['/users/LOGIN', '/users/Login', '/users/login/']) {
+        getRequestUrl.mockReturnValue(url);
+        instance.use({}, {}, next);
+      }
+      expect(fn).toHaveBeenCalledTimes(3);
+      expect(next).toHaveBeenCalledOnce();
+    };
+
+    describe('when the adapter tells how its router matches paths', () => {
+      class StrictRouterAdapter extends NoopHttpAdapter {
+        getRouteMatchingOptions() {
+          return { caseSensitive: true, ignoreTrailingSlash: false };
+        }
+      }
+
+      it('should skip the middleware only for requests the router serves with an excluded route', () => {
+        expectSkippedOnlyForExactMatches(new StrictRouterAdapter({}));
+      });
+    });
+    describe('when the adapter does not tell how its router matches paths', () => {
+      it('should skip the middleware only for requests matching an excluded route exactly', () => {
+        expectSkippedOnlyForExactMatches(new NoopHttpAdapter({}));
+      });
     });
   });
   describe('mapToClass', () => {
@@ -31,62 +207,99 @@ describe('middleware utils', () => {
       describe('when there is no excluded routes', () => {
         it('should return an identity', () => {
           const type = mapToClass(Test, [], noopAdapter);
-          expect(type).to.eql(Test);
+          expect(type).toEqual(Test);
         });
       });
       describe('when there are excluded routes', () => {
         it('should return a host class', () => {
           const type = mapToClass(
             Test,
-            [{ path: '*', method: RequestMethod.ALL, regex: /./ }],
+            mapToExcludeRoute([{ path: '*', method: RequestMethod.ALL }]),
             noopAdapter,
           );
-          expect(type).to.not.eql(Test);
-          expect(type.name).to.eql(Test.name);
+          expect(type).not.toEqual(Test);
+          expect(type.name).toEqual(Test.name);
+        });
+        it('should keep the metadata of the "use" method', () => {
+          const filter = { catch() {} };
+          class WithFilter {
+            @UseFilters(filter)
+            use() {}
+          }
+          class Inherited extends WithFilter {}
+
+          for (const middleware of [WithFilter, Inherited]) {
+            const type = mapToClass(
+              middleware,
+              mapToExcludeRoute([{ path: 'foo', method: RequestMethod.ALL }]),
+              noopAdapter,
+            );
+            expect(
+              Reflect.getMetadata(EXCEPTION_FILTERS_METADATA, new type().use),
+            ).toEqual([filter]);
+          }
+          // The original method keeps its own metadata only
+          expect(
+            Reflect.getMetadata(
+              EXCEPTION_FILTERS_METADATA,
+              WithFilter.prototype.use,
+            ),
+          ).toEqual([filter]);
         });
       });
     });
     describe('when middleware is a function', () => {
       it('should return a metatype', () => {
         const metatype = mapToClass(fnMiddleware, [], noopAdapter);
-        expect(metatype).to.not.eql(fnMiddleware);
+        expect(metatype).not.toEqual(fnMiddleware);
       });
       it('should define a `use` method', () => {
-        const metatype = mapToClass(fnMiddleware, [], noopAdapter) as Type<any>;
-        expect(new metatype().use).to.exist;
+        const metatype = mapToClass(fnMiddleware, [], noopAdapter);
+        expect(new metatype().use).toBeDefined();
       });
       it('should encapsulate a function', () => {
-        const spy = sinon.spy();
-        const metatype = mapToClass(spy, [], noopAdapter) as Type<any>;
+        const spy = vi.fn();
+        const metatype = mapToClass(spy, [], noopAdapter);
         new metatype().use();
-        expect(spy.called).to.be.true;
+        expect(spy).toHaveBeenCalled();
       });
     });
   });
-  describe('isClass', () => {
+  describe('isMiddlewareClass', () => {
     describe('when middleware is a class', () => {
       it('should returns true', () => {
-        expect(isClass(Test)).to.be.true;
+        expect(isMiddlewareClass(Test)).toBe(true);
       });
     });
     describe('when middleware is a function', () => {
       it('should returns false', () => {
-        expect(isClass(fnMiddleware)).to.be.false;
+        expect(isMiddlewareClass(fnMiddleware)).toBe(false);
       });
     });
   });
   describe('assignToken', () => {
-    describe('should define `name` property on metatype', () => {
+    it('should define `name` property on metatype', () => {
       const AnonymousType = class {};
       assignToken(AnonymousType);
-      expect(AnonymousType.name).to.exist;
+      expect(AnonymousType.name).toBeDefined();
     });
-    describe('should use passed token as `name`', () => {
+    it('should use passed token as `name`', () => {
       const AnonymousType = class {};
       const token = 'token';
 
       assignToken(AnonymousType, token);
-      expect(AnonymousType.name).to.eq(token);
+      expect(AnonymousType.name).toBe(token);
+    });
+  });
+
+  describe('stripEndSlashes', () => {
+    it('should remove the trailing slashes only', () => {
+      expect(stripEndSlashes('/cats')).toBe('/cats');
+      expect(stripEndSlashes('/cats/')).toBe('/cats');
+      expect(stripEndSlashes('/cats///')).toBe('/cats');
+      expect(stripEndSlashes('//cats//1//')).toBe('//cats//1');
+      expect(stripEndSlashes('///')).toBe('');
+      expect(stripEndSlashes('')).toBe('');
     });
   });
 
@@ -95,25 +308,508 @@ describe('middleware utils', () => {
 
     beforeEach(() => {
       adapter = new NoopHttpAdapter({});
-      sinon.stub(adapter, 'getRequestMethod').callsFake(() => 'GET');
-      sinon.stub(adapter, 'getRequestUrl').callsFake(() => '/cats/3');
+      vi.spyOn(adapter, 'getRequestMethod').mockImplementation(() => 'GET');
+      vi.spyOn(adapter, 'getRequestUrl').mockImplementation(() => '/cats/3');
     });
-    describe('when route is excluded', () => {
-      const path = '/cats/(.*)';
-      const exludedRoutes = [
+    describe('when route is excluded (new syntax *path)', () => {
+      const path = '/cats/*path';
+      const excludedRoutes = mapToExcludeRoute([
         {
           path,
           method: RequestMethod.GET,
-          regex: pathToRegexp(path),
         },
-      ];
+      ]);
       it('should return true', () => {
-        expect(isRouteExcluded({}, exludedRoutes, adapter)).to.be.true;
+        expect(isMiddlewareRouteExcluded({}, excludedRoutes, adapter)).toBe(
+          true,
+        );
+      });
+    });
+    describe('when route is excluded (legacy syntax (.*))', () => {
+      const path = '/cats/(.*)';
+      const excludedRoutes = mapToExcludeRoute([
+        {
+          path,
+          method: RequestMethod.GET,
+        },
+      ]);
+      it('should return true', () => {
+        expect(isMiddlewareRouteExcluded({}, excludedRoutes, adapter)).toBe(
+          true,
+        );
       });
     });
     describe('when route is not excluded', () => {
       it('should return false', () => {
-        expect(isRouteExcluded({}, [], adapter)).to.be.false;
+        expect(isMiddlewareRouteExcluded({}, [], adapter)).toBe(false);
+      });
+    });
+    describe('when the request target is not a plain path', () => {
+      const excludedRoutes = mapToExcludeRoute([
+        'cats/:id/avatar',
+        '*prefix/admin',
+      ]);
+      it('should return true for a path with a query string', () => {
+        vi.spyOn(adapter, 'getRequestUrl').mockReturnValue(
+          '/cats/3/avatar?size=1%0A',
+        );
+        expect(isMiddlewareRouteExcluded({}, excludedRoutes, adapter)).toBe(
+          true,
+        );
+      });
+      it.each([
+        '/cats/3#/avatar',
+        '/cats/3/avatar#',
+        '/cats/3/avatar?size=1#',
+        'http://localhost/admin',
+        '/cats/3%0A/avatar',
+        '/cats/3%0d/avatar',
+        '/cats/3\n/avatar',
+        '/cats/3%E2%80%A8/avatar',
+        '/cats/3%e2%80%a9/avatar',
+        '/cats/3\u2028/avatar',
+      ])('should return false for %j', url => {
+        vi.spyOn(adapter, 'getRequestUrl').mockReturnValue(url);
+        expect(isMiddlewareRouteExcluded({}, excludedRoutes, adapter)).toBe(
+          false,
+        );
+      });
+    });
+    describe('when the router ignores a trailing slash', () => {
+      const isExcluded = (exclusions: string[], url: string) => {
+        vi.spyOn(adapter, 'getRequestUrl').mockReturnValue(url);
+        return isMiddlewareRouteExcluded(
+          {},
+          mapToExcludeRoute(exclusions, {
+            caseSensitive: false,
+            ignoreTrailingSlash: true,
+          }),
+          adapter,
+          true,
+        );
+      };
+
+      it('should not exclude "/x/", served by the "/x" route, when only its wildcard is excluded', () => {
+        expect(isExcluded(['invoices/*'], '/invoices/')).toBe(false);
+        expect(isExcluded(['invoices/{*path}'], '/invoices//')).toBe(false);
+        expect(isExcluded(['invoices/*'], '/invoices/abc')).toBe(true);
+        expect(isExcluded(['invoices/*'], '/invoices/abc/')).toBe(true);
+      });
+
+      it('should exclude "/x/" when "/x" is excluded too', () => {
+        expect(isExcluded(['invoices', 'invoices/*'], '/invoices/')).toBe(true);
+        expect(isExcluded(['invoices{/*path}'], '/invoices/')).toBe(true);
+      });
+
+      it('should drop every trailing slash, and only those, for that check', () => {
+        expect(isExcluded(['invoices/*'], '/invoices///')).toBe(false);
+        expect(isExcluded(['invoices/*'], '/invoices/abc//')).toBe(true);
+        expect(isExcluded(['invoices', 'invoices/*'], '/invoices///')).toBe(
+          true,
+        );
+      });
+    });
+    describe('when the router ends the path at a semicolon', () => {
+      const isExcluded = (url: string, useSemicolonDelimiter: boolean) => {
+        vi.spyOn(adapter, 'getRequestUrl').mockReturnValue(url);
+        const options = {
+          caseSensitive: true,
+          ignoreTrailingSlash: false,
+          useSemicolonDelimiter,
+        };
+        return isMiddlewareRouteExcluded(
+          {},
+          mapToExcludeRoute(['cats/:id/avatar'], options),
+          adapter,
+          options,
+        );
+      };
+
+      it('should match the path up to the semicolon', () => {
+        expect(isExcluded('/cats/1;/avatar', true)).toBe(false);
+        expect(isExcluded('/cats/1/avatar;size=1', true)).toBe(true);
+        expect(isExcluded('/cats/1/avatar?a=1;b', true)).toBe(true);
+      });
+
+      it('should take the semicolon as a path character otherwise', () => {
+        expect(isExcluded('/cats/1;/avatar', false)).toBe(true);
+        expect(isExcluded('/cats/1/avatar;size=1', false)).toBe(false);
+      });
+    });
+    describe('when the router limits the length of a parameter', () => {
+      const isExcluded = (exclusion: string, url: string) => {
+        vi.spyOn(adapter, 'getRequestUrl').mockReturnValue(url);
+        const options = {
+          caseSensitive: true,
+          ignoreTrailingSlash: false,
+          maxParamLength: 10,
+        };
+        return isMiddlewareRouteExcluded(
+          {},
+          mapToExcludeRoute([exclusion], options),
+          adapter,
+          options,
+        );
+      };
+
+      it('should not exclude a request whose parameter is longer', () => {
+        expect(isExcluded('docs/:page', `/docs/${'a'.repeat(10)}`)).toBe(true);
+        expect(isExcluded('docs/:page', `/docs/${'a'.repeat(11)}`)).toBe(false);
+        expect(isExcluded('docs/:id/raw', `/docs/${'a'.repeat(11)}/raw`)).toBe(
+          false,
+        );
+      });
+
+      it('should measure the decoded value, as the router does', () => {
+        expect(isExcluded('docs/:page', `/docs/${'%41'.repeat(10)}`)).toBe(
+          true,
+        );
+        expect(isExcluded('docs/:page', `/docs/${'%41'.repeat(11)}`)).toBe(
+          false,
+        );
+        expect(isExcluded('docs/:page', '/docs/%E0%A4%A')).toBe(false);
+      });
+
+      it('should count the parameters of one segment together', () => {
+        expect(isExcluded('range/:from-:to', '/range/aaaaa-bbbbb')).toBe(true);
+        expect(isExcluded('range/:from-:to', '/range/aaaaaa-bbbbb')).toBe(
+          false,
+        );
+        expect(
+          isExcluded('range/:from/:to', `/range/${'a'.repeat(10)}/bbbbb`),
+        ).toBe(true);
+      });
+
+      it('should not limit wildcards or optional parameters left out', () => {
+        expect(isExcluded('docs/{*path}', `/docs/${'a'.repeat(50)}`)).toBe(
+          true,
+        );
+        expect(isExcluded('docs{/:page}', '/docs')).toBe(true);
+        expect(isExcluded('docs{/:page}', `/docs/${'a'.repeat(11)}`)).toBe(
+          false,
+        );
+      });
+    });
+    describe('when the router serves "/x/" with the first route that matches it', () => {
+      const matchingOptions = {
+        caseSensitive: true,
+        ignoreTrailingSlash: true,
+      };
+      const isExcluded = (
+        exclusions: (string | { path: string; method: RequestMethod })[],
+        servedRoutes: { path: string; method: RequestMethod }[],
+        url: string,
+        options: {
+          caseSensitive: boolean;
+          ignoreTrailingSlash: boolean;
+          removesTrailingSlash?: boolean;
+        } = matchingOptions,
+      ) => {
+        vi.spyOn(adapter, 'getRequestUrl').mockReturnValue(url);
+        return isMiddlewareRouteExcluded(
+          {},
+          mapToExcludeRoute(exclusions, options),
+          adapter,
+          options,
+          undefined,
+          () => mapToExcludeRoute(servedRoutes, options),
+        );
+      };
+      const reportsRoutes = [
+        { path: '/reports/{*path}', method: RequestMethod.GET },
+        { path: '/reports', method: RequestMethod.GET },
+      ];
+
+      it('should not exclude "/x/" when a route that matches "/x/" itself may serve it', () => {
+        expect(isExcluded(['reports'], reportsRoutes, '/reports/')).toBe(false);
+        expect(
+          isExcluded(
+            ['reports'],
+            [{ path: '/reports/{:id}', method: RequestMethod.GET }],
+            '/reports/',
+          ),
+        ).toBe(false);
+        expect(
+          isExcluded(
+            ['accounts/:id'],
+            [{ path: '/accounts/:id/{*path}', method: RequestMethod.GET }],
+            '/accounts/42/',
+          ),
+        ).toBe(false);
+      });
+
+      it('should still exclude "/x" and the paths only the excluded route serves', () => {
+        expect(isExcluded(['reports'], reportsRoutes, '/reports')).toBe(true);
+        expect(
+          isExcluded(
+            ['users/login'],
+            [{ path: '/users/:id', method: RequestMethod.GET }],
+            '/users/login/',
+          ),
+        ).toBe(true);
+        // The route of another method does not serve the request
+        expect(
+          isExcluded(
+            ['reports'],
+            [{ path: '/reports/{*path}', method: RequestMethod.DELETE }],
+            '/reports/',
+          ),
+        ).toBe(true);
+      });
+
+      it('should exclude "/x/" when an exclusion covers the route that matches it', () => {
+        expect(
+          isExcluded(
+            ['reports', 'reports/{*path}'],
+            reportsRoutes,
+            '/reports/',
+          ),
+        ).toBe(true);
+        // It matches "/reports/" only as "/reports" with a trailing slash,
+        // which does not cover the empty wildcard of "reports/{*path}"
+        expect(
+          isExcluded(['reports{/*path}'], reportsRoutes, '/reports/'),
+        ).toBe(false);
+        // Both conditions must hold for one exclusion
+        expect(
+          isExcluded(
+            ['reports', 'reports/{:id}/{*path}'],
+            reportsRoutes,
+            '/reports/',
+          ),
+        ).toBe(false);
+      });
+
+      it('should exclude "/x/" when the router removes the slash before it looks for a route', () => {
+        expect(
+          isExcluded(['reports'], reportsRoutes, '/reports/', {
+            ...matchingOptions,
+            removesTrailingSlash: true,
+          }),
+        ).toBe(true);
+      });
+    });
+    describe('when an excluded route has a version that is not in the path', () => {
+      const excludedRoutes = mapToExcludeRoute([
+        { path: 'cats/3', method: RequestMethod.GET, version: '1' },
+        { path: 'dogs/3', method: RequestMethod.GET, version: ['1', '2'] },
+        {
+          path: 'birds/3',
+          method: RequestMethod.GET,
+          version: ['1', VERSION_NEUTRAL],
+        },
+        { path: 'fish/3', method: RequestMethod.GET, version: VERSION_NEUTRAL },
+        { path: 'mice/3', method: RequestMethod.GET },
+      ]);
+      const isExcluded = (
+        url: string,
+        headers: Record<string, string>,
+        versioningOptions: VersioningOptions,
+      ) => {
+        vi.spyOn(adapter, 'getRequestUrl').mockReturnValue(url);
+        return isMiddlewareRouteExcluded(
+          { headers },
+          excludedRoutes,
+          adapter,
+          false,
+          versioningOptions,
+        );
+      };
+
+      describe('with header versioning', () => {
+        const versioning: VersioningOptions = {
+          type: VersioningType.HEADER,
+          header: 'X-Version',
+        };
+
+        it('should exclude the route only for a request for its version', () => {
+          expect(isExcluded('/cats/3', { 'x-version': '1' }, versioning)).toBe(
+            true,
+          );
+          expect(isExcluded('/cats/3', { 'x-version': '2' }, versioning)).toBe(
+            false,
+          );
+          expect(isExcluded('/cats/3', {}, versioning)).toBe(false);
+          expect(isExcluded('/dogs/3', { 'x-version': '2' }, versioning)).toBe(
+            true,
+          );
+          expect(isExcluded('/dogs/3', { 'x-version': '3' }, versioning)).toBe(
+            false,
+          );
+        });
+
+        it('should exclude a version-neutral route as before', () => {
+          expect(isExcluded('/birds/3', {}, versioning)).toBe(true);
+          expect(isExcluded('/birds/3', { 'x-version': '2' }, versioning)).toBe(
+            false,
+          );
+          expect(isExcluded('/fish/3', { 'x-version': '2' }, versioning)).toBe(
+            true,
+          );
+          expect(isExcluded('/mice/3', { 'x-version': '2' }, versioning)).toBe(
+            true,
+          );
+        });
+      });
+
+      it('should read the version of the Accept header with media type versioning', () => {
+        const versioning: VersioningOptions = {
+          type: VersioningType.MEDIA_TYPE,
+          key: 'v=',
+        };
+        expect(
+          isExcluded('/cats/3', { accept: 'application/json;v=1' }, versioning),
+        ).toBe(true);
+        expect(
+          isExcluded('/cats/3', { accept: 'application/json;v=2' }, versioning),
+        ).toBe(false);
+        expect(
+          isExcluded('/cats/3', { accept: 'application/json' }, versioning),
+        ).toBe(false);
+      });
+
+      it('should read a quoted media type version, like the router does', () => {
+        const versioning: VersioningOptions = {
+          type: VersioningType.MEDIA_TYPE,
+          key: 'v=',
+        };
+        expect(
+          isExcluded(
+            '/cats/3',
+            { accept: 'application/json;v="1"' },
+            versioning,
+          ),
+        ).toBe(true);
+        expect(
+          isExcluded(
+            '/cats/3',
+            { accept: 'application/json;v="2"' },
+            versioning,
+          ),
+        ).toBe(false);
+      });
+
+      it('should read a quoted media type version after other parameters', () => {
+        const versioning: VersioningOptions = {
+          type: VersioningType.MEDIA_TYPE,
+          key: 'v=',
+        };
+        expect(
+          isExcluded(
+            '/cats/3',
+            { accept: 'application/json; charset=utf-8; v="1" ;q=0.8' },
+            versioning,
+          ),
+        ).toBe(true);
+        expect(
+          isExcluded(
+            '/cats/3',
+            { accept: 'text/html, application/json;v="1"' },
+            versioning,
+          ),
+        ).toBe(true);
+      });
+
+      it('should ignore a version parameter inside a quoted value', () => {
+        const versioning: VersioningOptions = {
+          type: VersioningType.MEDIA_TYPE,
+          key: 'v=',
+        };
+        // The only version parameter is inside the quoted value, so the
+        // request asks for the version the route is not excluded for.
+        expect(
+          isExcluded(
+            '/cats/3',
+            { accept: 'application/json;note="a;v=2";v="1"' },
+            versioning,
+          ),
+        ).toBe(true);
+        expect(
+          isExcluded(
+            '/cats/3',
+            { accept: 'application/json;note="a;v=2"' },
+            versioning,
+          ),
+        ).toBe(false);
+      });
+
+      it('should read the version with the extractor of custom versioning', () => {
+        const extractor = vi.fn((request: any) =>
+          request.headers.versions?.split(','),
+        );
+        const versioning: VersioningOptions = {
+          type: VersioningType.CUSTOM,
+          extractor,
+        };
+        expect(isExcluded('/cats/3', { versions: '1' }, versioning)).toBe(true);
+        // The route that serves it may be one of another version
+        expect(isExcluded('/cats/3', { versions: '2,1' }, versioning)).toBe(
+          false,
+        );
+        expect(isExcluded('/dogs/3', { versions: '2,1' }, versioning)).toBe(
+          true,
+        );
+        // Not called for a request that matches no versioned route
+        extractor.mockClear();
+        expect(isExcluded('/mice/3', {}, versioning)).toBe(true);
+        expect(extractor).not.toHaveBeenCalled();
+      });
+
+      it('should not exclude the route when the extractor throws', () => {
+        const versioning: VersioningOptions = {
+          type: VersioningType.CUSTOM,
+          extractor: () => {
+            throw new Error('no version');
+          },
+        };
+        expect(isExcluded('/cats/3', {}, versioning)).toBe(false);
+      });
+
+      it('should leave the version to the path with URI versioning', () => {
+        const versioning: VersioningOptions = { type: VersioningType.URI };
+        expect(isExcluded('/cats/3', {}, versioning)).toBe(true);
+      });
+    });
+    describe('when the router matches a trailing slash exactly', () => {
+      it('should exclude "/x/" when it matches an excluded route', () => {
+        vi.spyOn(adapter, 'getRequestUrl').mockReturnValue('/invoices/');
+        expect(
+          isMiddlewareRouteExcluded(
+            {},
+            mapToExcludeRoute(['invoices/*'], {
+              caseSensitive: true,
+              ignoreTrailingSlash: false,
+            }),
+            adapter,
+          ),
+        ).toBe(true);
+      });
+    });
+    describe('when a HEAD request targets a route excluded for GET', () => {
+      const excludedRoutes = mapToExcludeRoute([
+        {
+          path: '/cats/*path',
+          method: RequestMethod.GET,
+        },
+      ]);
+      it('should return true', () => {
+        vi.spyOn(adapter, 'getRequestMethod').mockImplementation(() => 'HEAD');
+        expect(isMiddlewareRouteExcluded({}, excludedRoutes, adapter)).toBe(
+          true,
+        );
+      });
+    });
+    describe('when a GET request targets a route excluded only for HEAD', () => {
+      const excludedRoutes = mapToExcludeRoute([
+        {
+          path: '/cats/*path',
+          method: RequestMethod.HEAD,
+        },
+      ]);
+      it('should return false', () => {
+        expect(isMiddlewareRouteExcluded({}, excludedRoutes, adapter)).toBe(
+          false,
+        );
       });
     });
   });

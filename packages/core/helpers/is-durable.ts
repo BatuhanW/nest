@@ -1,0 +1,7 @@
+import { SCOPE_OPTIONS_METADATA } from '@nestjs/common/internal';
+import type { Type } from '@nestjs/common';
+
+export function isDurable(provider: Type<unknown>): boolean | undefined {
+  const metadata = Reflect.getMetadata(SCOPE_OPTIONS_METADATA, provider);
+  return metadata && metadata.durable;
+}

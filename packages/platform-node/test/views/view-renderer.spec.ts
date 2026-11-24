@@ -1,0 +1,852 @@
+import ejs from 'ejs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
+import handlebars from 'handlebars';
+import { tmpdir } from 'os';
+import { basename, dirname, join } from 'path';
+import { ViewRenderer } from '../../views/view-renderer.js';
+
+type Callback = (err: unknown, html?: string) => void;
+
+describe('ViewRenderer', () => {
+  let dir: string;
+  let views: string;
+  let renderer: ViewRenderer;
+
+  /** Writes `content` to `file`, relative to the temporary directory. */
+  const write = (file: string, content = '') => {
+    const path = join(dir, file);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, content);
+    return path;
+  };
+
+  /** An Express-style `(path, data, callback)` engine echoing the path. */
+  const createCallbackEngine = () =>
+    vi.fn((file: string, data: Record<string, any>, callback: Callback) =>
+      callback(null, file),
+    );
+
+  /** A `compile()` engine whose templates render the source and the data. */
+  const createCompileEngine = () => ({
+    compile: vi.fn(
+      (source: string, options: Record<string, any>) =>
+        (data: Record<string, any>) =>
+          `${source}:${data.name}`,
+    ),
+  });
+
+  /**
+   * A nunjucks-shaped engine: `compile()` returns a Template object instead
+   * of a function, and rendering goes through an `Environment` over a
+   * `FileSystemLoader`, as with the real nunjucks module.
+   */
+  const createNunjucksEngine = (
+    renderImpl?: (
+      name: string,
+      data: Record<string, any>,
+      callback: Callback,
+    ) => void,
+  ) => {
+    const loaderPaths: any[] = [];
+    const loaderOptions: any[] = [];
+    const environments: any[] = [];
+    class FileSystemLoader {
+      constructor(
+        public searchPaths: string | string[],
+        opts?: Record<string, any>,
+      ) {
+        loaderPaths.push(searchPaths);
+        loaderOptions.push(opts);
+      }
+    }
+    class Environment {
+      constructor(
+        public loader: FileSystemLoader,
+        public options: Record<string, any>,
+      ) {
+        environments.push(this);
+      }
+      render(name: string, data: Record<string, any>, callback: Callback) {
+        if (renderImpl) {
+          renderImpl(name, data, callback);
+        } else {
+          callback(null, `${name}:${data.name}`);
+        }
+      }
+    }
+    return {
+      engine: {
+        Environment,
+        FileSystemLoader,
+        compile: vi.fn(() => ({ render: () => 'compiled' })),
+      },
+      loaderPaths,
+      loaderOptions,
+      environments,
+    };
+  };
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'nest-view-renderer-'));
+    views = join(dir, 'views');
+    mkdirSync(views);
+    renderer = new ViewRenderer();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  describe('isConfigured', () => {
+    it('should be false until an engine is set', () => {
+      expect(renderer.isConfigured()).toBe(false);
+
+      renderer.setEngine({ engine: { ejs } });
+
+      expect(renderer.isConfigured()).toBe(true);
+    });
+
+    it('should be true once an engine name is set', () => {
+      renderer.setEngine('ejs');
+
+      expect(renderer.isConfigured()).toBe(true);
+    });
+  });
+
+  describe('setEngine', () => {
+    it('should throw a TypeError without an engine', () => {
+      expect(() => renderer.setEngine({ engine: {} })).toThrow(TypeError);
+      expect(renderer.isConfigured()).toBe(false);
+    });
+  });
+
+  describe('engines', () => {
+    it('should render with ejs, through its __express() function', async () => {
+      write('views/index.ejs', 'Hello <%= name %>!');
+      renderer.setEngine({ engine: { ejs }, root: views });
+
+      await expect(renderer.render('index', { name: 'Nest' })).resolves.toBe(
+        'Hello Nest!',
+      );
+    });
+
+    it('should render with handlebars, through its compile() function', async () => {
+      write('views/index.hbs', 'Hello {{name}}!');
+      renderer.setEngine({ engine: { handlebars }, root: views });
+
+      await expect(renderer.render('index', { name: 'Nest' })).resolves.toBe(
+        'Hello Nest!',
+      );
+    });
+
+    it('should call a function engine with the file, the data and a callback', async () => {
+      const file = write('views/index.fn');
+      const engine = vi.fn(
+        (path: string, data: Record<string, any>, callback: Callback) =>
+          callback(null, `<p>${data.name}</p>`),
+      );
+      renderer.setEngine({ engine: { fn: engine }, root: views });
+
+      const html = await renderer.render('index', { name: 'Nest' });
+
+      expect(html).toBe('<p>Nest</p>');
+      expect(engine).toHaveBeenCalledExactlyOnceWith(
+        file,
+        expect.objectContaining({ name: 'Nest' }),
+        expect.any(Function),
+      );
+    });
+
+    it('should call __express() with the file, the data and a callback', async () => {
+      const file = write('views/index.express');
+      const engine = { __express: createCallbackEngine() };
+      renderer.setEngine({ engine: { express: engine }, root: views });
+
+      await expect(renderer.render('index', { name: 'Nest' })).resolves.toBe(
+        file,
+      );
+      expect(engine.__express).toHaveBeenCalledExactlyOnceWith(
+        file,
+        expect.objectContaining({ name: 'Nest' }),
+        expect.any(Function),
+      );
+    });
+
+    it('should pass the views directory to __express() as Express does, for engines such as hbs', async () => {
+      write('views/index.express');
+      const engine = { __express: createCallbackEngine() };
+      renderer.setEngine({ engine: { express: engine }, root: views });
+
+      await renderer.render('index');
+
+      const { settings } = engine.__express.mock.calls[0][1];
+      expect(settings.views).toBe(views);
+      expect(settings['view engine']).toBe('express');
+    });
+
+    it('should pass every views directory when given several', async () => {
+      write('views/index.express');
+      const other = join(views, '..', 'other-views');
+      const engine = { __express: createCallbackEngine() };
+      renderer.setEngine({ engine: { express: engine }, root: [views, other] });
+
+      await renderer.render('index');
+
+      expect(engine.__express.mock.calls[0][1].settings.views).toEqual([
+        views,
+        other,
+      ]);
+    });
+
+    it('should compile the template with the options and the filename, then render it with the data', async () => {
+      const file = write('views/index.compiled', 'source');
+      const engine = createCompileEngine();
+      renderer.setEngine({
+        engine: { compiled: engine },
+        root: views,
+        options: { strict: true },
+      });
+
+      await expect(renderer.render('index', { name: 'Nest' })).resolves.toBe(
+        'source:Nest',
+      );
+      expect(engine.compile).toHaveBeenCalledExactlyOnceWith('source', {
+        strict: true,
+        filename: file,
+      });
+    });
+
+    it('should run a compile() template with the engine as "this" and the file, as Eta expects', async () => {
+      const file = write('views/index.eta', 'source');
+      const engine = {
+        greeting: 'hello',
+        compile: (source: string) =>
+          function (
+            this: { greeting: string },
+            data: { name: string },
+            options: { filepath: string },
+          ) {
+            return `${this.greeting} ${data.name} ${source} ${options.filepath}`;
+          },
+      };
+      renderer.setEngine({ engine: { eta: engine }, root: views });
+
+      await expect(renderer.render('index', { name: 'a' })).resolves.toBe(
+        `hello a source ${file}`,
+      );
+    });
+
+    it('should render with nunjucks, through an Environment over the views directories', async () => {
+      write('views/index.njk', 'Hello {{ name }}!');
+      const { engine, loaderPaths, environments } = createNunjucksEngine();
+      renderer.setEngine({ engine: { nunjucks: engine }, root: views });
+
+      await expect(renderer.render('index', { name: 'Nest' })).resolves.toBe(
+        'index.njk:Nest',
+      );
+      expect(engine.compile).not.toHaveBeenCalled();
+      expect(loaderPaths).toEqual([[views]]);
+      expect(environments).toHaveLength(1);
+      expect(environments[0].options).toEqual({});
+    });
+
+    it('should pass the engine options to the nunjucks Environment', async () => {
+      write('views/index.njk', 'Hello {{ name }}!');
+      const { engine, environments } = createNunjucksEngine();
+      renderer.setEngine({
+        engine: { nunjucks: engine },
+        root: views,
+        options: { autoescape: false },
+      });
+
+      await renderer.render('index', { name: 'Nest' });
+
+      expect(environments[0].options).toEqual({ autoescape: false });
+    });
+
+    it('should render every nunjucks view through one Environment', async () => {
+      write('views/index.njk', 'index');
+      write('views/admin/list.njk', 'list');
+      const { engine, environments } = createNunjucksEngine();
+      renderer.setEngine({ engine: { nunjucks: engine }, root: views });
+
+      await renderer.render('index', { name: 'Nest' });
+      await renderer.render('admin/list', { name: 'Nest' });
+      await renderer.render('index', { name: 'Nest' });
+
+      expect(environments).toHaveLength(1);
+    });
+
+    it('should hand the nunjucks Environment to "onConfigure" once, as @fastify/view does', async () => {
+      write('views/index.njk', 'index');
+      write('views/other.njk', 'other');
+      const { engine, environments } = createNunjucksEngine();
+      const onConfigure = vi.fn();
+      renderer.setEngine({
+        engine: { nunjucks: engine },
+        root: views,
+        options: { autoescape: false, onConfigure },
+      });
+
+      await renderer.render('index', { name: 'Nest' });
+      await renderer.render('other', { name: 'Nest' });
+
+      expect(onConfigure).toHaveBeenCalledExactlyOnceWith(environments[0]);
+      expect(environments[0].options).toEqual({ autoescape: false });
+    });
+
+    it.each([
+      ['outside production', false, {}, true],
+      ['in production', true, {}, false],
+      ['when "noCache" is set', true, { noCache: true }, true],
+    ])(
+      'should set the nunjucks loader "noCache" %s',
+      async (_case, production, options, noCache) => {
+        write('views/index.njk', 'index');
+        const { engine, loaderOptions } = createNunjucksEngine();
+        renderer.setEngine({
+          engine: { nunjucks: engine },
+          root: views,
+          production,
+          options: { ...options, watch: false },
+        });
+
+        await renderer.render('index', { name: 'Nest' });
+
+        expect(loaderOptions).toEqual([{ watch: false, noCache }]);
+      },
+    );
+
+    it('should create a new nunjucks Environment once the views directories change', async () => {
+      const other = join(dir, 'other-views');
+      write('views/index.njk', 'first');
+      write('other-views/index.njk', 'second');
+      const { engine, loaderPaths, environments } = createNunjucksEngine();
+      renderer.setEngine({ engine: { nunjucks: engine }, root: views });
+
+      await renderer.render('index', { name: 'Nest' });
+      renderer.setBaseViewsDir(other);
+      await renderer.render('index', { name: 'Nest' });
+
+      expect(environments).toHaveLength(2);
+      expect(loaderPaths).toEqual([[views], [other]]);
+    });
+
+    it('should render a nunjucks view in a subdirectory by its path relative to the views directory', async () => {
+      write('views/admin/list.njk', 'list');
+      const { engine } = createNunjucksEngine();
+      renderer.setEngine({ engine: { nunjucks: engine }, root: views });
+
+      await expect(
+        renderer.render('admin/list', { name: 'Nest' }),
+      ).resolves.toBe('admin/list.njk:Nest');
+    });
+
+    it('should look for a nunjucks view in every views directory', async () => {
+      const other = join(dir, 'other-views');
+      write('other-views/only-second.njk', 'second');
+      const { engine, loaderPaths } = createNunjucksEngine();
+      renderer.setEngine({
+        engine: { nunjucks: engine },
+        root: [views, other],
+      });
+
+      await expect(
+        renderer.render('only-second', { name: 'Nest' }),
+      ).resolves.toBe('only-second.njk:Nest');
+      expect(loaderPaths).toEqual([[views, other]]);
+    });
+
+    it('should reject with the error the nunjucks Environment passes to its callback', async () => {
+      write('views/index.njk', 'bad {{');
+      const error = new Error('template error');
+      const { engine } = createNunjucksEngine((name, data, callback) =>
+        callback(error),
+      );
+      renderer.setEngine({ engine: { nunjucks: engine }, root: views });
+
+      await expect(renderer.render('index')).rejects.toBe(error);
+    });
+
+    it('should use the promise of an engine that ignores the callback, as liquidjs does', async () => {
+      write('views/index.liquid', 'source');
+      const engine = {
+        renderFile: vi.fn(async (file: string) => basename(file)),
+      };
+      renderer.setEngine({ engine: { liquid: engine }, root: views });
+
+      await expect(renderer.render('index')).resolves.toBe('index.liquid');
+    });
+
+    it('should reject when the promise of such an engine rejects', async () => {
+      write('views/index.liquid', 'source');
+      const error = new Error('parse error');
+      const engine = { renderFile: vi.fn(() => Promise.reject(error)) };
+      renderer.setEngine({ engine: { liquid: engine }, root: views });
+
+      await expect(renderer.render('index')).rejects.toBe(error);
+    });
+
+    it('should use the html an engine returns without calling back, as art-template does', async () => {
+      write('views/index.art', 'source');
+      const engine = vi.fn((file: string) => basename(file));
+      renderer.setEngine({ engine: { art: engine }, root: views });
+
+      await expect(renderer.render('index')).resolves.toBe('index.art');
+    });
+
+    it('should wait for the callback of an engine whose promise settles first', async () => {
+      write('views/index.late', 'source');
+      const engine = async (file: string, data: object, callback: Callback) => {
+        setTimeout(() => callback(null, 'late'));
+      };
+      renderer.setEngine({ engine: { late: engine }, root: views });
+
+      await expect(renderer.render('index')).resolves.toBe('late');
+    });
+
+    it('should call renderFile() with the file, the data and a callback', async () => {
+      const file = write('views/index.rf');
+      const engine = { renderFile: createCallbackEngine() };
+      renderer.setEngine({ engine: { rf: engine }, root: views });
+
+      await expect(renderer.render('index', { name: 'Nest' })).resolves.toBe(
+        file,
+      );
+      expect(engine.renderFile).toHaveBeenCalledExactlyOnceWith(
+        file,
+        expect.objectContaining({ name: 'Nest' }),
+        expect.any(Function),
+      );
+    });
+
+    it('should reject with the error an engine passes to its callback', async () => {
+      write('views/index.fn');
+      const error = new Error('template error');
+      renderer.setEngine({
+        engine: {
+          fn: (path: string, data: object, callback: Callback) =>
+            callback(error),
+        },
+        root: views,
+      });
+
+      await expect(renderer.render('index')).rejects.toBe(error);
+    });
+
+    it('should reject with a TypeError for an engine exposing none of __express(), compile() or renderFile()', async () => {
+      write('views/index.odd');
+      renderer.setEngine({ engine: { odd: { render: vi.fn() } }, root: views });
+
+      await expect(renderer.render('index')).rejects.toThrow(TypeError);
+    });
+  });
+
+  describe('view lookup', () => {
+    it('should default to the "views" directory of the working directory', async () => {
+      vi.spyOn(process, 'cwd').mockReturnValue(dir);
+      const file = write('views/index.fn');
+      renderer = new ViewRenderer();
+      renderer.setEngine({ engine: { fn: createCallbackEngine() } });
+
+      await expect(renderer.render('index')).resolves.toBe(file);
+    });
+
+    it.each(['root', 'templates'] as const)(
+      'should search the %s directories in order',
+      async option => {
+        const first = join(dir, 'first');
+        const second = join(dir, 'second');
+        const inFirst = write('first/both.fn');
+        write('second/both.fn');
+        const inSecond = write('second/only-second.fn');
+        renderer.setEngine({
+          engine: { fn: createCallbackEngine() },
+          [option]: [first, second],
+        });
+
+        await expect(renderer.render('both')).resolves.toBe(inFirst);
+        await expect(renderer.render('only-second')).resolves.toBe(inSecond);
+      },
+    );
+
+    it('should render a view in a subdirectory', async () => {
+      const file = write('views/admin/users/list.fn');
+      renderer.setEngine({
+        engine: { fn: createCallbackEngine() },
+        root: views,
+      });
+
+      await expect(renderer.render('admin/users/list')).resolves.toBe(file);
+    });
+
+    it.each([
+      ['handlebars', 'hbs'],
+      ['nunjucks', 'njk'],
+      ['ejs', 'ejs'],
+    ])(
+      'should append the default extension of %s (.%s)',
+      async (name, extension) => {
+        write(`views/index.${extension}`, 'source');
+        renderer.setEngine({
+          engine: { [name]: createCompileEngine() },
+          root: views,
+        });
+
+        await expect(renderer.render('index', { name: 'Nest' })).resolves.toBe(
+          'source:Nest',
+        );
+      },
+    );
+
+    it('should fall back to the index file of a directory named like the view, as Express does', async () => {
+      write('views/users/index.ejs', 'users index');
+      renderer.setEngine({ engine: { ejs }, root: views });
+
+      await expect(renderer.render('users')).resolves.toBe('users index');
+      await expect(renderer.render('users/')).resolves.toBe('users index');
+      await expect(renderer.render('users.ejs')).resolves.toBe('users index');
+    });
+
+    it('should prefer a view file to the index file of a directory named like it', async () => {
+      write('views/users.ejs', 'users file');
+      write('views/users/index.ejs', 'users index');
+      renderer.setEngine({ engine: { ejs }, root: views });
+
+      await expect(renderer.render('users')).resolves.toBe('users file');
+    });
+
+    it('should resolve to the index file when trailing slash is used, even if a file shares the name', async () => {
+      write('views/a.ejs', 'a file');
+      write('views/a/index.ejs', 'a index');
+      renderer.setEngine({ engine: { ejs }, root: views });
+
+      await expect(renderer.render('a')).resolves.toBe('a file');
+      await expect(renderer.render('a/')).resolves.toBe('a index');
+    });
+
+    it('should not fall back to a view file when trailing slash names a missing index file', async () => {
+      write('views/a.ejs', 'a file');
+      renderer.setEngine({ engine: { ejs }, root: views });
+
+      await expect(renderer.render('a')).resolves.toBe('a file');
+      await expect(renderer.render('a/')).rejects.toThrow(
+        'Failed to lookup view',
+      );
+    });
+
+    it('should resolve a view named with its extension and a trailing slash, as Express does', async () => {
+      write('views/a.ejs', 'a file');
+      write('views/users/index.ejs', 'users index');
+      renderer.setEngine({ engine: { ejs }, root: views });
+
+      await expect(renderer.render('a.ejs/')).resolves.toBe('a file');
+      await expect(renderer.render('users.ejs/')).resolves.toBe('users index');
+    });
+
+    it('should not resolve "/" to ".<ext>" at the views root', async () => {
+      write('views/.ejs', 'root dot ejs');
+      renderer.setEngine({ engine: { ejs }, root: views });
+
+      await expect(renderer.render('/')).rejects.toThrow(
+        'Failed to lookup view',
+      );
+      await expect(renderer.render('\\')).rejects.toThrow(
+        'Failed to lookup view',
+      );
+    });
+
+    it('should not take a directory named like the view file for it', async () => {
+      mkdirSync(join(views, 'users.ejs'));
+      write('views/users/index.ejs', 'users index');
+      renderer.setEngine({ engine: { ejs }, root: views });
+
+      await expect(renderer.render('users')).resolves.toBe('users index');
+    });
+
+    it('should look for the index file in a subdirectory', async () => {
+      write('views/admin/users/index.ejs', 'admin users index');
+      renderer.setEngine({ engine: { ejs }, root: views });
+
+      await expect(renderer.render('admin/users')).resolves.toBe(
+        'admin users index',
+      );
+    });
+
+    it('should prefer a view file of a later directory to the index file of an earlier one', async () => {
+      write('views/users/index.ejs', 'users index');
+      write('more/users.ejs', 'users file');
+      renderer.setEngine({ engine: { ejs }, root: [views, join(dir, 'more')] });
+
+      await expect(renderer.render('users')).resolves.toBe('users file');
+    });
+
+    it('should look for the index file in every directory', async () => {
+      write('more/users/index.ejs', 'users index');
+      renderer.setEngine({ engine: { ejs }, root: [views, join(dir, 'more')] });
+
+      await expect(renderer.render('users')).resolves.toBe('users index');
+    });
+
+    it('should append viewExt to names without an extension', async () => {
+      const file = write('views/index.html');
+      write('views/index.fn');
+      renderer.setEngine({
+        engine: { fn: createCallbackEngine() },
+        root: views,
+        viewExt: 'html',
+      });
+
+      await expect(renderer.render('index')).resolves.toBe(file);
+    });
+
+    it('should keep the extension of a name that has one', async () => {
+      const file = write('views/page.txt');
+      renderer.setEngine({
+        engine: { fn: createCallbackEngine() },
+        root: views,
+      });
+
+      await expect(renderer.render('page.txt')).resolves.toBe(file);
+    });
+
+    it('should fall back to the index file with the extension of the name', async () => {
+      const file = write('views/page/index.txt');
+      renderer.setEngine({
+        engine: { fn: createCallbackEngine() },
+        root: views,
+      });
+
+      await expect(renderer.render('page.txt')).resolves.toBe(file);
+    });
+
+    it('should reject a view that does not exist', async () => {
+      const engine = createCallbackEngine();
+      renderer.setEngine({ engine: { fn: engine }, root: views });
+
+      await expect(renderer.render('missing')).rejects.toThrow(
+        'Failed to lookup view',
+      );
+      expect(engine).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['a relative path', () => '../secret'],
+      ['an absolute path', () => join(dir, 'secret')],
+      ['a sibling directory sharing its prefix', () => '../views-secret/page'],
+    ])(
+      'should not render %s resolving outside the views directories',
+      async (_, getView) => {
+        write('secret.fn', 'secret');
+        write('secret/index.fn', 'secret');
+        write('views-secret/page.fn', 'secret');
+        write('views-secret/page/index.fn', 'secret');
+        const engine = createCallbackEngine();
+        renderer.setEngine({ engine: { fn: engine }, root: views });
+
+        await expect(renderer.render(getView())).rejects.toThrow(
+          'Failed to lookup view',
+        );
+        expect(engine).not.toHaveBeenCalled();
+      },
+    );
+  });
+
+  describe('data', () => {
+    it('should merge defaultContext under the render data', async () => {
+      write('views/index.fn');
+      const engine = createCallbackEngine();
+      const defaultContext = { title: 'Default', site: 'Nest' };
+      renderer.setEngine({
+        engine: { fn: engine },
+        root: views,
+        defaultContext,
+      });
+
+      await renderer.render('index', { title: 'Page' });
+
+      expect(engine.mock.calls[0][1]).toMatchObject({
+        title: 'Page',
+        site: 'Nest',
+      });
+      expect(defaultContext).toEqual({ title: 'Default', site: 'Nest' });
+    });
+
+    it('should pass the options to an ejs-style engine as "view options"', async () => {
+      // ejs reads these two only from "view options", never from the data
+      write('views/index.ejs', 'Hello [%= name %]!');
+      renderer.setEngine({
+        engine: { ejs },
+        root: views,
+        options: { openDelimiter: '[', closeDelimiter: ']' },
+      });
+
+      await expect(renderer.render('index', { name: 'Nest' })).resolves.toBe(
+        'Hello Nest!',
+      );
+    });
+
+    it('should pass the options to a compile() engine', async () => {
+      write('views/index.hbs', '{{name}}');
+      renderer.setEngine({
+        engine: { handlebars },
+        root: views,
+        options: { noEscape: true },
+      });
+
+      await expect(
+        renderer.render('index', { name: '<b>Nest</b>' }),
+      ).resolves.toBe('<b>Nest</b>');
+    });
+
+    it('should not let the data override the settings passed to the engine', async () => {
+      write('views/index.express');
+      const engine = { __express: createCallbackEngine() };
+      const options = { rmWhitespace: true };
+      renderer.setEngine({
+        engine: { express: engine },
+        root: views,
+        options,
+        production: false,
+      });
+
+      await renderer.render('index', {
+        name: 'Nest',
+        settings: {
+          'view options': { client: true, escapeFunction: 'evil()' },
+          'view cache': true,
+        },
+      });
+
+      const data = engine.__express.mock.calls[0][1];
+      expect(data.name).toBe('Nest');
+      expect(data.settings).toEqual({
+        views,
+        'view engine': 'express',
+        'view options': options,
+        'view cache': false,
+      });
+    });
+
+    it('should not let the data inject ejs options through "settings" (CVE-2022-29078)', async () => {
+      write('views/index.ejs', 'Hello <%= name %>!');
+      renderer.setEngine({ engine: { ejs }, root: views });
+
+      const html = await renderer.render('index', {
+        name: 'Nest',
+        settings: {
+          'view options': { openDelimiter: '[', closeDelimiter: ']' },
+        },
+      });
+
+      expect(html).toBe('Hello Nest!');
+    });
+  });
+
+  describe('caching', () => {
+    it('should resolve and compile a view once with production: true', async () => {
+      write('views/index.compiled', 'source');
+      const engine = createCompileEngine();
+      renderer.setEngine({
+        engine: { compiled: engine },
+        root: views,
+        production: true,
+      });
+
+      await expect(renderer.render('index', { name: 'a' })).resolves.toBe(
+        'source:a',
+      );
+      rmSync(join(views, 'index.compiled'));
+      await expect(renderer.render('index', { name: 'b' })).resolves.toBe(
+        'source:b',
+      );
+      expect(engine.compile).toHaveBeenCalledTimes(1);
+    });
+
+    it('should resolve and compile a view on every render with production: false', async () => {
+      write('views/index.compiled', 'source');
+      const engine = createCompileEngine();
+      renderer.setEngine({
+        engine: { compiled: engine },
+        root: views,
+        production: false,
+      });
+
+      await renderer.render('index', { name: 'a' });
+      await renderer.render('index', { name: 'b' });
+
+      expect(engine.compile).toHaveBeenCalledTimes(2);
+    });
+
+    it('should pick up template changes with production: false', async () => {
+      write('views/index.hbs', 'first {{name}}');
+      renderer.setEngine({
+        engine: { handlebars },
+        root: views,
+        production: false,
+      });
+
+      await expect(renderer.render('index', { name: 'Nest' })).resolves.toBe(
+        'first Nest',
+      );
+      write('views/index.hbs', 'second {{name}}');
+      await expect(renderer.render('index', { name: 'Nest' })).resolves.toBe(
+        'second Nest',
+      );
+    });
+
+    it('should cache when NODE_ENV is "production" by default', async () => {
+      vi.stubEnv('NODE_ENV', 'production');
+      write('views/index.compiled', 'source');
+      const engine = createCompileEngine();
+      renderer = new ViewRenderer();
+      renderer.setEngine({ engine: { compiled: engine }, root: views });
+
+      await renderer.render('index', { name: 'a' });
+      await renderer.render('index', { name: 'b' });
+
+      expect(engine.compile).toHaveBeenCalledTimes(1);
+    });
+
+    it('should drop the cached views when the views directory changes', async () => {
+      const inFirst = write('first/index.fn');
+      const inSecond = write('second/index.fn');
+      renderer.setEngine({
+        engine: { fn: createCallbackEngine() },
+        root: join(dir, 'first'),
+        production: true,
+      });
+
+      await expect(renderer.render('index')).resolves.toBe(inFirst);
+      renderer.setBaseViewsDir(join(dir, 'second'));
+      await expect(renderer.render('index')).resolves.toBe(inSecond);
+    });
+  });
+
+  describe('engine names', () => {
+    it('should load the engine module on the first render', async () => {
+      write('views/index.ejs', 'Hello <%= name %>!');
+      renderer.setEngine('ejs');
+      renderer.setBaseViewsDir(views);
+
+      await expect(renderer.render('index', { name: 'Nest' })).resolves.toBe(
+        'Hello Nest!',
+      );
+    });
+
+    it('should reject with a clear error when the engine cannot be loaded', async () => {
+      write('views/index.nest-missing-view-engine');
+      renderer.setEngine('nest-missing-view-engine');
+      renderer.setBaseViewsDir(views);
+
+      await expect(renderer.render('index')).rejects.toThrow(
+        'Cannot load the "nest-missing-view-engine" view engine',
+      );
+      await expect(renderer.render('index')).rejects.toThrow(
+        'Cannot load the "nest-missing-view-engine" view engine',
+      );
+    });
+  });
+});

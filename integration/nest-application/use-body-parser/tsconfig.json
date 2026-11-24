@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "types": ["vitest/globals"],
+    "module": "commonjs",
+    "declaration": false,
+    "noImplicitAny": false,
+    "removeComments": true,
+    "lib": ["dom"],
+    "noLib": false,
+    "esModuleInterop": true,
+    "emitDecoratorMetadata": true,
+    "experimentalDecorators": true,
+    "target": "ES2023",
+    "sourceMap": true,
+    "allowJs": true,
+    "outDir": "./dist"
+  },
+  "include": [
+    "src/**/*",
+    "e2e/**/*"
+  ],
+  "exclude": [
+    "node_modules"
+  ]
+}

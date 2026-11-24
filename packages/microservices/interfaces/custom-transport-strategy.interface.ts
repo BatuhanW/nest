@@ -1,7 +1,20 @@
-import { Transport } from '../enums';
+import { TransportId } from './microservice-configuration.interface.js';
 
+/**
+ * @publicApi
+ */
 export interface CustomTransportStrategy {
-  readonly transportId?: Transport;
-  listen(callback: () => void): any;
+  /**
+   * Unique transport identifier.
+   */
+  transportId?: TransportId;
+  /**
+   * Method called when the transport is being initialized.
+   * @param callback Function to be called upon initialization
+   */
+  listen(callback: (...optionalParams: unknown[]) => any): any;
+  /**
+   * Method called when the transport is being terminated.
+   */
   close(): any;
 }

@@ -1,8 +1,7 @@
 import { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import { expect } from 'chai';
-import * as io from 'socket.io-client';
-import { ErrorGateway } from '../src/error.gateway';
+import { io } from 'socket.io-client';
+import { ErrorGateway } from '../src/error.gateway.js';
 
 describe('ErrorGateway', () => {
   let app: INestApplication;
@@ -11,20 +10,27 @@ describe('ErrorGateway', () => {
     const testingModule = await Test.createTestingModule({
       providers: [ErrorGateway],
     }).compile();
-    app = await testingModule.createNestApplication();
-    await app.listenAsync(3000);
+
+    app = testingModule.createNestApplication();
+    await app.listen(3000);
   });
 
   it(`should handle error`, async () => {
-    const ws = io.connect('http://localhost:8080');
-    ws.emit('push', {
-      test: 'test',
-    });
+    const ws = io('http://localhost:8080');
+    const pattern = 'push';
+    const data = { test: 'test' };
+
+    ws.emit(pattern, data);
+
     await new Promise<void>(resolve =>
-      ws.on('exception', data => {
-        expect(data).to.be.eql({
+      ws.on('exception', error => {
+        expect(error).toEqual({
           status: 'error',
           message: 'test',
+          cause: {
+            pattern,
+            data,
+          },
         });
         resolve();
       }),

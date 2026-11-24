@@ -1,13 +1,12 @@
-import { loadPackage } from '@nestjs/common/utils/load-package.util';
-import { isUndefined } from '@nestjs/common/utils/shared.utils';
-import { ClientKafka } from '../client/client-kafka';
+import { ClientKafka } from '../client/client-kafka.js';
 import {
   Cluster,
   GroupMember,
   GroupMemberAssignment,
   GroupState,
   MemberMetadata,
-} from '../external/kafka.interface';
+} from '../external/kafka.interface.js';
+import { loadPackageCached, isUndefined } from '@nestjs/common/internal';
 
 let kafkaPackage: any = {};
 
@@ -21,10 +20,10 @@ export class KafkaReplyPartitionAssigner {
       cluster: Cluster;
     },
   ) {
-    kafkaPackage = loadPackage(
+    // ClientKafka loads kafkajs (createClient()) before it creates the assigner
+    kafkaPackage = loadPackageCached(
       'kafkajs',
       KafkaReplyPartitionAssigner.name,
-      () => require('kafkajs'),
     );
   }
 
@@ -39,6 +38,7 @@ export class KafkaReplyPartitionAssigner {
     members: GroupMember[];
     topics: string[];
   }): Promise<GroupMemberAssignment[]> {
+    kafkaPackage = await kafkaPackage;
     const assignment = {};
     const previousAssignment = {};
 
@@ -61,19 +61,14 @@ export class KafkaReplyPartitionAssigner {
     });
 
     // build a collection of topics and partitions
-    const topicsPartitions = group.topics
-      .map(topic => {
-        const partitionMetadata = this.config.cluster.findTopicPartitionMetadata(
-          topic,
-        );
-        return partitionMetadata.map(m => {
-          return {
-            topic,
-            partitionId: m.partitionId,
-          };
-        });
-      })
-      .reduce((acc, val) => acc.concat(val), []);
+    const topicsPartitions = group.topics.flatMap(topic => {
+      const partitionMetadata =
+        this.config.cluster.findTopicPartitionMetadata(topic);
+      return partitionMetadata.map(m => ({
+        topic,
+        partitionId: m.partitionId,
+      }));
+    });
 
     // create the new assignment by populating the members with the first partition of the topics
     sortedMemberIds.forEach(assignee => {
@@ -95,9 +90,6 @@ export class KafkaReplyPartitionAssigner {
           // take the minimum partition since replies will be sent to the minimum partition
           const firstPartition = previousAssignment[assignee][topic];
 
-          // create the assignment with the first partition
-          assignment[assignee][topic].push(firstPartition);
-
           // find and remove this topic and partition from the topicPartitions to be assigned later
           const topicsPartitionsIndex = topicsPartitions.findIndex(
             topicPartition => {
@@ -108,8 +100,11 @@ export class KafkaReplyPartitionAssigner {
             },
           );
 
-          // only continue if we found a partition matching this topic
+          // only keep a partition that exists and is not taken yet, otherwise
+          // the member gets a free partition below
           if (topicsPartitionsIndex !== -1) {
+            // create the assignment with the first partition
+            assignment[assignee][topic].push(firstPartition);
             // remove inline
             topicsPartitions.splice(topicsPartitionsIndex, 1);
           }
@@ -189,14 +184,50 @@ export class KafkaReplyPartitionAssigner {
   }
 
   public decodeMember(member: GroupMember) {
-    const memberMetadata = kafkaPackage.AssignerProtocol.MemberMetadata.decode(
-      member.memberMetadata,
-    ) as MemberMetadata;
-    const memberUserData = JSON.parse(memberMetadata.userData.toString());
+    // kafkaPackage must be resolved before calling this method
+    // (it is resolved in assign() which calls decodeMember)
+    let memberMetadata: MemberMetadata;
+    try {
+      memberMetadata = kafkaPackage.AssignerProtocol.MemberMetadata.decode(
+        member.memberMetadata,
+      ) as MemberMetadata;
+    } catch {
+      return { memberId: member.memberId, previousAssignment: {} };
+    }
 
     return {
       memberId: member.memberId,
-      previousAssignment: memberUserData.previousAssignment,
+      previousAssignment: this.decodePreviousAssignment(
+        memberMetadata.userData,
+      ),
     };
+  }
+
+  /**
+   * The metadata carried by a group member is chosen by that member, so it is
+   * parsed defensively: malformed or missing data must not make the rebalance
+   * fail, as a group that never stabilizes leaves the client unable to consume
+   * replies. Anything that is not a `previousAssignment` record degrades to an
+   * empty assignment (the member is then treated as new).
+   */
+  private decodePreviousAssignment(
+    userData: Buffer | undefined,
+  ): Record<string, unknown> {
+    const rawUserData = userData?.toString();
+    if (!rawUserData) {
+      return {};
+    }
+    try {
+      const previousAssignment = (
+        JSON.parse(rawUserData) as { previousAssignment?: unknown }
+      )?.previousAssignment;
+      return previousAssignment &&
+        typeof previousAssignment === 'object' &&
+        !Array.isArray(previousAssignment)
+        ? (previousAssignment as Record<string, unknown>)
+        : {};
+    } catch {
+      return {};
+    }
   }
 }

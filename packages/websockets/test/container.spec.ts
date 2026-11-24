@@ -1,49 +1,54 @@
-import { expect } from 'chai';
-import * as sinon from 'sinon';
-import { SocketsContainer } from '../sockets-container';
+import hash from 'object-hash';
+import { SocketsContainer } from '../sockets-container.js';
 
 describe('SocketsContainer', () => {
-  const namespace = 'test';
   const port = 30;
 
   let instance: SocketsContainer;
-  let getSpy: sinon.SinonSpy, setSpy: sinon.SinonSpy;
+  let getSpy: ReturnType<typeof vi.fn>, setSpy: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
-    setSpy = sinon.spy();
-    getSpy = sinon.spy();
+    setSpy = vi.fn();
+    getSpy = vi.fn();
     instance = new SocketsContainer();
-    (instance as any).socketEventHosts = {
+    (instance as any).serverAndEventStreamsHosts = {
       get: getSpy,
       set: setSpy,
     };
   });
   describe('getSocketEventsHostByPort', () => {
-    it(`should call "socketEventHosts" get method with expected arguments`, () => {
-      instance.getSocketEventsHostByPort(port);
-      expect(getSpy.calledWith(port.toString())).to.be.true;
+    it(`should call "serverAndEventStreamsHosts" get method with expected arguments`, () => {
+      const config = { port, path: 'random' };
+      instance.getOneByConfig(config);
+
+      const token = hash(config);
+      expect(getSpy).toHaveBeenCalledWith(token);
     });
   });
-  describe('addSocketEventsHost', () => {
-    it(`should call "socketEventHosts" set method with expected arguments`, () => {
+  describe('addOne', () => {
+    it(`should call "serverAndEventStreamsHosts" set method with expected arguments`, () => {
       const server = {};
-      instance.addSocketEventsHost(namespace, port, server as any);
-      expect(setSpy.calledWith(`${namespace}:${port}`, server)).to.be.true;
+      const config = { port, path: 'random' };
+
+      instance.addOne(config, server as any);
+
+      const token = hash(config);
+      expect(setSpy).toHaveBeenCalledWith(token, server);
     });
   });
-  describe('getAllSocketEventHosts', () => {
-    it('should return "socketEventHosts"', () => {
+  describe('getAll', () => {
+    it('should return "serverAndEventStreamsHosts"', () => {
       const collection = ['test'];
-      (instance as any).socketEventHosts = collection;
-      expect(instance.getAllSocketEventHosts()).to.be.eq(collection);
+      (instance as any).serverAndEventStreamsHosts = collection;
+      expect(instance.getAll()).toBe(collection);
     });
   });
   describe('clear', () => {
     it('should clear hosts collection', () => {
-      const collection = { clear: sinon.spy() };
-      (instance as any).socketEventHosts = collection;
+      const collection = { clear: vi.fn() };
+      (instance as any).serverAndEventStreamsHosts = collection;
       instance.clear();
-      expect(collection.clear.called).to.be.true;
+      expect(collection.clear).toHaveBeenCalled();
     });
   });
 });

@@ -1,17 +1,17 @@
-import { expect } from 'chai';
-import * as sinon from 'sinon';
-import { ClientKafka } from '../../client/client-kafka';
-import { NO_MESSAGE_HANDLER } from '../../constants';
-import { KafkaHeaders } from '../../enums';
-import { InvalidKafkaClientTopicException } from '../../errors/invalid-kafka-client-topic.exception';
+import { Producer } from 'kafkajs';
+import { lastValueFrom, Observable } from 'rxjs';
+import { ClientKafka } from '../../client/client-kafka.js';
+import { NO_MESSAGE_HANDLER } from '../../constants.js';
+import { KafkaHeaders } from '../../enums/index.js';
+import { InvalidKafkaClientTopicException } from '../../errors/invalid-kafka-client-topic.exception.js';
+import { MaxPacketLengthExceededException } from '../../errors/max-packet-length-exceeded.exception.js';
 import {
   ConsumerGroupJoinEvent,
   EachMessagePayload,
   KafkaMessage,
-} from '../../external/kafka.interface';
+} from '../../external/kafka.interface.js';
 
 describe('ClientKafka', () => {
-  // static
   const topic = 'test.topic';
   const partition = 0;
   const replyTopic = 'test.topic.reply';
@@ -22,8 +22,9 @@ describe('ClientKafka', () => {
   const timestamp = new Date().toISOString();
   const attributes = 1;
   const messageValue = 'test-message';
+  const heartbeat = async () => {};
+  const pause = () => () => {};
 
-  // message
   const message: KafkaMessage = {
     key: Buffer.from(key),
     offset,
@@ -33,7 +34,6 @@ describe('ClientKafka', () => {
     attributes,
   };
 
-  // deserialized message
   const deserializedMessage: any = {
     key,
     offset,
@@ -45,7 +45,6 @@ describe('ClientKafka', () => {
     partition,
   };
 
-  // payloads
   const payload: EachMessagePayload = {
     topic,
     partition,
@@ -57,6 +56,8 @@ describe('ClientKafka', () => {
       },
       message,
     ),
+    heartbeat,
+    pause,
   };
 
   const payloadDisposed: EachMessagePayload = {
@@ -72,9 +73,11 @@ describe('ClientKafka', () => {
       message,
       {
         size: 0,
-        value: { test: true },
+        value: Buffer.from(JSON.stringify({ test: true })),
       },
     ),
+    heartbeat,
+    pause,
   };
 
   const payloadError: EachMessagePayload = {
@@ -93,6 +96,8 @@ describe('ClientKafka', () => {
         value: null,
       },
     ),
+    heartbeat,
+    pause,
   };
 
   const payloadWithoutCorrelation: EachMessagePayload = {
@@ -104,6 +109,8 @@ describe('ClientKafka', () => {
       },
       message,
     ),
+    heartbeat,
+    pause,
   };
 
   // deserialized payload
@@ -118,6 +125,8 @@ describe('ClientKafka', () => {
       },
       deserializedMessage,
     ),
+    heartbeat,
+    pause,
   };
 
   const deserializedPayloadDisposed: EachMessagePayload = {
@@ -136,62 +145,76 @@ describe('ClientKafka', () => {
         value: { test: true },
       },
     ),
-  };
-
-  const deserializedPayloadError: EachMessagePayload = {
-    topic,
-    partition,
-    message: Object.assign(
-      {
-        headers: {
-          [KafkaHeaders.CORRELATION_ID]: correlationId,
-          [KafkaHeaders.NEST_ERR]: NO_MESSAGE_HANDLER,
-        },
-      },
-      deserializedMessage,
-      {
-        size: 0,
-        value: null,
-      },
-    ),
+    heartbeat,
+    pause,
   };
 
   let client: ClientKafka;
-  let callback: sinon.SinonSpy;
-  let connect: sinon.SinonSpy;
-  let subscribe: sinon.SinonSpy;
-  let run: sinon.SinonSpy;
-  let send: sinon.SinonSpy;
-  let on: sinon.SinonSpy;
-  let consumerStub: sinon.SinonStub;
-  let producerStub: sinon.SinonStub;
-  let createClientStub: sinon.SinonStub;
-  let kafkaClient;
+  let untypedClient: any;
+  let callback: ReturnType<typeof vi.fn>;
+  let connect: ReturnType<typeof vi.fn>;
+  let disconnect: ReturnType<typeof vi.fn>;
+  let subscribe: ReturnType<typeof vi.fn>;
+  let run: ReturnType<typeof vi.fn>;
+  let send: ReturnType<typeof vi.fn>;
+  let on: ReturnType<typeof vi.fn>;
+  let consumerStub: ReturnType<typeof vi.fn>;
+  let producerStub: ReturnType<typeof vi.fn>;
+  let createClientStub: ReturnType<typeof vi.fn>;
+  let kafkaClient: any;
 
   beforeEach(() => {
     client = new ClientKafka({});
-    callback = sinon.spy();
-    connect = sinon.spy();
-    subscribe = sinon.spy();
-    run = sinon.spy();
-    send = sinon.spy();
-    on = sinon.spy();
+    untypedClient = client as any;
 
-    consumerStub = sinon.stub(client as any, 'consumer').callsFake(() => {
+    callback = vi.fn();
+    connect = vi.fn();
+    disconnect = vi.fn().mockResolvedValue(undefined);
+    subscribe = vi.fn();
+    run = vi.fn();
+    send = vi.fn();
+    on = vi.fn();
+
+    consumerStub = vi.fn().mockImplementation(() => {
       return {
         connect,
+        disconnect,
         subscribe,
         run,
         events: {
           GROUP_JOIN: 'consumer.group_join',
+          HEARTBEAT: 'consumer.heartbeat',
+          COMMIT_OFFSETS: 'consumer.commit_offsets',
+          FETCH_START: 'consumer.fetch_start',
+          FETCH: 'consumer.fetch',
+          START_BATCH_PROCESS: 'consumer.start_batch_process',
+          END_BATCH_PROCESS: 'consumer.end_batch_process',
+          CONNECT: 'consumer.connect',
+          DISCONNECT: 'consumer.disconnect',
+          STOP: 'consumer.stop',
+          CRASH: 'consumer.crash',
+          REBALANCING: 'consumer.rebalancing',
+          RECEIVED_UNSUBSCRIBED_TOPICS: 'consumer.received_unsubscribed_topics',
+          REQUEST: 'consumer.network.request',
+          REQUEST_TIMEOUT: 'consumer.network.request_timeout',
+          REQUEST_QUEUE_SIZE: 'consumer.network.request_queue_size',
         },
         on,
       };
     });
-    producerStub = sinon.stub(client as any, 'producer').callsFake(() => {
+    producerStub = vi.fn().mockImplementation(() => {
       return {
         connect,
+        disconnect,
         send,
+        events: {
+          CONNECT: 'producer.connect',
+          DISCONNECT: 'producer.disconnect',
+          REQUEST: 'producer.network.request',
+          REQUEST_TIMEOUT: 'producer.network.request_timeout',
+          REQUEST_QUEUE_SIZE: 'producer.network.request_queue_size',
+        },
+        on,
       };
     });
     kafkaClient = {
@@ -199,18 +222,43 @@ describe('ClientKafka', () => {
       producer: producerStub,
     };
 
-    createClientStub = sinon
-      .stub(client, 'createClient')
-      .callsFake(() => kafkaClient);
+    createClientStub = vi
+      .spyOn(client, 'createClient')
+      .mockImplementation(() => kafkaClient);
+  });
+
+  describe('createClient', () => {
+    beforeEach(() => {
+      client = new ClientKafka({});
+    });
+
+    it(`should accept a custom logCreator in client options`, async () => {
+      const logCreatorSpy = vi.fn().mockReturnValue('test');
+      const logCreator = () => logCreatorSpy;
+
+      client = new ClientKafka({
+        client: {
+          brokers: [],
+          logCreator,
+        },
+      });
+
+      const kafkaClient = await client.createClient();
+      const logger = kafkaClient.logger();
+
+      logger.info({ namespace: '', level: 1, log: 'test' });
+
+      expect(logCreatorSpy).toHaveBeenCalled();
+    });
   });
 
   describe('subscribeToResponseOf', () => {
-    let normalizePatternSpy: sinon.SinonSpy;
-    let getResponsePatternNameSpy: sinon.SinonSpy;
+    let normalizePatternSpy: ReturnType<typeof vi.spyOn>;
+    let getResponsePatternNameSpy: ReturnType<typeof vi.spyOn>;
 
     beforeEach(() => {
-      normalizePatternSpy = sinon.spy(client as any, 'normalizePattern');
-      getResponsePatternNameSpy = sinon.spy(
+      normalizePatternSpy = vi.spyOn(client as any, 'normalizePattern');
+      getResponsePatternNameSpy = vi.spyOn(
         client as any,
         'getResponsePatternName',
       );
@@ -219,81 +267,563 @@ describe('ClientKafka', () => {
     it(`should create an array of response patterns`, () => {
       client.subscribeToResponseOf(topic);
 
-      expect(normalizePatternSpy.calledWith(topic)).to.be.true;
-      expect(getResponsePatternNameSpy.calledWith(topic)).to.be.true;
-      expect(client['responsePatterns']).to.not.be.empty;
-      expect(client['responsePatterns'][0]).to.eq(replyTopic);
+      expect(normalizePatternSpy).toHaveBeenCalledWith(topic);
+      expect(getResponsePatternNameSpy).toHaveBeenCalledWith(topic);
+      expect(client['responsePatterns']).not.toHaveLength(0);
+      expect(client['responsePatterns'][0]).toEqual(replyTopic);
     });
 
     afterEach(() => {
-      normalizePatternSpy.restore();
+      normalizePatternSpy.mockRestore();
     });
   });
 
   describe('close', () => {
-    const consumer = { disconnect: sinon.stub().resolves() };
-    const producer = { disconnect: sinon.stub().resolves() };
+    const consumer = { disconnect: vi.fn().mockResolvedValue(undefined) };
+    const producer = { disconnect: vi.fn().mockResolvedValue(undefined) };
     beforeEach(() => {
-      (client as any).consumer = consumer;
-      (client as any).producer = producer;
+      untypedClient._consumer = consumer;
+      untypedClient._producer = producer;
+    });
+    afterEach(() => {
+      vi.restoreAllMocks();
     });
     it('should close server', async () => {
       await client.close();
 
-      expect(consumer.disconnect.calledOnce).to.be.true;
-      expect(producer.disconnect.calledOnce).to.be.true;
-      expect((client as any).consumer).to.be.null;
-      expect((client as any).producer).to.be.null;
-      expect((client as any).client).to.be.null;
+      expect(consumer.disconnect).toHaveBeenCalledOnce();
+      expect(producer.disconnect).toHaveBeenCalledOnce();
+      expect(untypedClient._consumer).toBeNull();
+      expect(untypedClient._producer).toBeNull();
+      expect(untypedClient.client).toBeNull();
+    });
+
+    it('should disconnect the consumer when the producer fails to disconnect', async () => {
+      const error = new Error('producer disconnect failed');
+      producer.disconnect.mockRejectedValueOnce(error);
+      untypedClient.initialized = Promise.resolve();
+      untypedClient.client = {};
+
+      await expect(client.close()).rejects.toBe(error);
+
+      expect(consumer.disconnect).toHaveBeenCalledOnce();
+      expect(untypedClient._consumer).toBeNull();
+      expect(untypedClient._producer).toBeNull();
+      expect(untypedClient.initialized).toBeNull();
+      expect(untypedClient.client).toBeNull();
+    });
+
+    it('should disconnect the producer when the consumer fails to disconnect', async () => {
+      const error = new Error('consumer disconnect failed');
+      consumer.disconnect.mockRejectedValueOnce(error);
+      untypedClient.initialized = Promise.resolve();
+      untypedClient.client = {};
+
+      await expect(client.close()).rejects.toBe(error);
+
+      expect(producer.disconnect).toHaveBeenCalledOnce();
+      expect(untypedClient._consumer).toBeNull();
+      expect(untypedClient._producer).toBeNull();
+      expect(untypedClient.initialized).toBeNull();
+      expect(untypedClient.client).toBeNull();
+    });
+
+    it('should log the second error when both clients fail to disconnect', async () => {
+      const producerError = new Error('producer disconnect failed');
+      const consumerError = new Error('consumer disconnect failed');
+      producer.disconnect.mockRejectedValueOnce(producerError);
+      consumer.disconnect.mockRejectedValueOnce(consumerError);
+      const logError = vi
+        .spyOn(untypedClient.logger, 'error')
+        .mockImplementation(() => {});
+
+      await expect(client.close()).rejects.toBe(producerError);
+
+      expect(logError).toHaveBeenCalledWith(consumerError);
+    });
+
+    it('should fail pending requests with a connection closed error', async () => {
+      const callback = vi.fn();
+      untypedClient.routingMap.set('some id', callback);
+
+      await client.close();
+
+      expect(untypedClient.routingMap.size).toBe(0);
+      expect(callback).toHaveBeenCalledWith({
+        err: expect.objectContaining({ message: 'Connection closed' }),
+      });
+    });
+
+    it('should fail every pending request when a callback throws', async () => {
+      const loggerErrorSpy = vi
+        .spyOn(untypedClient.logger, 'error')
+        .mockImplementation(() => {});
+      const throwingCallback = vi.fn().mockImplementation(() => {
+        throw new Error('Callback error');
+      });
+      let pendingDuringFlush: number | undefined;
+      const callback = vi.fn(() => {
+        pendingDuringFlush = untypedClient.routingMap.size;
+      });
+      untypedClient.routingMap.set('some id', throwingCallback);
+      untypedClient.routingMap.set('some other id', callback);
+
+      await client.close();
+
+      expect(throwingCallback).toHaveBeenCalledTimes(1);
+      expect(callback).toHaveBeenCalledWith({
+        err: expect.objectContaining({ message: 'Connection closed' }),
+      });
+      expect(loggerErrorSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ message: 'Callback error' }),
+      );
+      expect(pendingDuringFlush).toBe(0);
+      expect(producer.disconnect).toHaveBeenCalled();
+      expect(consumer.disconnect).toHaveBeenCalled();
+      expect(untypedClient.routingMap.size).toBe(0);
+    });
+  });
+
+  describe('registerConsumerEventListeners', () => {
+    it('should use the _consumer backing field, not the consumer getter', () => {
+      const consumerOnSpy = vi.fn();
+      const fakeConsumer = {
+        events: {
+          CONNECT: 'consumer.connect',
+          DISCONNECT: 'consumer.disconnect',
+          REBALANCING: 'consumer.rebalancing',
+          STOP: 'consumer.stop',
+          CRASH: 'consumer.crash',
+        },
+        on: consumerOnSpy,
+      };
+
+      // Set the backing field directly
+      untypedClient._consumer = fakeConsumer;
+
+      // Replace the consumer getter stub with one that throws,
+      // ensuring the method only uses _consumer (backing field)
+      consumerStub.mockImplementation(() => {
+        throw new Error(
+          'Consumer getter should not be called in registerConsumerEventListeners',
+        );
+      });
+
+      expect(() =>
+        untypedClient.registerConsumerEventListeners(),
+      ).to.not.throw();
+      expect(consumerOnSpy).toHaveBeenCalledTimes(5);
+
+      const registeredEvents = consumerOnSpy.mock.calls.map(
+        (args: any[]) => args[0],
+      );
+      expect(registeredEvents).toContain('consumer.connect');
+      expect(registeredEvents).toContain('consumer.disconnect');
+      expect(registeredEvents).toContain('consumer.rebalancing');
+      expect(registeredEvents).toContain('consumer.stop');
+      expect(registeredEvents).toContain('consumer.crash');
+    });
+
+    it('should fail pending requests once the reply consumer stops, but not for a replaced consumer', () => {
+      const listeners = new Map<string, Function>();
+      const fakeConsumer = {
+        events: {
+          CONNECT: 'consumer.connect',
+          DISCONNECT: 'consumer.disconnect',
+          REBALANCING: 'consumer.rebalancing',
+          STOP: 'consumer.stop',
+          CRASH: 'consumer.crash',
+        },
+        on: vi.fn((event: string, fn: Function) => {
+          listeners.set(event, fn);
+        }),
+      };
+
+      untypedClient._consumer = fakeConsumer;
+      untypedClient.registerConsumerEventListeners();
+
+      const pending = vi.fn();
+      untypedClient.routingMap.set('req', pending);
+      // On a crash, kafkajs stops the consumer before it emits CRASH, even
+      // when it restarts it afterwards
+      listeners.get('consumer.stop')!();
+      listeners.get('consumer.crash')!({ payload: { restart: true } });
+      expect(pending).toHaveBeenCalledExactlyOnceWith({
+        err: expect.objectContaining({ message: 'Connection closed' }),
+      });
+      expect(untypedClient.routingMap.size).toBe(0);
+
+      const activeClientCallback = vi.fn();
+      untypedClient._consumer = { ...fakeConsumer };
+      untypedClient.routingMap.set('req-new', activeClientCallback);
+      listeners.get('consumer.stop')!();
+      expect(activeClientCallback).not.toHaveBeenCalled();
+      expect(untypedClient.routingMap.has('req-new')).toBe(true);
     });
   });
 
   describe('connect', () => {
-    let consumerAssignmentsStub: sinon.SinonStub;
-    let bindTopicsStub: sinon.SinonStub;
-    // let handleErrorsSpy: sinon.SinonSpy;
+    let consumerAssignmentsStub: any;
+    let bindTopicsStub: ReturnType<typeof vi.fn>;
 
-    beforeEach(() => {
-      consumerAssignmentsStub = sinon.stub(
-        client as any,
-        'consumerAssignments',
-      );
-      bindTopicsStub = sinon
-        .stub(client, 'bindTopics')
-        .callsFake(async () => {});
+    describe('consumer and producer', () => {
+      beforeEach(() => {
+        consumerAssignmentsStub = (client as any).consumerAssignments;
+        bindTopicsStub = vi
+          .spyOn(client, 'bindTopics')
+          .mockImplementation(async () => {});
+      });
+
+      it('should expect the connection to be created', async () => {
+        const connection = await client.connect();
+
+        expect(createClientStub).toHaveBeenCalledOnce();
+        expect(producerStub).toHaveBeenCalledOnce();
+        expect(consumerStub).toHaveBeenCalledOnce();
+        expect(on).toHaveBeenCalled();
+        expect(client['consumerAssignments']).toEqual({});
+        expect(connect).toHaveBeenCalledTimes(2);
+        expect(bindTopicsStub).toHaveBeenCalledOnce();
+        expect(connection).toEqual(producerStub());
+      });
+
+      it('should expect the connection to be reused', async () => {
+        untypedClient.initialized = Promise.resolve({});
+
+        await client.connect();
+
+        expect(createClientStub).not.toHaveBeenCalled();
+        expect(producerStub).not.toHaveBeenCalled();
+        expect(consumerStub).not.toHaveBeenCalled();
+
+        expect(on).not.toHaveBeenCalled();
+        expect(client['consumerAssignments']).toEqual({});
+
+        expect(connect).not.toHaveBeenCalledTimes(2);
+
+        expect(bindTopicsStub).not.toHaveBeenCalled();
+      });
+
+      it('should discard the partial connection when an attempt fails', async () => {
+        const error = new Error('broker unavailable');
+        // The consumer connects, then the producer fails.
+        connect.mockResolvedValueOnce(undefined).mockRejectedValueOnce(error);
+
+        await expect(client.connect()).rejects.toThrow(error);
+
+        expect(untypedClient.initialized).toBeNull();
+        expect(untypedClient._consumer).toBeNull();
+        expect(untypedClient._producer).toBeNull();
+        expect(untypedClient.client).toBeNull();
+        // Both the consumer that joined its group and the producer are torn down.
+        expect(disconnect).toHaveBeenCalledTimes(2);
+      });
+
+      it('should try again on the next call instead of caching a failed attempt', async () => {
+        const error = new Error('broker unavailable');
+        connect.mockRejectedValueOnce(error);
+
+        await expect(client.connect()).rejects.toThrow(error);
+        const connection = await client.connect();
+
+        expect(createClientStub).toHaveBeenCalledTimes(2);
+        expect(consumerStub).toHaveBeenCalledTimes(2);
+        expect(producerStub).toHaveBeenCalledOnce();
+        expect(connection).toEqual(producerStub());
+      });
+
+      it('should not discard a newer connection when a stale attempt fails', async () => {
+        let rejectFirstAttempt!: (err: Error) => void;
+        const firstDisconnect = vi.fn().mockResolvedValue(undefined);
+        const secondDisconnect = vi.fn().mockResolvedValue(undefined);
+        const createConsumer = consumerStub.getMockImplementation()!;
+        const createProducer = producerStub.getMockImplementation()!;
+        consumerStub
+          .mockImplementationOnce(() => ({
+            ...createConsumer(),
+            connect: () =>
+              new Promise<void>((_, reject) => (rejectFirstAttempt = reject)),
+            disconnect: firstDisconnect,
+          }))
+          .mockImplementationOnce(() => ({
+            ...createConsumer(),
+            disconnect: secondDisconnect,
+          }));
+        producerStub.mockImplementationOnce(() => ({
+          ...createProducer(),
+          disconnect: secondDisconnect,
+        }));
+
+        const firstAttempt = client.connect();
+        // Let the first attempt reach the (pending) consumer connection.
+        await new Promise(process.nextTick);
+        await client.close();
+        firstDisconnect.mockClear();
+        const secondAttempt = client.connect();
+        await secondAttempt;
+        const secondConsumer = untypedClient._consumer;
+        const secondProducer = untypedClient._producer;
+
+        rejectFirstAttempt(new Error('broker unavailable'));
+        await expect(firstAttempt).rejects.toThrow('broker unavailable');
+
+        expect(untypedClient._consumer).toBe(secondConsumer);
+        expect(untypedClient._producer).toBe(secondProducer);
+        expect(untypedClient.client).not.toBeNull();
+        expect(untypedClient.initialized).not.toBeNull();
+        expect(secondDisconnect).not.toHaveBeenCalled();
+        // The stale attempt still disconnects the consumer it created.
+        expect(firstDisconnect).toHaveBeenCalledOnce();
+      });
+
+      it('should stop the attempt when close() runs while the consumer connects', async () => {
+        let releaseConsumerConnect!: () => void;
+        const consumerDisconnect = vi.fn().mockResolvedValue(undefined);
+        const createConsumer = consumerStub.getMockImplementation()!;
+        consumerStub.mockImplementationOnce(() => ({
+          ...createConsumer(),
+          connect: () =>
+            new Promise<void>(resolve => (releaseConsumerConnect = resolve)),
+          disconnect: consumerDisconnect,
+        }));
+
+        const connecting = client.connect();
+        // Let the attempt reach the (pending) consumer connection.
+        await new Promise(process.nextTick);
+        await client.close();
+        releaseConsumerConnect();
+
+        await expect(connecting).rejects.toThrow('Connection closed');
+        expect(producerStub).not.toHaveBeenCalled();
+        expect(consumerDisconnect).toHaveBeenCalled();
+        expect(untypedClient._consumer).toBeNull();
+        expect(untypedClient._producer).toBeNull();
+        expect(untypedClient.client).toBeNull();
+      });
+
+      it('should stop the attempt when close() runs while the Kafka client is created', async () => {
+        let releaseCreateClient!: () => void;
+        createClientStub.mockImplementationOnce(
+          () =>
+            new Promise(resolve => {
+              releaseCreateClient = () => resolve(kafkaClient);
+            }),
+        );
+
+        const connecting = client.connect();
+        await new Promise(process.nextTick);
+        await client.close();
+        releaseCreateClient();
+
+        await expect(connecting).rejects.toThrow('Connection closed');
+        expect(consumerStub).not.toHaveBeenCalled();
+        expect(producerStub).not.toHaveBeenCalled();
+        expect(untypedClient.client).toBeNull();
+      });
+
+      it('should stop the attempt when close() runs while the consumer starts running', async () => {
+        let releaseRun!: () => void;
+        const consumerDisconnect = vi.fn().mockResolvedValue(undefined);
+        const createConsumer = consumerStub.getMockImplementation()!;
+        consumerStub.mockImplementationOnce(() => ({
+          ...createConsumer(),
+          run: () => new Promise<void>(resolve => (releaseRun = resolve)),
+          disconnect: consumerDisconnect,
+        }));
+        // The real `bindTopics()`, which starts the consumer.
+        bindTopicsStub.mockRestore();
+
+        const connecting = client.connect();
+        // Let the attempt reach the (pending) consumer run.
+        await new Promise(process.nextTick);
+        await client.close();
+        releaseRun();
+
+        await expect(connecting).rejects.toThrow('Connection closed');
+        expect(producerStub).not.toHaveBeenCalled();
+        expect(consumerDisconnect).toHaveBeenCalled();
+        expect(untypedClient._consumer).toBeNull();
+        expect(untypedClient._producer).toBeNull();
+        expect(untypedClient.client).toBeNull();
+      });
+
+      it('should stop the attempt when close() runs while the producer connects', async () => {
+        let releaseProducerConnect!: () => void;
+        const producerDisconnect = vi.fn().mockResolvedValue(undefined);
+        const createProducer = producerStub.getMockImplementation()!;
+        producerStub.mockImplementationOnce(() => ({
+          ...createProducer(),
+          connect: () =>
+            new Promise<void>(resolve => (releaseProducerConnect = resolve)),
+          disconnect: producerDisconnect,
+        }));
+
+        const connecting = client.connect();
+        // Let the attempt reach the (pending) producer connection.
+        await new Promise(process.nextTick);
+        await client.close();
+        releaseProducerConnect();
+
+        await expect(connecting).rejects.toThrow('Connection closed');
+        expect(producerDisconnect).toHaveBeenCalled();
+        // The consumer that joined its group is torn down as well.
+        expect(disconnect).toHaveBeenCalled();
+        expect(untypedClient._consumer).toBeNull();
+        expect(untypedClient._producer).toBeNull();
+        expect(untypedClient.client).toBeNull();
+      });
+
+      it('should connect after close() stopped a pending attempt', async () => {
+        let releaseConsumerConnect!: () => void;
+        const createConsumer = consumerStub.getMockImplementation()!;
+        consumerStub.mockImplementationOnce(() => ({
+          ...createConsumer(),
+          connect: () =>
+            new Promise<void>(resolve => (releaseConsumerConnect = resolve)),
+        }));
+
+        const stopped = client.connect();
+        await new Promise(process.nextTick);
+        await client.close();
+        const connection = await client.connect();
+        const consumer = untypedClient._consumer;
+        const producer = untypedClient._producer;
+
+        releaseConsumerConnect();
+        await expect(stopped).rejects.toThrow('Connection closed');
+
+        expect(connection).toEqual(producerStub());
+        expect(untypedClient._consumer).toBe(consumer);
+        expect(untypedClient._producer).toBe(producer);
+        expect(untypedClient.initialized).not.toBeNull();
+        expect(untypedClient.client).not.toBeNull();
+      });
+
+      it('should keep an attempt started while close() disconnects the clients', async () => {
+        let releaseStaleConnect!: () => void;
+        let releaseCloseDisconnect!: () => void;
+        let releaseProducerConnect!: () => void;
+        const createConsumer = consumerStub.getMockImplementation()!;
+        const createProducer = producerStub.getMockImplementation()!;
+        consumerStub.mockImplementationOnce(() => ({
+          ...createConsumer(),
+          connect: () =>
+            new Promise<void>(resolve => (releaseStaleConnect = resolve)),
+          // Only the disconnect issued by close() is held, the stale attempt
+          // tears its consumer down right away.
+          disconnect: vi
+            .fn()
+            .mockImplementationOnce(
+              () =>
+                new Promise<void>(
+                  resolve => (releaseCloseDisconnect = resolve),
+                ),
+            )
+            .mockResolvedValue(undefined),
+        }));
+        producerStub.mockImplementationOnce(() => ({
+          ...createProducer(),
+          connect: () =>
+            new Promise<void>(resolve => (releaseProducerConnect = resolve)),
+        }));
+
+        const stale = client.connect();
+        const stopped = expect(stale).rejects.toThrow('Connection closed');
+        // Let the stale attempt reach the (pending) consumer connection.
+        await new Promise(process.nextTick);
+        const closing = client.close();
+        releaseStaleConnect();
+        await stopped;
+
+        const connecting = client.connect();
+        const initialized = untypedClient.initialized;
+        // Let the new attempt reach the (pending) producer connection.
+        await new Promise(process.nextTick);
+        const consumer = consumerStub.mock.results[1].value;
+        const producer = producerStub.mock.results[0].value;
+        releaseCloseDisconnect();
+        await closing;
+
+        expect(untypedClient._consumer).toBe(consumer);
+        expect(untypedClient._producer).toBe(producer);
+        expect(untypedClient.client).toBe(kafkaClient);
+        expect(untypedClient.initialized).toBe(initialized);
+
+        releaseProducerConnect();
+        expect(await connecting).toBe(producer);
+        expect(untypedClient._consumer).toBe(consumer);
+        expect(untypedClient._producer).toBe(producer);
+        expect(untypedClient.initialized).toBe(initialized);
+        expect(disconnect).not.toHaveBeenCalled();
+      });
     });
 
-    it('should expect the connection to be created', async () => {
-      const connection = await client.connect();
+    describe('producer only mode', () => {
+      beforeEach(() => {
+        consumerAssignmentsStub = (client as any).consumerAssignments;
+        bindTopicsStub = vi
+          .spyOn(client, 'bindTopics')
+          .mockImplementation(async () => {});
+        client['producerOnlyMode'] = true;
+      });
 
-      expect(createClientStub.calledOnce).to.be.true;
-      expect(producerStub.calledOnce).to.be.true;
+      it('should expect the connection to be created', async () => {
+        const connection = await client.connect();
 
-      expect(consumerStub.calledOnce).to.be.true;
+        expect(createClientStub).toHaveBeenCalledOnce();
+        expect(producerStub).toHaveBeenCalledOnce();
 
-      expect(on.calledOnce).to.be.true;
-      expect(client['consumerAssignments']).to.be.empty;
+        expect(consumerStub).not.toHaveBeenCalled();
 
-      expect(connect.calledTwice).to.be.true;
+        expect(client['consumerAssignments']).toEqual({});
 
-      expect(bindTopicsStub.calledOnce).to.be.true;
-      expect(connection).to.deep.equal(producerStub());
-    });
+        expect(connect).toHaveBeenCalledOnce();
 
-    it('should expect the connection to be reused', async () => {
-      (client as any).client = kafkaClient;
-      await client.connect();
+        expect(bindTopicsStub).not.toHaveBeenCalled();
+        expect(connection).toEqual(producerStub());
+      });
 
-      expect(createClientStub.calledOnce).to.be.false;
-      expect(producerStub.calledOnce).to.be.false;
-      expect(consumerStub.calledOnce).to.be.false;
+      it('should stop the attempt when close() runs while the producer connects', async () => {
+        let releaseProducerConnect!: () => void;
+        const producerDisconnect = vi.fn().mockResolvedValue(undefined);
+        const createProducer = producerStub.getMockImplementation()!;
+        producerStub.mockImplementationOnce(() => ({
+          ...createProducer(),
+          connect: () =>
+            new Promise<void>(resolve => (releaseProducerConnect = resolve)),
+          disconnect: producerDisconnect,
+        }));
 
-      expect(on.calledOnce).to.be.false;
-      expect(client['consumerAssignments']).to.be.empty;
+        const connecting = client.connect();
+        // Let the attempt reach the (pending) producer connection.
+        await new Promise(process.nextTick);
+        await client.close();
+        releaseProducerConnect();
 
-      expect(connect.calledTwice).to.be.false;
+        await expect(connecting).rejects.toThrow('Connection closed');
+        expect(consumerStub).not.toHaveBeenCalled();
+        expect(producerDisconnect).toHaveBeenCalled();
+        expect(untypedClient._producer).toBeNull();
+        expect(untypedClient.initialized).toBeNull();
+        expect(untypedClient.client).toBeNull();
+      });
 
-      expect(bindTopicsStub.calledOnce).to.be.false;
+      it('should expect the connection to be reused', async () => {
+        untypedClient.initialized = Promise.resolve({});
+
+        await client.connect();
+
+        expect(createClientStub).not.toHaveBeenCalled();
+        expect(producerStub).not.toHaveBeenCalled();
+        expect(consumerStub).not.toHaveBeenCalled();
+
+        expect(on).not.toHaveBeenCalled();
+        expect(client['consumerAssignments']).toEqual({});
+
+        expect(connect).not.toHaveBeenCalledTimes(2);
+
+        expect(bindTopicsStub).not.toHaveBeenCalled();
+      });
     });
   });
 
@@ -321,7 +851,7 @@ describe('ClientKafka', () => {
 
       client['setConsumerAssignments'](consumerAssignments);
 
-      expect(client['consumerAssignments']).to.deep.eq(
+      expect(client['consumerAssignments']).toEqual(
         // consumerAssignments.payload.memberAssignment,
         {
           'topic-a': 0,
@@ -329,40 +859,135 @@ describe('ClientKafka', () => {
         },
       );
     });
+
+    it('should not update consumer assignments if there are no partitions assigned to consumer', async () => {
+      await client.connect();
+
+      const consumerAssignments: ConsumerGroupJoinEvent = {
+        id: 'id',
+        type: 'type',
+        timestamp: 1234567890,
+        payload: {
+          duration: 20,
+          groupId: 'group-id',
+          isLeader: true,
+          leaderId: 'member-1',
+          groupProtocol: 'RoundRobin',
+          memberId: 'member-1',
+          memberAssignment: {
+            'topic-a': [],
+            'topic-b': [3, 4, 5],
+          },
+        },
+      };
+
+      client['setConsumerAssignments'](consumerAssignments);
+
+      expect(client['consumerAssignments']).toEqual({
+        'topic-b': 3,
+      });
+    });
+
+    it('should fail only pending requests whose reply partition was lost on rebalance', async () => {
+      await client.connect();
+
+      const lostCallback = vi.fn();
+      const droppedTopicCallback = vi.fn();
+      const retainedCallback = vi.fn();
+
+      untypedClient.routingMap.set('lost', lostCallback);
+      untypedClient.pendingRequestPartitions.set('lost', {
+        replyTopic: 'topic-a.reply',
+        replyPartition: 0,
+      });
+      untypedClient.routingMap.set('dropped-topic', droppedTopicCallback);
+      untypedClient.pendingRequestPartitions.set('dropped-topic', {
+        replyTopic: 'topic-gone.reply',
+        replyPartition: 0,
+      });
+      untypedClient.routingMap.set('retained', retainedCallback);
+      untypedClient.pendingRequestPartitions.set('retained', {
+        replyTopic: 'topic-a.reply',
+        replyPartition: 2,
+      });
+
+      client['setConsumerAssignments']({
+        id: 'id',
+        type: 'type',
+        timestamp: 1234567890,
+        payload: {
+          duration: 20,
+          groupId: 'group-id',
+          isLeader: true,
+          leaderId: 'member-1',
+          groupProtocol: 'RoundRobin',
+          memberId: 'member-1',
+          memberAssignment: {
+            'topic-a.reply': [1, 2],
+          },
+        },
+      });
+
+      expect(lostCallback).toHaveBeenCalledWith({
+        err: expect.objectContaining({ message: 'Connection closed' }),
+      });
+      expect(droppedTopicCallback).toHaveBeenCalledWith({
+        err: expect.objectContaining({ message: 'Connection closed' }),
+      });
+      expect(retainedCallback).not.toHaveBeenCalled();
+      expect(untypedClient.routingMap.has('retained')).toBe(true);
+      expect(untypedClient.routingMap.has('lost')).toBe(false);
+      expect(untypedClient.routingMap.has('dropped-topic')).toBe(false);
+    });
   });
 
   describe('bindTopics', () => {
     it('should bind topics from response patterns', async () => {
-      (client as any).responsePatterns = [replyTopic];
-      (client as any).consumer = kafkaClient.consumer();
+      untypedClient.responsePatterns = [replyTopic];
+      untypedClient._consumer = kafkaClient.consumer();
 
       await client.bindTopics();
 
-      expect(subscribe.calledOnce).to.be.true;
-      expect(
-        subscribe.calledWith({
-          topic: replyTopic,
-        }),
-      ).to.be.true;
-      expect(run.calledOnce).to.be.true;
+      expect(subscribe).toHaveBeenCalledOnce();
+      expect(subscribe).toHaveBeenCalledWith({
+        topics: [replyTopic],
+      });
+      expect(run).toHaveBeenCalledOnce();
     });
 
     it('should bind topics from response patterns with options', async () => {
-      (client as any).responsePatterns = [replyTopic];
-      (client as any).consumer = kafkaClient.consumer();
-      (client as any).options.subscribe = {};
-      (client as any).options.subscribe.fromBeginning = true;
+      untypedClient.responsePatterns = [replyTopic];
+      untypedClient._consumer = kafkaClient.consumer();
+      untypedClient.options.subscribe = {};
+      untypedClient.options.subscribe.fromBeginning = true;
 
       await client.bindTopics();
 
-      expect(subscribe.calledOnce).to.be.true;
-      expect(
-        subscribe.calledWith({
-          topic: replyTopic,
-          fromBeginning: true,
-        }),
-      ).to.be.true;
-      expect(run.calledOnce).to.be.true;
+      expect(subscribe).toHaveBeenCalledOnce();
+      expect(subscribe).toHaveBeenCalledWith({
+        topics: [replyTopic],
+        fromBeginning: true,
+      });
+      expect(run).toHaveBeenCalledOnce();
+    });
+
+    it('should reject when close() runs while the consumer subscribes', async () => {
+      let releaseSubscribe!: () => void;
+      const consumer = {
+        ...kafkaClient.consumer(),
+        subscribe: () =>
+          new Promise<void>(resolve => (releaseSubscribe = resolve)),
+      };
+      untypedClient.responsePatterns = [replyTopic];
+      untypedClient._consumer = consumer;
+
+      const binding = client.bindTopics();
+      await new Promise(process.nextTick);
+      await client.close();
+      releaseSubscribe();
+
+      await expect(binding).rejects.toThrow('Connection closed');
+      expect(run).not.toHaveBeenCalled();
     });
   });
 
@@ -377,13 +1002,11 @@ describe('ClientKafka', () => {
         subscription(payload);
       });
       it('should call callback with expected arguments', () => {
-        expect(callback.called).to.be.true;
-        expect(
-          callback.calledWith({
-            err: undefined,
-            response: messageValue,
-          }),
-        ).to.be.true;
+        expect(callback).toHaveBeenCalled();
+        expect(callback).toHaveBeenCalledWith({
+          err: undefined,
+          response: messageValue,
+        });
       });
     });
 
@@ -396,14 +1019,12 @@ describe('ClientKafka', () => {
       });
 
       it('should call callback with dispose param', () => {
-        expect(callback.called).to.be.true;
-        expect(
-          callback.calledWith({
-            isDisposed: true,
-            response: payloadDisposed.message.value,
-            err: undefined,
-          }),
-        ).to.be.true;
+        expect(callback).toHaveBeenCalled();
+        expect(callback).toHaveBeenCalledWith({
+          isDisposed: true,
+          response: deserializedPayloadDisposed.message.value,
+          err: undefined,
+        });
       });
     });
 
@@ -416,14 +1037,12 @@ describe('ClientKafka', () => {
       });
 
       it('should call callback with error param', () => {
-        expect(callback.called).to.be.true;
-        expect(
-          callback.calledWith({
-            isDisposed: true,
-            response: undefined,
-            err: NO_MESSAGE_HANDLER,
-          }),
-        ).to.be.true;
+        expect(callback).toHaveBeenCalled();
+        expect(callback).toHaveBeenCalledWith({
+          isDisposed: true,
+          response: undefined,
+          err: NO_MESSAGE_HANDLER,
+        });
       });
     });
 
@@ -436,13 +1055,13 @@ describe('ClientKafka', () => {
       });
 
       it('should not call callback', () => {
-        expect(callback.called).to.be.false;
+        expect(callback).not.toHaveBeenCalled();
       });
     });
 
     describe('disposed and "id" is incorrect', () => {
       beforeEach(async () => {
-        callback = sinon.spy();
+        callback = vi.fn();
         subscription = client.createResponseCallback();
 
         client['routingMap'].set('incorrect-correlation-id', callback);
@@ -450,8 +1069,203 @@ describe('ClientKafka', () => {
       });
 
       it('should not call callback', () => {
-        expect(callback.called).to.be.false;
+        expect(callback).not.toHaveBeenCalled();
       });
+    });
+
+    describe('when the correlation id looks like JSON', () => {
+      it('should look up the pending request by its text', async () => {
+        const jsonCorrelationId = '{"toString":1}';
+        subscription = client.createResponseCallback();
+        client['routingMap'].set(jsonCorrelationId, callback);
+
+        await subscription({
+          ...payload,
+          message: {
+            ...payload.message,
+            headers: {
+              [KafkaHeaders.CORRELATION_ID]: Buffer.from(jsonCorrelationId),
+            },
+          },
+        });
+
+        expect(callback).toHaveBeenCalledExactlyOnceWith({
+          err: undefined,
+          response: messageValue,
+        });
+      });
+    });
+
+    describe('when the parser rejects the message', () => {
+      let loggerErrorSpy: ReturnType<typeof vi.spyOn>;
+
+      beforeEach(() => {
+        untypedClient.parser = {
+          parse: () => {
+            throw new MaxPacketLengthExceededException(17);
+          },
+        };
+        loggerErrorSpy = vi
+          .spyOn(untypedClient.logger, 'error')
+          .mockImplementation(() => {});
+        subscription = client.createResponseCallback();
+        client['routingMap'].set(correlationId, callback);
+      });
+
+      it('should log and skip the message, and fail the pending request', async () => {
+        // A rejection would make kafkajs redeliver the message
+        await expect(subscription(payload)).resolves.toBeUndefined();
+
+        expect(loggerErrorSpy).toHaveBeenCalledOnce();
+        expect(callback).toHaveBeenCalledExactlyOnceWith({
+          err: expect.any(MaxPacketLengthExceededException),
+          isDisposed: true,
+        });
+      });
+
+      it('should skip the message when its correlation id cannot be decoded', async () => {
+        const correlationIdHeader = {
+          toString: () => {
+            throw new RangeError(
+              'Cannot create a string longer than 0x1fffffe8 characters',
+            );
+          },
+        };
+
+        await expect(
+          subscription({
+            ...payload,
+            message: {
+              ...payload.message,
+              headers: { [KafkaHeaders.CORRELATION_ID]: correlationIdHeader },
+            },
+          }),
+        ).resolves.toBeUndefined();
+
+        expect(loggerErrorSpy).toHaveBeenCalledOnce();
+        expect(callback).not.toHaveBeenCalled();
+      });
+    });
+  });
+
+  describe('emitBatch', () => {
+    it(`should return an observable stream`, () => {
+      const stream$ = client.emitBatch(
+        {},
+        {
+          messages: [],
+        },
+      );
+      expect(stream$ instanceof Observable).toBe(true);
+    });
+
+    it(`should call "connect" immediately`, () => {
+      const connectSpy = vi.spyOn(client, 'connect');
+      client.emitBatch(
+        {},
+        {
+          messages: [],
+        },
+      );
+      expect(connectSpy).toHaveBeenCalledOnce();
+    });
+
+    describe('when "connect" throws', () => {
+      it('should return Observable with error', () => {
+        vi.spyOn(client, 'connect').mockImplementation(() => {
+          throw new Error();
+        });
+
+        const stream$ = client.emitBatch(
+          {},
+          {
+            messages: [],
+          },
+        );
+
+        stream$.subscribe({
+          next: () => {},
+          error: err => {
+            expect(err).toBeInstanceOf(Error);
+          },
+        });
+      });
+    });
+
+    describe('when is connected', () => {
+      beforeEach(() => {
+        vi.spyOn(client, 'connect').mockImplementation(() =>
+          Promise.resolve({} as Producer),
+        );
+      });
+
+      it(`should call dispatchBatchEvent`, () => {
+        const pattern = { test: 3 };
+        const data = { messages: [] };
+        const dispatchBatchEventSpy = vi
+          .fn()
+          .mockImplementation(() => Promise.resolve(true));
+        const stream$ = client.emitBatch(pattern, data);
+        client['dispatchBatchEvent'] = dispatchBatchEventSpy;
+        stream$.subscribe(() => {
+          expect(dispatchBatchEventSpy).toHaveBeenCalledOnce();
+        });
+      });
+
+      it('should run the dispatch hook once, and send its metadata with every message', async () => {
+        const send = vi.fn().mockResolvedValue([]);
+        vi.spyOn(client as any, 'producer', 'get').mockReturnValue({ send });
+        const hook = vi.fn(packet => {
+          packet.metadata = { 'x-request-id': 'trace-1' };
+        });
+        client.setOnDispatchHook(hook);
+
+        await lastValueFrom(
+          client.emitBatch(topic, {
+            messages: [
+              { value: 'a' },
+              { value: 'b', headers: { 'x-request-id': 'own-id' } },
+            ],
+          }),
+        );
+
+        expect(hook).toHaveBeenCalledOnce();
+        const [first, second] = send.mock.calls[0][0].messages;
+        expect(first.headers).toEqual({ 'x-request-id': 'trace-1' });
+        expect(second.headers).toEqual({ 'x-request-id': 'own-id' });
+      });
+
+      it('should not send the headers that ask for a reply', async () => {
+        const send = vi.fn().mockResolvedValue([]);
+        vi.spyOn(client as any, 'producer', 'get').mockReturnValue({ send });
+
+        await lastValueFrom(
+          client.emitBatch(topic, {
+            messages: [
+              { value: 'a' },
+              {
+                value: 'b',
+                headers: {
+                  [KafkaHeaders.CORRELATION_ID]: 'chosen-id',
+                  [KafkaHeaders.REPLY_TOPIC]: 'other.topic',
+                  [KafkaHeaders.REPLY_PARTITION]: '0',
+                },
+              },
+            ],
+          }),
+        );
+
+        const [first, second] = send.mock.calls[0][0].messages;
+        expect(first.headers).toEqual({});
+        expect(second.headers).toEqual({
+          [KafkaHeaders.CORRELATION_ID]: 'chosen-id',
+        });
+      });
+    });
+
+    it('should return Observable with error', () => {
+      const err$ = client.emitBatch(null, null!);
+      expect(err$).toBeInstanceOf(Observable);
     });
   });
 
@@ -462,40 +1276,124 @@ describe('ClientKafka', () => {
       data: messageValue,
     };
 
-    let sendStub: sinon.SinonStub;
-    let sendSpy: sinon.SinonSpy;
+    let sendStub: ReturnType<typeof vi.fn>;
+    let sendSpy: ReturnType<typeof vi.fn>;
 
     beforeEach(() => {
-      sendStub = sinon.stub().callsFake(async a => {
+      sendStub = vi.fn().mockImplementation(async a => {
         throw new Error('ERROR!');
       });
-      sendSpy = sinon.spy();
+      sendSpy = vi.fn();
     });
 
     it('should publish packet', async () => {
-      sinon.stub(client as any, 'producer').value({
+      vi.spyOn(client as any, '_producer', 'get').mockReturnValue({
         send: sendSpy,
       });
 
       await client['dispatchEvent'](eventMessage);
 
-      expect(sendSpy.calledOnce).to.be.true;
-      expect(sendSpy.args[0][0].topic).to.eq(topic);
-      expect(sendSpy.args[0][0].messages).to.not.be.empty;
+      expect(sendSpy).toHaveBeenCalledOnce();
+      expect(sendSpy.mock.calls[0][0].topic).toEqual(topic);
+      expect(sendSpy.mock.calls[0][0].messages).not.toHaveLength(0);
 
-      const sentMessage = sendSpy.args[0][0].messages[0];
+      const sentMessage = sendSpy.mock.calls[0][0].messages[0];
 
-      expect(sentMessage.value).to.eq(messageValue);
+      expect(sentMessage.value).toEqual(messageValue);
     });
 
     it('should throw error', async () => {
-      sinon.stub(client as any, 'producer').value({
+      vi.spyOn(client as any, 'producer', 'get').mockReturnValue({
         send: sendStub,
       });
 
       client['dispatchEvent'](eventMessage).catch(err =>
-        expect(err).to.be.instanceOf(Error),
+        expect(err).toBeInstanceOf(Error),
       );
+    });
+
+    it('should send the packet metadata as headers', async () => {
+      vi.spyOn(client as any, '_producer', 'get').mockReturnValue({
+        send: sendSpy,
+      });
+
+      await client['dispatchEvent']({
+        pattern: topic,
+        data: messageValue,
+        metadata: { 'x-request-id': 'trace-1' },
+      });
+
+      const sentMessage = sendSpy.mock.calls[0][0].messages[0];
+      expect(sentMessage.value).toEqual(messageValue);
+      expect(sentMessage.headers).toEqual({ 'x-request-id': 'trace-1' });
+    });
+
+    it('should let the headers of the message win, and leave them unchanged', async () => {
+      vi.spyOn(client as any, '_producer', 'get').mockReturnValue({
+        send: sendSpy,
+      });
+      const record = {
+        key: 'key',
+        value: messageValue,
+        headers: { 'x-request-id': 'own-id' },
+      };
+
+      await client['dispatchEvent']({
+        pattern: topic,
+        data: record,
+        metadata: { 'x-request-id': 'trace-1', tenant: 'acme' },
+      });
+
+      const sentMessage = sendSpy.mock.calls[0][0].messages[0];
+      expect(sentMessage.headers).toEqual({
+        'x-request-id': 'own-id',
+        tenant: 'acme',
+      });
+      expect(record.headers).toEqual({ 'x-request-id': 'own-id' });
+    });
+
+    it('should not send the headers that ask for a reply', async () => {
+      vi.spyOn(client as any, '_producer', 'get').mockReturnValue({
+        send: sendSpy,
+      });
+      // As a gateway forwards it, with a "value" of the sender's choosing
+      const forwarded = {
+        value: { item: 'book' },
+        headers: {
+          [KafkaHeaders.CORRELATION_ID]: 'chosen-id',
+          [KafkaHeaders.REPLY_TOPIC]: 'other.topic',
+          [KafkaHeaders.REPLY_PARTITION]: '0',
+          'x-origin': 'gateway',
+        },
+      };
+
+      await client['dispatchEvent']({ pattern: topic, data: forwarded });
+
+      const sentMessage = sendSpy.mock.calls[0][0].messages[0];
+      // ServerKafka handles a message without a reply topic as an event
+      expect(sentMessage.headers).toEqual({
+        [KafkaHeaders.CORRELATION_ID]: 'chosen-id',
+        'x-origin': 'gateway',
+      });
+      expect(forwarded.headers).toHaveProperty(KafkaHeaders.REPLY_TOPIC);
+    });
+
+    it('should not send the headers that ask for a reply when metadata is merged in', async () => {
+      vi.spyOn(client as any, '_producer', 'get').mockReturnValue({
+        send: sendSpy,
+      });
+
+      await client['dispatchEvent']({
+        pattern: topic,
+        data: {
+          value: 'data',
+          headers: { [KafkaHeaders.REPLY_TOPIC]: 'other.topic' },
+        },
+        metadata: { 'x-request-id': 'trace-1' },
+      });
+
+      const sentMessage = sendSpy.mock.calls[0][0].messages[0];
+      expect(sentMessage.headers).toEqual({ 'x-request-id': 'trace-1' });
     });
   });
 
@@ -507,7 +1405,7 @@ describe('ClientKafka', () => {
 
       const result = client.getConsumerAssignments();
 
-      expect(result).to.deep.eq(client['consumerAssignments']);
+      expect(result).toEqual(client['consumerAssignments']);
     });
   });
 
@@ -519,178 +1417,275 @@ describe('ClientKafka', () => {
 
       const result = client['getReplyTopicPartition'](replyTopic);
 
-      expect(result).to.eq('0');
+      expect(result).toEqual('0');
     });
 
     it('should throw error when the topic is not being consumed', () => {
       client['consumerAssignments'] = {};
 
-      expect(() => client['getReplyTopicPartition'](replyTopic)).to.throw(
+      expect(() => client['getReplyTopicPartition'](replyTopic)).toThrow(
         InvalidKafkaClientTopicException,
       );
     });
 
     it('should throw error when the topic is not being consumed', () => {
       client['consumerAssignments'] = {
-        [topic]: undefined,
+        [topic]: undefined!,
       };
 
-      expect(() => client['getReplyTopicPartition'](replyTopic)).to.throw(
+      expect(() => client['getReplyTopicPartition'](replyTopic)).toThrow(
         InvalidKafkaClientTopicException,
       );
     });
   });
 
   describe('publish', () => {
+    const waitForNextTick = async () =>
+      await new Promise(resolve => process.nextTick(resolve));
     const readPacket = {
       pattern: topic,
       data: messageValue,
     };
 
-    let assignPacketIdStub: sinon.SinonStub;
-
-    let normalizePatternSpy: sinon.SinonSpy;
-    let getResponsePatternNameSpy: sinon.SinonSpy;
-    let getReplyTopicPartitionSpy: sinon.SinonSpy;
-    let routingMapSetSpy: sinon.SinonSpy;
-    let sendSpy: sinon.SinonSpy;
+    let assignPacketIdStub: any;
+    let normalizePatternSpy: any;
+    let getResponsePatternNameSpy: any;
+    let getReplyTopicPartitionSpy: any;
+    let routingMapSetSpy: any;
+    let sendSpy: ReturnType<typeof vi.fn>;
 
     beforeEach(() => {
-      // spy
-      normalizePatternSpy = sinon.spy(client as any, 'normalizePattern');
-      getResponsePatternNameSpy = sinon.spy(
+      normalizePatternSpy = vi.spyOn(client as any, 'normalizePattern');
+      getResponsePatternNameSpy = vi.spyOn(
         client as any,
         'getResponsePatternName',
       );
-      getReplyTopicPartitionSpy = sinon.spy(
+      getReplyTopicPartitionSpy = vi.spyOn(
         client as any,
         'getReplyTopicPartition',
       );
-      routingMapSetSpy = sinon.spy((client as any).routingMap, 'set');
-      sendSpy = sinon.spy(() => Promise.resolve());
+      routingMapSetSpy = vi.spyOn(untypedClient.routingMap, 'set');
+      sendSpy = vi.fn().mockResolvedValue(undefined);
 
-      // stub
-      assignPacketIdStub = sinon
-        .stub(client as any, 'assignPacketId')
-        .callsFake(packet =>
-          Object.assign(packet, {
+      assignPacketIdStub = vi
+        .spyOn(client as any, 'assignPacketId')
+        .mockImplementation(packet =>
+          Object.assign(packet as object, {
             id: correlationId,
           }),
         );
 
-      sinon.stub(client as any, 'producer').value({
+      vi.spyOn(client as any, '_producer', 'get').mockReturnValue({
         send: sendSpy,
       });
 
-      // set
       client['consumerAssignments'] = {
         [replyTopic]: parseFloat(replyPartition),
       };
     });
 
     it('should assign a packet id', async () => {
-      await client['publish'](readPacket, callback);
-      expect(assignPacketIdStub.calledWith(readPacket)).to.be.true;
+      client['publish'](readPacket, callback);
+
+      await waitForNextTick();
+
+      expect(assignPacketIdStub).toHaveBeenCalledWith(readPacket);
     });
 
     it('should normalize the pattern', async () => {
-      await client['publish'](readPacket, callback);
-      expect(normalizePatternSpy.calledWith(topic)).to.be.true;
+      client['publish'](readPacket, callback);
+
+      await waitForNextTick();
+
+      expect(normalizePatternSpy).toHaveBeenCalledWith(topic);
     });
 
     it('should get the reply pattern', async () => {
-      await client['publish'](readPacket, callback);
-      expect(getResponsePatternNameSpy.calledWith(topic)).to.be.true;
+      client['publish'](readPacket, callback);
+
+      await waitForNextTick();
+
+      expect(getResponsePatternNameSpy).toHaveBeenCalledWith(topic);
     });
 
     it('should get the reply partition', async () => {
-      await client['publish'](readPacket, callback);
-      expect(getReplyTopicPartitionSpy.calledWith(replyTopic)).to.be.true;
+      client['publish'](readPacket, callback);
+
+      await waitForNextTick();
+
+      expect(getReplyTopicPartitionSpy).toHaveBeenCalledWith(replyTopic);
     });
 
     it('should add the callback to the routing map', async () => {
-      await client['publish'](readPacket, callback);
-      expect(routingMapSetSpy.calledOnce).to.be.true;
-      expect(routingMapSetSpy.args[0][0]).to.eq(correlationId);
-      expect(routingMapSetSpy.args[0][1]).to.eq(callback);
+      client['publish'](readPacket, callback);
+
+      await waitForNextTick();
+
+      expect(routingMapSetSpy).toHaveBeenCalledOnce();
+      expect(routingMapSetSpy.mock.calls[0][0]).toEqual(correlationId);
+      expect(routingMapSetSpy.mock.calls[0][1]).toEqual(callback);
     });
 
     it('should send the message with headers', async () => {
-      await client['publish'](readPacket, callback);
+      client['publish'](readPacket, callback);
 
-      expect(sendSpy.calledOnce).to.be.true;
-      expect(sendSpy.args[0][0].topic).to.eq(topic);
-      expect(sendSpy.args[0][0].messages).to.not.be.empty;
+      await waitForNextTick();
 
-      const sentMessage = sendSpy.args[0][0].messages[0];
+      expect(sendSpy).toHaveBeenCalledOnce();
+      expect(sendSpy.mock.calls[0][0].topic).toEqual(topic);
+      expect(sendSpy.mock.calls[0][0].messages).not.toHaveLength(0);
 
-      expect(sentMessage.value).to.eq(messageValue);
-      expect(sentMessage.headers).to.not.be.empty;
-      expect(sentMessage.headers[KafkaHeaders.CORRELATION_ID]).to.eq(
+      const sentMessage = sendSpy.mock.calls[0][0].messages[0];
+
+      expect(sentMessage.value).toEqual(messageValue);
+      expect(sentMessage.headers).toBeDefined();
+      expect(sentMessage.headers[KafkaHeaders.CORRELATION_ID]).toEqual(
         correlationId,
       );
-      expect(sentMessage.headers[KafkaHeaders.REPLY_TOPIC]).to.eq(replyTopic);
-      expect(sentMessage.headers[KafkaHeaders.REPLY_PARTITION]).to.eq(
+      expect(sentMessage.headers[KafkaHeaders.REPLY_TOPIC]).toEqual(replyTopic);
+      expect(sentMessage.headers[KafkaHeaders.REPLY_PARTITION]).toEqual(
         replyPartition,
       );
     });
 
+    it('should send the packet metadata as headers, which never replace the reply headers', async () => {
+      client['publish'](
+        {
+          pattern: topic,
+          data: messageValue,
+          metadata: {
+            'x-request-id': 'trace-1',
+            [KafkaHeaders.CORRELATION_ID]: 'not-the-id',
+            [KafkaHeaders.REPLY_TOPIC]: 'elsewhere',
+          },
+        },
+        callback,
+      );
+
+      await waitForNextTick();
+
+      const sentMessage = sendSpy.mock.calls[0][0].messages[0];
+      expect(sentMessage.headers).toEqual({
+        'x-request-id': 'trace-1',
+        [KafkaHeaders.CORRELATION_ID]: correlationId,
+        [KafkaHeaders.REPLY_TOPIC]: replyTopic,
+        [KafkaHeaders.REPLY_PARTITION]: replyPartition,
+      });
+    });
+
+    it('should remove callback from routing map when unsubscribe', async () => {
+      client['publish'](readPacket, callback)();
+
+      await waitForNextTick();
+
+      expect(client['routingMap'].has(correlationId)).toBe(false);
+      expect(client['routingMap'].size).toEqual(0);
+    });
+
     describe('on error', () => {
-      let clientProducerStub: sinon.SinonStub;
-      let sendStub: sinon.SinonStub;
+      let clientProducerStub: any;
+      let sendStub: ReturnType<typeof vi.fn>;
 
       beforeEach(() => {
-        sendStub = sinon.stub().callsFake(() => {
+        sendStub = vi.fn().mockImplementation(() => {
           throw new Error();
         });
 
-        clientProducerStub = sinon.stub(client as any, 'producer').value({
-          send: sendStub,
-        });
+        clientProducerStub = vi
+          .spyOn(client as any, '_producer', 'get')
+          .mockReturnValue({
+            send: sendStub,
+          });
       });
 
       afterEach(() => {
-        clientProducerStub.restore();
+        clientProducerStub.mockRestore();
       });
 
       it('should call callback', async () => {
-        await client['publish'](readPacket, callback);
-
-        expect(callback.called).to.be.true;
-        expect(callback.getCall(0).args[0].err).to.be.instanceof(Error);
+        return new Promise(resolve => {
+          return client['publish'](readPacket, ({ err }) => resolve(err));
+        }).then(err => {
+          expect(err).toBeInstanceOf(Error);
+        });
       });
     });
 
     describe('dispose callback', () => {
       let subscription;
-      let getResponsePatternNameStub: sinon.SinonStub;
-      let getReplyTopicPartitionStub: sinon.SinonStub;
+      let getResponsePatternNameStub: any;
+      let getReplyTopicPartitionStub: any;
 
       beforeEach(async () => {
         // restore
-        getResponsePatternNameSpy.restore();
-        getReplyTopicPartitionSpy.restore();
+        getResponsePatternNameSpy.mockRestore();
+        getReplyTopicPartitionSpy.mockRestore();
 
         // return the topic instead of the reply topic
-        getResponsePatternNameStub = sinon
-          .stub(client as any, 'getResponsePatternName')
-          .callsFake(() => topic);
-        getReplyTopicPartitionStub = sinon
-          .stub(client as any, 'getReplyTopicPartition')
-          .callsFake(() => '0');
+        getResponsePatternNameStub = vi
+          .spyOn(client as any, 'getResponsePatternName')
+          .mockImplementation(() => topic);
+        getReplyTopicPartitionStub = vi
+          .spyOn(client as any, 'getReplyTopicPartition')
+          .mockImplementation(() => '0');
 
-        subscription = await client['publish'](readPacket, callback);
+        subscription = client['publish'](readPacket, callback);
         subscription(payloadDisposed);
       });
 
       afterEach(() => {
-        getResponsePatternNameStub.restore();
-        getReplyTopicPartitionStub.restore();
+        getResponsePatternNameStub.mockRestore();
+        getReplyTopicPartitionStub.mockRestore();
       });
 
       it('should remove callback from routing map', async () => {
-        expect(client['routingMap'].has(correlationId)).to.be.false;
-        expect(client['routingMap'].size).to.eq(0);
+        expect(client['routingMap'].has(correlationId)).toBe(false);
+        expect(client['routingMap'].size).toEqual(0);
+      });
+
+      it('should skip producer.send and errorCallback if disposed before async serialize settles', async () => {
+        let resolveSerialize!: (val: any) => void;
+        let rejectSerialize!: (err: Error) => void;
+        const serializeSpy = vi
+          .spyOn(untypedClient.serializer, 'serialize')
+          .mockImplementationOnce(
+            () =>
+              new Promise(resolve => {
+                resolveSerialize = resolve;
+              }),
+          )
+          .mockImplementationOnce(
+            () =>
+              new Promise((_, reject) => {
+                rejectSerialize = reject;
+              }),
+          );
+        const sendSpy = vi.fn();
+        const producerSpy = vi
+          .spyOn(client as any, '_producer', 'get')
+          .mockReturnValue({ send: sendSpy });
+
+        const cb1 = vi.fn();
+        const dispose1 = client['publish'](readPacket, cb1);
+        dispose1();
+        resolveSerialize({ value: 'ok', headers: {} });
+        await Promise.resolve();
+        await Promise.resolve();
+
+        expect(sendSpy).not.toHaveBeenCalled();
+        expect(cb1).not.toHaveBeenCalled();
+
+        const cb2 = vi.fn();
+        const dispose2 = client['publish'](readPacket, cb2);
+        dispose2();
+        rejectSerialize(new Error('late serialize error'));
+        await Promise.resolve();
+        await Promise.resolve();
+
+        expect(cb2).not.toHaveBeenCalled();
+
+        serializeSpy.mockRestore();
+        producerSpy.mockRestore();
       });
     });
   });
